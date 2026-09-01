@@ -4,4 +4,5 @@
 **/__pycache__/
 /python/lateweave/*.so
 /benchmarks/.work/
+/benchmarks/maxsim-kernels/target/
 uv.lock

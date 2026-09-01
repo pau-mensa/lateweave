@@ -43,9 +43,14 @@ uses every document.
 `maxsim_kernel_comparison.py` compares three native implementations using the
 same generated embeddings:
 
-- the tiled-fused fixed/variable-length path from the `maxsim` fork;
+- the historical tiled-fused fixed/variable-length path;
 - the optimized packed path added in `maxsim-cpu` commit `d0c9a1e`; and
 - lateweave's current packed implementation.
+
+The two historical implementations are copied into the benchmark-only native
+crate at `benchmarks/maxsim-kernels`. They are versioned with lateweave for
+reproducibility but are not compiled into, imported by, or exposed from the
+production package. Their Apache-2.0 attribution is recorded beside the code.
 
 The benchmark uses separate processes for every Rayon thread count because the
 global Rayon pool cannot be resized after initialization. It fixes every known
@@ -55,29 +60,20 @@ shape matches the storage benchmark: 32 query tokens, 500 candidates, and 128
 dimensions. Fixed document lengths of 32, 128, and 512 tokens plus variable
 lengths from 32 through 256 are included.
 
-Place the comparison repositories beside lateweave. Use these revisions so the
-implementations match the original comparison:
+On Debian or Ubuntu, install a compiler and the system OpenBLAS library before
+running the benchmark:
 
 ```console
-git clone https://github.com/Novadata-Technologies/maxsim.git ../maxsim
-git -C ../maxsim checkout cc64b23
-
-git clone https://github.com/pau-mensa/maxsim-cpu.git ../maxsim-cpu
-git -C ../maxsim-cpu checkout d0c9a1e
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libopenblas-dev
 ```
 
-The `d0c9a1e` commit is currently ahead of the Mixedbread upstream branch. Push
-that commit to the fork before setting up a fresh benchmark machine if it is not
-available remotely yet.
-
-Run the comparison from the lateweave repository root. Python 3.12 is explicit
-because the older comparison packages use an earlier PyO3 release:
+Run the comparison from the lateweave repository root:
 
 ```console
 uv run --python 3.12 \
   --with-editable . \
-  --with-editable ../maxsim \
-  --with-editable ../maxsim-cpu \
+  --with-editable benchmarks/maxsim-kernels \
   benchmarks/maxsim_kernel_comparison.py \
   --thread-counts 1 2 \
   --concurrency 1 2 4 \
@@ -95,8 +91,7 @@ For a quick installation and API smoke test:
 ```console
 uv run --python 3.12 \
   --with-editable . \
-  --with-editable ../maxsim \
-  --with-editable ../maxsim-cpu \
+  --with-editable benchmarks/maxsim-kernels \
   benchmarks/maxsim_kernel_comparison.py \
   --thread-counts 1 \
   --concurrency 1 2 \

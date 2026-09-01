@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "lateweave-maxsim-bench"
+version = "0.0.0"
+description = "Benchmark-only historical MaxSim kernels"
+requires-python = ">=3.11,<3.14"
+dependencies = ["numpy>=1.26,<3"]
+
+[tool.maturin]
+module-name = "lateweave_maxsim_bench._native"
+python-source = "python"

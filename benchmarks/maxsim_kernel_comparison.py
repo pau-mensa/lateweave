@@ -53,7 +53,7 @@ def positive_integer(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare old tiled-fused MaxSim, maxsim-cpu packed MaxSim, and "
+            "Compare old tiled-fused MaxSim, optimized packed MaxSim, and "
             "lateweave packed MaxSim in isolated thread configurations."
         )
     )
@@ -234,15 +234,14 @@ def run_parent(args: argparse.Namespace) -> None:
 def import_implementations():
     try:
         import lateweave
-        import maxsim
-        import maxsim_cpu
+        import lateweave_maxsim_bench as comparison_kernels
         import numpy as np
     except ImportError as error:
         raise RuntimeError(
-            "the comparison requires editable installs of lateweave, maxsim, "
-            "and maxsim-cpu; see benchmarks/README.md"
+            "the comparison requires editable installs of lateweave and its "
+            "benchmark-only kernel crate; see benchmarks/README.md"
         ) from error
-    return np, lateweave, maxsim, maxsim_cpu
+    return np, lateweave, comparison_kernels
 
 
 def normalized(np, generator, shape: tuple[int, ...]):
@@ -309,8 +308,7 @@ def correctness(np, outputs: dict[str, Any]) -> dict[str, dict[str, float]]:
 def fixed_case(
     np,
     lateweave,
-    maxsim,
-    maxsim_cpu,
+    comparison_kernels,
     args: argparse.Namespace,
     document_tokens: int,
     seed: int,
@@ -323,8 +321,8 @@ def fixed_case(
     packed = documents.reshape(-1, args.dimension)
     lengths = np.full(args.documents, document_tokens, dtype=np.int64)
     methods = {
-        "old_fused_tiles": lambda: maxsim.maxsim_scores(query, documents),
-        "maxsim_cpu_packed": lambda: maxsim_cpu.maxsim_scores_packed(
+        "old_fused_tiles": lambda: comparison_kernels.fused_scores(query, documents),
+        "optimized_packed": lambda: comparison_kernels.packed_scores(
             query, packed, lengths
         ),
         "lateweave_packed": lambda: lateweave.maxsim_scores_packed(
@@ -343,9 +341,9 @@ def fixed_case(
         "total_document_tokens": args.documents * document_tokens,
         "timings": timings,
         "correctness_vs_lateweave": correctness(np, outputs),
-        "maxsim_cpu_packed_speedup_over_old_fused": (
+        "optimized_packed_speedup_over_old_fused": (
             timings["old_fused_tiles"]["mean_ms"]
-            / timings["maxsim_cpu_packed"]["mean_ms"]
+            / timings["optimized_packed"]["mean_ms"]
         ),
     }
 
@@ -353,8 +351,7 @@ def fixed_case(
 def variable_case(
     np,
     lateweave,
-    maxsim,
-    maxsim_cpu,
+    comparison_kernels,
     args: argparse.Namespace,
     seed: int,
 ) -> dict[str, object]:
@@ -367,16 +364,11 @@ def variable_case(
         dtype=np.int64,
     )
     packed = normalized(np, generator, (int(lengths.sum()), args.dimension))
-    offsets = np.concatenate(([0], np.cumsum(lengths)))
-    documents = [
-        np.ascontiguousarray(packed[offsets[index] : offsets[index + 1]])
-        for index in range(args.documents)
-    ]
     methods = {
-        "old_variable_fused_tiles": lambda: maxsim.maxsim_scores_variable(
-            query, documents
+        "old_variable_fused_tiles": lambda: comparison_kernels.fused_scores_variable(
+            query, packed, lengths
         ),
-        "maxsim_cpu_packed": lambda: maxsim_cpu.maxsim_scores_packed(
+        "optimized_packed": lambda: comparison_kernels.packed_scores(
             query, packed, lengths
         ),
         "lateweave_packed": lambda: lateweave.maxsim_scores_packed(
@@ -397,9 +389,9 @@ def variable_case(
         "total_document_tokens": int(lengths.sum()),
         "timings": timings,
         "correctness_vs_lateweave": correctness(np, outputs),
-        "maxsim_cpu_packed_speedup_over_old_fused": (
+        "optimized_packed_speedup_over_old_fused": (
             timings["old_variable_fused_tiles"]["mean_ms"]
-            / timings["maxsim_cpu_packed"]["mean_ms"]
+            / timings["optimized_packed"]["mean_ms"]
         ),
     }
 
@@ -440,8 +432,7 @@ def closed_loop_concurrency(
 def concurrency_case(
     np,
     lateweave,
-    maxsim,
-    maxsim_cpu,
+    comparison_kernels,
     args: argparse.Namespace,
     seed: int,
 ) -> dict[str, object]:
@@ -457,8 +448,8 @@ def concurrency_case(
         args.documents, args.concurrency_document_tokens, dtype=np.int64
     )
     methods = {
-        "old_fused_tiles": lambda: maxsim.maxsim_scores(query, documents),
-        "maxsim_cpu_packed": lambda: maxsim_cpu.maxsim_scores_packed(
+        "old_fused_tiles": lambda: comparison_kernels.fused_scores(query, documents),
+        "optimized_packed": lambda: comparison_kernels.packed_scores(
             query, packed, lengths
         ),
         "lateweave_packed": lambda: lateweave.maxsim_scores_packed(
@@ -490,13 +481,12 @@ def concurrency_case(
 
 
 def run_worker(args: argparse.Namespace) -> None:
-    np, lateweave, maxsim, maxsim_cpu = import_implementations()
+    np, lateweave, comparison_kernels = import_implementations()
     workloads = {
         f"fixed_{args.documents}x{tokens}": fixed_case(
             np,
             lateweave,
-            maxsim,
-            maxsim_cpu,
+            comparison_kernels,
             args,
             tokens,
             args.seed + position,
@@ -509,8 +499,7 @@ def run_worker(args: argparse.Namespace) -> None:
     ] = variable_case(
         np,
         lateweave,
-        maxsim,
-        maxsim_cpu,
+        comparison_kernels,
         args,
         args.seed + len(args.fixed_document_tokens),
     )
@@ -521,16 +510,14 @@ def run_worker(args: argparse.Namespace) -> None:
         },
         "modules": {
             "lateweave": lateweave.__file__,
-            "maxsim": maxsim.__file__,
-            "maxsim_cpu": maxsim_cpu.__file__,
+            "comparison_kernels": comparison_kernels.__file__,
             "numpy": np.__version__,
         },
         "single_query": workloads,
         "concurrent_queries": concurrency_case(
             np,
             lateweave,
-            maxsim,
-            maxsim_cpu,
+            comparison_kernels,
             args,
             args.seed + 10_000,
         ),
