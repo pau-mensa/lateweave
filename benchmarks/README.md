@@ -37,3 +37,75 @@ Pass `--overwrite` when rerunning `prepare`, `bm25`, or a store build. Preparing
 again invalidates and removes all generated benchmark stages in that workspace.
 For quick smoke tests, `prepare --documents 100` limits the corpus; the default
 uses every document.
+
+## MaxSim kernel comparison
+
+`maxsim_kernel_comparison.py` compares three native implementations using the
+same generated embeddings:
+
+- the tiled-fused fixed/variable-length path from the `maxsim` fork;
+- the optimized packed path added in `maxsim-cpu` commit `d0c9a1e`; and
+- lateweave's current packed implementation.
+
+The benchmark uses separate processes for every Rayon thread count because the
+global Rayon pool cannot be resized after initialization. It fixes every known
+BLAS thread setting to one, interleaves implementations during the single-query
+test, checks their scores, and runs closed-loop concurrent queries. The default
+shape matches the storage benchmark: 32 query tokens, 500 candidates, and 128
+dimensions. Fixed document lengths of 32, 128, and 512 tokens plus variable
+lengths from 32 through 256 are included.
+
+Place the comparison repositories beside lateweave. Use these revisions so the
+implementations match the original comparison:
+
+```console
+git clone https://github.com/Novadata-Technologies/maxsim.git ../maxsim
+git -C ../maxsim checkout cc64b23
+
+git clone https://github.com/pau-mensa/maxsim-cpu.git ../maxsim-cpu
+git -C ../maxsim-cpu checkout d0c9a1e
+```
+
+The `d0c9a1e` commit is currently ahead of the Mixedbread upstream branch. Push
+that commit to the fork before setting up a fresh benchmark machine if it is not
+available remotely yet.
+
+Run the comparison from the lateweave repository root. Python 3.12 is explicit
+because the older comparison packages use an earlier PyO3 release:
+
+```console
+uv run --python 3.12 \
+  --with-editable . \
+  --with-editable ../maxsim \
+  --with-editable ../maxsim-cpu \
+  benchmarks/maxsim_kernel_comparison.py \
+  --thread-counts 1 2 \
+  --concurrency 1 2 4 \
+  --output maxsim-comparison-x86.json
+```
+
+On a two-vCPU VPS, verify that the process can actually see two CPUs in the
+result's `available_logical_cpus` field. Avoid running other CPU-intensive work
+during the measurement. The output records CPU identity, platform, imported
+module paths, configuration, peak RSS, correctness error, latency percentiles,
+single-query throughput, and closed-loop concurrent throughput.
+
+For a quick installation and API smoke test:
+
+```console
+uv run --python 3.12 \
+  --with-editable . \
+  --with-editable ../maxsim \
+  --with-editable ../maxsim-cpu \
+  benchmarks/maxsim_kernel_comparison.py \
+  --thread-counts 1 \
+  --concurrency 1 2 \
+  --documents 32 \
+  --fixed-document-tokens 16 \
+  --variable-min-tokens 8 \
+  --variable-max-tokens 24 \
+  --warmups 1 \
+  --iterations 2 \
+  --requests-per-worker 2 \
+  --output /tmp/maxsim-comparison-smoke.json
+```
