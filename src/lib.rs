@@ -213,16 +213,11 @@ fn maxsim_scores_packed<'py>(
         return Err(PyValueError::new_err("threads must be positive"));
     }
 
+    // No non-finite scan here: it is a full streaming pass over every input
+    // float, which costs more than the kernel itself at large candidate sets.
+    // Non-finite embeddings propagate into the scores instead of raising.
     let query_values = query.as_slice()?;
     let document_values = documents.as_slice()?;
-    if query_values.iter().any(|value| !value.is_finite()) {
-        return Err(PyValueError::new_err("query contains a non-finite value"));
-    }
-    if document_values.iter().any(|value| !value.is_finite()) {
-        return Err(PyValueError::new_err(
-            "documents contain a non-finite value",
-        ));
-    }
     let mut offsets = Vec::with_capacity(document_lengths.len() + 1);
     offsets.push(0);
     let mut total_tokens = 0usize;

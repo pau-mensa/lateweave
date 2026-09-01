@@ -44,7 +44,7 @@ fn validate(values: &[f32], rows: usize, dimension: usize, name: &str) -> Result
     if values.len() != rows * dimension {
         return Err(format!("{name} shape does not match its value count"));
     }
-    if values.iter().any(|value| !value.is_finite()) {
+    if !crate::core::all_finite(values) {
         return Err(format!("{name} contains a non-finite value"));
     }
     Ok(())

@@ -38,14 +38,36 @@ unsafe fn avx2_max(values: &[f32]) -> f32 {
     if values.len() < 8 {
         return scalar_max(values);
     }
-    let mut maximum = _mm256_set1_ps(f32::NEG_INFINITY);
+    let mut maximum0 = _mm256_set1_ps(f32::NEG_INFINITY);
+    let mut maximum1 = maximum0;
+    let mut maximum2 = maximum0;
+    let mut maximum3 = maximum0;
     let mut position = 0;
+    while position + 32 <= values.len() {
+        if position + 64 < values.len() {
+            _mm_prefetch(values.as_ptr().add(position + 64) as *const i8, _MM_HINT_T0);
+        }
+        maximum0 = _mm256_max_ps(maximum0, _mm256_loadu_ps(values.as_ptr().add(position)));
+        maximum1 = _mm256_max_ps(maximum1, _mm256_loadu_ps(values.as_ptr().add(position + 8)));
+        maximum2 = _mm256_max_ps(
+            maximum2,
+            _mm256_loadu_ps(values.as_ptr().add(position + 16)),
+        );
+        maximum3 = _mm256_max_ps(
+            maximum3,
+            _mm256_loadu_ps(values.as_ptr().add(position + 24)),
+        );
+        position += 32;
+    }
     while position + 8 <= values.len() {
-        maximum = _mm256_max_ps(maximum, _mm256_loadu_ps(values.as_ptr().add(position)));
+        maximum0 = _mm256_max_ps(maximum0, _mm256_loadu_ps(values.as_ptr().add(position)));
         position += 8;
     }
-    let high = _mm256_extractf128_ps(maximum, 1);
-    let low = _mm256_castps256_ps128(maximum);
+    maximum0 = _mm256_max_ps(maximum0, maximum1);
+    maximum2 = _mm256_max_ps(maximum2, maximum3);
+    maximum0 = _mm256_max_ps(maximum0, maximum2);
+    let high = _mm256_extractf128_ps(maximum0, 1);
+    let low = _mm256_castps256_ps128(maximum0);
     let maximum = _mm_max_ps(high, low);
     let maximum = _mm_max_ps(maximum, _mm_movehl_ps(maximum, maximum));
     let maximum = _mm_max_ss(maximum, _mm_shuffle_ps(maximum, maximum, 0b01));
@@ -64,13 +86,26 @@ fn neon_max(values: &[f32]) -> f32 {
         return scalar_max(values);
     }
     unsafe {
-        let mut maximum = vdupq_n_f32(f32::NEG_INFINITY);
+        let mut maximum0 = vdupq_n_f32(f32::NEG_INFINITY);
+        let mut maximum1 = maximum0;
+        let mut maximum2 = maximum0;
+        let mut maximum3 = maximum0;
         let mut position = 0;
+        while position + 16 <= values.len() {
+            maximum0 = vmaxq_f32(maximum0, vld1q_f32(values.as_ptr().add(position)));
+            maximum1 = vmaxq_f32(maximum1, vld1q_f32(values.as_ptr().add(position + 4)));
+            maximum2 = vmaxq_f32(maximum2, vld1q_f32(values.as_ptr().add(position + 8)));
+            maximum3 = vmaxq_f32(maximum3, vld1q_f32(values.as_ptr().add(position + 12)));
+            position += 16;
+        }
         while position + 4 <= values.len() {
-            maximum = vmaxq_f32(maximum, vld1q_f32(values.as_ptr().add(position)));
+            maximum0 = vmaxq_f32(maximum0, vld1q_f32(values.as_ptr().add(position)));
             position += 4;
         }
-        let mut result = vmaxvq_f32(maximum);
+        maximum0 = vmaxq_f32(maximum0, maximum1);
+        maximum2 = vmaxq_f32(maximum2, maximum3);
+        maximum0 = vmaxq_f32(maximum0, maximum2);
+        let mut result = vmaxvq_f32(maximum0);
         for &value in &values[position..] {
             result = result.max(value);
         }

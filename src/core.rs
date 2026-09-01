@@ -8,6 +8,21 @@ use std::collections::HashSet;
 
 use thiserror::Error;
 
+/// Reject non-finite inputs without the per-element branch that stops the
+/// autovectorizer.  A float is non-finite exactly when its exponent bits are
+/// all set, so each chunk reduces with a branchless `|` and only the chunk
+/// boundary short-circuits.
+pub fn all_finite(values: &[f32]) -> bool {
+    const EXPONENT_MASK: u32 = 0x7F80_0000;
+    const CHUNK_VALUES: usize = 4096;
+
+    values.chunks(CHUNK_VALUES).all(|chunk| {
+        !chunk.iter().fold(false, |found, value| {
+            found | (value.to_bits() & EXPONENT_MASK == EXPONENT_MASK)
+        })
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
     pub document_id: u64,
