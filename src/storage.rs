@@ -5,7 +5,31 @@
 //! Python store implementation.
 
 use rayon::{prelude::*, ThreadPoolBuilder};
+use std::cell::RefCell;
 use std::mem::size_of;
+
+/// Reused across jzip frames so that decoding a candidate set does not
+/// allocate once per document.
+#[derive(Default)]
+struct JzipScratch {
+    bytes: Vec<u8>,
+    angles: Vec<f32>,
+    products: Vec<f64>,
+}
+
+thread_local! {
+    static JZIP_SCRATCH: RefCell<JzipScratch> = const {
+        RefCell::new(JzipScratch {
+            bytes: Vec::new(),
+            angles: Vec::new(),
+            products: Vec::new(),
+        })
+    };
+}
+
+/// Rows decoded together.  One block keeps its slice of the output inside L1
+/// while the angle recurrence walks every position.
+const JZIP_ROW_BLOCK: usize = 64;
 
 pub const INT8_FORMAT: &str = "lateweave-int8-rowwise-v1";
 pub const TURBOQUANT_FORMAT: &str = "lateweave-turboquant4-mse-v1";
@@ -124,23 +148,158 @@ fn cartesian_to_spherical(values: &[f32], rows: usize, dimension: usize) -> Vec<
     angles
 }
 
-fn spherical_to_cartesian(angles: &[f32], rows: usize, dimension: usize) -> Vec<f32> {
+/// Rebuild `block` rows of unit vectors from column-major angles.
+///
+/// `products[row]` carries the running product of sines, which is the norm of
+/// the not-yet-emitted tail of that row.  Every angle except the last comes
+/// from `acos` and therefore lies in `[0, pi]`, where the sine is non-negative
+/// and can be recovered as `sqrt(1 - cos^2)` instead of a second transcendental.
+fn spherical_block_scalar(
+    angles: &[f32],
+    output: &mut [f32],
+    products: &mut [f64],
+    rows: usize,
+    dimension: usize,
+    first_row: usize,
+    block: usize,
+) {
     let angle_dimension = dimension - 1;
-    let mut values = vec![0.0f32; rows * dimension];
-    for row in 0..rows {
-        let input = &angles[row * angle_dimension..(row + 1) * angle_dimension];
-        let output = &mut values[row * dimension..(row + 1) * dimension];
-        let mut sine_product = 1.0f64;
-        for position in 0..dimension.saturating_sub(2) {
-            let angle = f64::from(input[position]);
-            output[position] = (sine_product * angle.cos()) as f32;
-            sine_product *= angle.sin();
+    for position in 0..angle_dimension - 1 {
+        let plane = position * rows + first_row;
+        for row in 0..block {
+            let cosine = f64::from(angles[plane + row]).cos();
+            output[(first_row + row) * dimension + position] = (products[row] * cosine) as f32;
+            products[row] *= (1.0 - cosine * cosine).max(0.0).sqrt();
         }
-        let last = f64::from(input[dimension - 2]);
-        output[dimension - 2] = (sine_product * last.cos()) as f32;
-        output[dimension - 1] = (sine_product * last.sin()) as f32;
     }
-    values
+    spherical_block_tail(angles, output, products, rows, dimension, first_row, block);
+}
+
+/// The final angle comes from `atan2` and spans `[-pi, pi]`, so it needs a real
+/// sine.  It is one position out of `dimension - 1`.
+fn spherical_block_tail(
+    angles: &[f32],
+    output: &mut [f32],
+    products: &[f64],
+    rows: usize,
+    dimension: usize,
+    first_row: usize,
+    block: usize,
+) {
+    let plane = (dimension - 2) * rows + first_row;
+    for row in 0..block {
+        let (sine, cosine) = f64::from(angles[plane + row]).sin_cos();
+        output[(first_row + row) * dimension + dimension - 2] = (products[row] * cosine) as f32;
+        output[(first_row + row) * dimension + dimension - 1] = (products[row] * sine) as f32;
+    }
+}
+
+/// `cos(x)` for `|x| <= pi`, evaluated as `-sin(x - pi/2)`.
+///
+/// Shifting by a quarter turn puts the argument in `[-pi/2, pi/2]`, where the
+/// Taylor series through `t^21` is already below double rounding error, so no
+/// argument reduction and no quadrant selection are needed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn avx2_cosine(x: std::arch::x86_64::__m256d) -> std::arch::x86_64::__m256d {
+    use std::arch::x86_64::*;
+
+    let t = _mm256_sub_pd(x, _mm256_set1_pd(std::f64::consts::FRAC_PI_2));
+    let square = _mm256_mul_pd(t, t);
+    let mut series = _mm256_set1_pd(-1.0 / 51_090_942_171_709_440_000.0);
+    for coefficient in [
+        1.0 / 121_645_100_408_832_000.0,
+        -1.0 / 355_687_428_096_000.0,
+        1.0 / 1_307_674_368_000.0,
+        -1.0 / 6_227_020_800.0,
+        1.0 / 39_916_800.0,
+        -1.0 / 362_880.0,
+        1.0 / 5_040.0,
+        -1.0 / 120.0,
+        1.0 / 6.0,
+        -1.0,
+    ] {
+        series = _mm256_fmadd_pd(series, square, _mm256_set1_pd(coefficient));
+    }
+    _mm256_mul_pd(series, t)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn avx2_spherical_block(
+    angles: &[f32],
+    output: &mut [f32],
+    products: &mut [f64],
+    rows: usize,
+    dimension: usize,
+    first_row: usize,
+    block: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let angle_dimension = dimension - 1;
+    for position in 0..angle_dimension - 1 {
+        let plane = position * rows + first_row;
+        let mut row = 0;
+        while row + 4 <= block {
+            let cosine = avx2_cosine(_mm256_cvtps_pd(_mm_loadu_ps(
+                angles.as_ptr().add(plane + row),
+            )));
+            let product = _mm256_loadu_pd(products.as_ptr().add(row));
+            let sine = _mm256_sqrt_pd(_mm256_max_pd(
+                _mm256_sub_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(cosine, cosine)),
+                _mm256_setzero_pd(),
+            ));
+            _mm256_storeu_pd(products.as_mut_ptr().add(row), _mm256_mul_pd(product, sine));
+            let mut lanes = [0.0f32; 4];
+            _mm_storeu_ps(
+                lanes.as_mut_ptr(),
+                _mm256_cvtpd_ps(_mm256_mul_pd(product, cosine)),
+            );
+            for (lane, value) in lanes.iter().enumerate() {
+                output[(first_row + row + lane) * dimension + position] = *value;
+            }
+            row += 4;
+        }
+        while row < block {
+            let cosine = f64::from(angles[plane + row]).cos();
+            output[(first_row + row) * dimension + position] = (products[row] * cosine) as f32;
+            products[row] *= (1.0 - cosine * cosine).max(0.0).sqrt();
+            row += 1;
+        }
+    }
+    spherical_block_tail(angles, output, products, rows, dimension, first_row, block);
+}
+
+fn spherical_to_cartesian_planar(
+    angles: &[f32],
+    output: &mut [f32],
+    products: &mut Vec<f64>,
+    rows: usize,
+    dimension: usize,
+) {
+    let mut first_row = 0;
+    while first_row < rows {
+        let block = JZIP_ROW_BLOCK.min(rows - first_row);
+        products.clear();
+        products.resize(block, 1.0);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+            {
+                unsafe {
+                    avx2_spherical_block(
+                        angles, output, products, rows, dimension, first_row, block,
+                    );
+                }
+                first_row += block;
+                continue;
+            }
+        }
+        spherical_block_scalar(angles, output, products, rows, dimension, first_row, block);
+        first_row += block;
+    }
 }
 
 fn transpose_angles(angles: &[f32], rows: usize, columns: usize) -> Vec<f32> {
@@ -164,20 +323,59 @@ fn byte_shuffle(values: &[f32]) -> Vec<u8> {
     shuffled
 }
 
-fn byte_unshuffle(values: &[u8], floats: usize) -> Result<Vec<f32>, String> {
-    if values.len() != checked_product(floats, size_of::<f32>(), "jzip angle")? {
-        return Err("jzip angle payload has the wrong size".to_string());
+#[inline]
+fn shuffled_float(values: &[u8], floats: usize, index: usize) -> f32 {
+    f32::from_le_bytes([
+        values[index],
+        values[floats + index],
+        values[floats * 2 + index],
+        values[floats * 3 + index],
+    ])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_byte_unshuffle(values: &[u8], floats: usize, output: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let mut index = 0;
+    while index + 8 <= floats {
+        let first = _mm_loadl_epi64(values.as_ptr().add(index) as *const __m128i);
+        let second = _mm_loadl_epi64(values.as_ptr().add(floats + index) as *const __m128i);
+        let third = _mm_loadl_epi64(values.as_ptr().add(floats * 2 + index) as *const __m128i);
+        let fourth = _mm_loadl_epi64(values.as_ptr().add(floats * 3 + index) as *const __m128i);
+        let low = _mm_unpacklo_epi8(first, second);
+        let high = _mm_unpacklo_epi8(third, fourth);
+        _mm_storeu_si128(
+            output.as_mut_ptr().add(index) as *mut __m128i,
+            _mm_unpacklo_epi16(low, high),
+        );
+        _mm_storeu_si128(
+            output.as_mut_ptr().add(index + 4) as *mut __m128i,
+            _mm_unpackhi_epi16(low, high),
+        );
+        index += 8;
     }
-    let mut output = Vec::with_capacity(floats);
-    for position in 0..floats {
-        output.push(f32::from_le_bytes([
-            values[position],
-            values[floats + position],
-            values[floats * 2 + position],
-            values[floats * 3 + position],
-        ]));
+    while index < floats {
+        output[index] = shuffled_float(values, floats, index);
+        index += 1;
     }
-    Ok(output)
+}
+
+/// Undo the byte-plane shuffle, leaving the angles column-major exactly as the
+/// encoder transposed them.  The reconstruction walks that layout directly, so
+/// no transpose back to row-major is needed.
+fn byte_unshuffle_into(values: &[u8], floats: usize, output: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { avx2_byte_unshuffle(values, floats, output) };
+            return;
+        }
+    }
+    for (index, value) in output.iter_mut().enumerate().take(floats) {
+        *value = shuffled_float(values, floats, index);
+    }
 }
 
 fn encode_jzip_frame(
@@ -214,11 +412,12 @@ fn parse_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().expect("four-byte field"))
 }
 
-fn decode_jzip_frame(
+fn decode_jzip_frame_into(
     frame: &[u8],
     expected_rows: usize,
     expected_dimension: usize,
-) -> Result<Vec<f32>, String> {
+    output: &mut [f32],
+) -> Result<(), String> {
     if frame.len() < JZIP_HEADER_BYTES {
         return Err("jzip frame is shorter than its header".to_string());
     }
@@ -237,14 +436,34 @@ fn decode_jzip_frame(
     }
     let floats = checked_product(rows, dimension - 1, "jzip angle")?;
     let uncompressed_bytes = checked_product(floats, size_of::<f32>(), "jzip angle")?;
-    let shuffled = zstd::bulk::decompress(&frame[JZIP_HEADER_BYTES..], uncompressed_bytes)
-        .map_err(|error| format!("jzip zstd decompression failed: {error}"))?;
-    if shuffled.len() != uncompressed_bytes {
-        return Err("jzip decompressed payload has the wrong size".to_string());
+    if output.len() != checked_product(rows, dimension, "jzip output")? {
+        return Err("jzip output slice does not match the frame shape".to_string());
     }
-    let transposed = byte_unshuffle(&shuffled, floats)?;
-    let angles = transpose_angles(&transposed, dimension - 1, rows);
-    Ok(spherical_to_cartesian(&angles, rows, dimension))
+
+    JZIP_SCRATCH.with(|scratch| {
+        let scratch = &mut *scratch.borrow_mut();
+        scratch.bytes.clear();
+        scratch.bytes.resize(uncompressed_bytes, 0);
+        let written = zstd::bulk::Decompressor::new()
+            .and_then(|mut decompressor| {
+                decompressor.decompress_to_buffer(&frame[JZIP_HEADER_BYTES..], &mut scratch.bytes)
+            })
+            .map_err(|error| format!("jzip zstd decompression failed: {error}"))?;
+        if written != uncompressed_bytes {
+            return Err("jzip decompressed payload has the wrong size".to_string());
+        }
+        scratch.angles.clear();
+        scratch.angles.resize(floats, 0.0);
+        byte_unshuffle_into(&scratch.bytes, floats, &mut scratch.angles);
+        spherical_to_cartesian_planar(
+            &scratch.angles,
+            output,
+            &mut scratch.products,
+            rows,
+            dimension,
+        );
+        Ok(())
+    })
 }
 
 pub fn jzip_encode_documents(
@@ -330,27 +549,35 @@ pub fn jzip_decode_documents(
     if frame_offsets.last().copied() != Some(payload.len()) {
         return Err("jzip frame lengths do not match the payload".to_string());
     }
-    let decoded = install(threads, || {
-        document_lengths
-            .par_iter()
-            .enumerate()
-            .map(|(document, &rows)| {
-                decode_jzip_frame(
-                    &payload[frame_offsets[document]..frame_offsets[document + 1]],
-                    rows,
-                    dimension,
-                )
-            })
-            .collect::<Vec<_>>()
-    })?;
     let total_rows = document_lengths.iter().try_fold(0usize, |total, &rows| {
         total
             .checked_add(rows)
             .ok_or_else(|| "jzip document lengths overflow usize".to_string())
     })?;
-    let mut output = Vec::with_capacity(checked_product(total_rows, dimension, "jzip output")?);
+    let mut output = vec![0.0f32; checked_product(total_rows, dimension, "jzip output")?];
+    let mut slices = Vec::with_capacity(document_lengths.len());
+    let mut remainder = output.as_mut_slice();
+    for &rows in document_lengths {
+        let (document, rest) = remainder.split_at_mut(rows * dimension);
+        slices.push(document);
+        remainder = rest;
+    }
+    let decoded = install(threads, || {
+        slices
+            .into_par_iter()
+            .enumerate()
+            .map(|(document, slice)| {
+                decode_jzip_frame_into(
+                    &payload[frame_offsets[document]..frame_offsets[document + 1]],
+                    document_lengths[document],
+                    dimension,
+                    slice,
+                )
+            })
+            .collect::<Vec<_>>()
+    })?;
     for result in decoded {
-        output.extend(result?);
+        result?;
     }
     Ok(output)
 }
