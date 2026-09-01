@@ -1,0 +1,26 @@
+lateweave
+
+The batching and SIMD reduction in src/maxsim.rs are derived from maxsim-cpu,
+an Apache-2.0 project by Benjamin Clavie and the Mixedbread team:
+https://github.com/mixedbread-ai/maxsim-cpu
+
+The TurboQuant-MSE storage implementation follows the TurboQuant algorithm by
+Zandieh et al. and adapts fixed Lloyd-Max constants and deterministic rotation
+structure from Qdrant's Apache-2.0 implementation:
+https://arxiv.org/abs/2504.19874
+https://github.com/qdrant/qdrant/tree/master/lib/quantization/src/turboquant
+
+The spherical-coordinate embedding compression used by JzipVectorStore was
+introduced by Han Xiao and Jina AI. Lateweave's Rust implementation and
+document-framed persistent format are original and are not byte-compatible
+with the upstream CLI:
+https://jina.ai/embedding-compression.pdf
+https://github.com/jina-ai/jzip-compressor
+
+Jina AI's legal repository states that Apache-2.0 applies to its managed
+open-source projects unless a project states otherwise:
+https://github.com/jina-ai/legal
+
+JzipVectorStore uses zstd, distributed under the BSD license by Yann Collet and
+contributors:
+https://github.com/facebook/zstd

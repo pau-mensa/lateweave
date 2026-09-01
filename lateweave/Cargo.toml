@@ -1,0 +1,27 @@
+[package]
+name = "lateweave"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+description = "Composable late-interaction retrieval primitives"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blas = "0.23"
+numpy = "0.24.0"
+pyo3 = "0.24.2"
+rayon = "1.10"
+thiserror = "2.0"
+zstd = "0.13"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+blas-src = { version = "0.11", default-features = false, features = ["accelerate"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

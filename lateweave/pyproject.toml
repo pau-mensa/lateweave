@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "lateweave"
+version = "0.1.0"
+description = "Composable candidate generation and late-interaction scoring"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+dependencies = ["numpy>=1.26,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "maturin>=1.8,<2"]
+
+[tool.maturin]
+module-name = "lateweave._native"
+python-source = "python"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

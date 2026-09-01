@@ -1,0 +1,125 @@
+# lateweave architecture
+
+## Ownership boundary
+
+Lateweave owns search algebra, conformance, reusable execution policy, and the
+CPU MaxSim kernel. It does not own retrieval algorithms or engine-specific
+index layouts.
+
+```text
+External engine                         lateweave
+
+query text/features -> gather IDs  ---> Candidate contract
+private representation -> scores   ---> Score contract
+                                         |
+                                         +-- exact candidate-set validation
+                                         +-- qualified score semantics
+                                         +-- deterministic top-k
+                                         +-- budgets, timing, diagnostics
+
+Optional lateweave store ----------> StoredMaxSimScorer -> CPU MaxSim
+```
+
+BM25X, FastPLAID, WARP, and Tachiom are potential implementors or consumers of
+the contracts, not dependencies of the package. Native engines that already
+own document representations should implement `CandidateScorer` directly and
+ignore optional storage.
+
+## Stable search interfaces
+
+`CandidateGenerator.gather(query, limit)` returns ordered, unique internal
+document IDs with gather scores, canonical zero-based ranks, and provenance.
+
+`CandidateScorer.score(query, candidates, budget=...)` returns exactly one
+qualified score for every supplied candidate. Representation access and
+transition remain private. Gather scores do not affect final ranking unless an
+external scorer explicitly declares different semantics.
+
+Both components expose an `IndexManifest`. Composition validates corpus and
+document-ID identity, encoder/tokenizer identity, query/document conventions,
+and mutation generation before query execution. Generator and scorer storage
+representations may intentionally differ.
+
+## Storage is an optional implementation, not a search primitive
+
+Some generators, notably BM25, do not retain token embeddings. For those
+compositions, `StoredMaxSimScorer` uses a lateweave-owned `VectorStore`. The
+store owns:
+
+- persistent layout and representation metadata;
+- query preparation and candidate-to-scoring-space transition;
+- append and delete mechanics; and
+- workspace estimates used by the scorer's resource policy.
+
+There is no public codec interface in the search algebra. Compression is a
+private detail of a store. The behavioral store base deliberately makes no
+fixed-record assumption:
+
+```text
+VectorStore
+├── FixedRecordVectorStore
+│   ├── Int8VectorStore
+│   └── TurboQuantVectorStore
+└── JzipVectorStore
+```
+
+INT8 and TurboQuant use memory-mapped, fixed-width token records. Jzip uses a
+variable-width directory and independently compressed document frames. This
+separation lets future database, object-store, or codec-backed mechanics join
+without changing `CandidateScorer`.
+
+## Jzip document framing
+
+The upstream jzip transform converts unit vectors to `D - 1` spherical angles,
+transposes angles across vectors, byte-shuffles float32 lanes, and applies
+zstd. Lateweave implements that algorithm natively in Rust but changes the
+physical container:
+
+```text
+frame-directory.npy
+  document ID -> byte offset, compressed length, token count
+
+frames.bin
+  [versioned document frame][versioned document frame]...
+```
+
+A candidate transition gathers only requested frames, decodes them in parallel
+to packed float32 token rows, and invokes the shared MaxSim kernel. Appends add
+new frames. Deletes copy live compressed frames into a compact replacement
+without reconstruction or recompression.
+
+Every frame contains magic, format version, normalization flags, token count,
+and dimension in a little-endian header, and its zstd payload carries a content
+checksum. The store checks these against its directory and manifest before
+returning vectors. The format is
+`lateweave-jzip-document-zstd-v1`, not the upstream CLI format.
+
+The spherical round trip is near-lossless rather than bit-exact; its qualified
+score semantics are `jzip-reconstructed-near-lossless-full-maxsim`.
+
+## Native scoring and execution
+
+`maxsim_scores_packed` accepts a contiguous float32 token matrix plus document
+lengths. Rust performs batched SGEMM, SIMD maximum reduction, and deterministic
+document-order restoration. Token batch size and worker count are explicit.
+The kernel knows nothing about where vectors came from.
+
+`ScorerCapabilities` records facts the runtime may rely upon, including mmap,
+prefetch, candidate reordering, future CPU/GPU sharding, preferred batch size,
+and score semantics. `ResourceBudget` crosses the scorer boundary because
+bounded execution is caller policy; each scorer maps the budget to its private
+representation.
+
+## Where purity can fail
+
+- Some engines fuse gathering and scoring so tightly that an external
+  candidate list destroys their defining optimization. They should eventually
+  satisfy a separate fused `SearchPlan` contract rather than fake a scorer
+  boundary.
+- Capability declarations need executable conformance tests; strings and type
+  hints cannot guarantee behavior.
+- Manifest fields must evolve conservatively. Backend-specific fields do not
+  belong in the compatibility core.
+- Engine adapters should live with their engine or in separately versioned
+  integration packages. Cookbooks may demonstrate them without making them
+  dependencies of lateweave.

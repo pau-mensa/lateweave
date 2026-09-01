@@ -1,0 +1,207 @@
+//! Packed, allocation-bounded CPU MaxSim.
+//!
+//! The batching and SIMD reduction are derived from the Apache-2.0 licensed
+//! `maxsim-cpu` implementation by Benjamin Clavie and Mixedbread. Keeping the
+//! kernel here makes MaxSim the one concrete scoring primitive supplied by
+//! lateweave; retrieval backends remain external implementations of the
+//! generator/scorer contracts.
+
+use blas::sgemm;
+use rayon::{prelude::*, ThreadPoolBuilder};
+use std::cell::RefCell;
+
+thread_local! {
+    static SIMILARITY_BUFFER: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(target_arch = "aarch64")]
+const DEFAULT_BATCH_TOKENS: usize = 8 * 1024;
+
+#[cfg(not(target_arch = "aarch64"))]
+const DEFAULT_BATCH_TOKENS: usize = 32 * 1024;
+
+#[derive(Clone, Copy)]
+struct Work {
+    first_document: usize,
+    last_document: usize,
+}
+
+fn scalar_max(values: &[f32]) -> f32 {
+    values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_max(values: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    if values.len() < 8 {
+        return scalar_max(values);
+    }
+    let mut maximum = _mm256_set1_ps(f32::NEG_INFINITY);
+    let mut position = 0;
+    while position + 8 <= values.len() {
+        maximum = _mm256_max_ps(maximum, _mm256_loadu_ps(values.as_ptr().add(position)));
+        position += 8;
+    }
+    let high = _mm256_extractf128_ps(maximum, 1);
+    let low = _mm256_castps256_ps128(maximum);
+    let maximum = _mm_max_ps(high, low);
+    let maximum = _mm_max_ps(maximum, _mm_movehl_ps(maximum, maximum));
+    let maximum = _mm_max_ss(maximum, _mm_shuffle_ps(maximum, maximum, 0b01));
+    let mut result = _mm_cvtss_f32(maximum);
+    for &value in &values[position..] {
+        result = result.max(value);
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+fn neon_max(values: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    if values.len() < 4 {
+        return scalar_max(values);
+    }
+    unsafe {
+        let mut maximum = vdupq_n_f32(f32::NEG_INFINITY);
+        let mut position = 0;
+        while position + 4 <= values.len() {
+            maximum = vmaxq_f32(maximum, vld1q_f32(values.as_ptr().add(position)));
+            position += 4;
+        }
+        let mut result = vmaxvq_f32(maximum);
+        for &value in &values[position..] {
+            result = result.max(value);
+        }
+        result
+    }
+}
+
+#[inline]
+fn simd_max(values: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { avx2_max(values) };
+        }
+        scalar_max(values)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_max(values)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        scalar_max(values)
+    }
+}
+
+fn batches(offsets: &[usize], maximum_tokens: usize) -> Vec<Work> {
+    let document_count = offsets.len() - 1;
+    let mut output = Vec::new();
+    let mut first_document = 0;
+    while first_document < document_count {
+        let first_token = offsets[first_document];
+        let mut last_document = first_document + 1;
+        while last_document < document_count
+            && offsets[last_document + 1] - first_token <= maximum_tokens
+        {
+            last_document += 1;
+        }
+        output.push(Work {
+            first_document,
+            last_document,
+        });
+        first_document = last_document;
+    }
+    output
+}
+
+fn score_work(
+    query: &[f32],
+    documents: &[f32],
+    offsets: &[usize],
+    query_tokens: usize,
+    dimension: usize,
+    work: Work,
+) -> (usize, Vec<f32>) {
+    let first_token = offsets[work.first_document];
+    let last_token = offsets[work.last_document];
+    let token_count = last_token - first_token;
+    let documents = &documents[first_token * dimension..last_token * dimension];
+
+    let scores = SIMILARITY_BUFFER.with(|storage| {
+        let mut storage = storage.borrow_mut();
+        storage.resize(query_tokens * token_count, 0.0);
+        unsafe {
+            sgemm(
+                b'T',
+                b'N',
+                token_count as i32,
+                query_tokens as i32,
+                dimension as i32,
+                1.0,
+                documents,
+                dimension as i32,
+                query,
+                dimension as i32,
+                0.0,
+                storage.as_mut_slice(),
+                token_count as i32,
+            );
+        }
+
+        (work.first_document..work.last_document)
+            .map(|document| {
+                let start = offsets[document] - first_token;
+                let end = offsets[document + 1] - first_token;
+                (0..query_tokens)
+                    .map(|query_token| {
+                        let row = query_token * token_count;
+                        simd_max(&storage[row + start..row + end])
+                    })
+                    .sum()
+            })
+            .collect()
+    });
+    (work.first_document, scores)
+}
+
+pub fn maxsim_scores_packed(
+    query: &[f32],
+    documents: &[f32],
+    offsets: &[usize],
+    query_tokens: usize,
+    dimension: usize,
+    maximum_batch_tokens: Option<usize>,
+    threads: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    let document_count = offsets.len() - 1;
+    if document_count == 0 {
+        return Ok(Vec::new());
+    }
+    let work = batches(
+        offsets,
+        maximum_batch_tokens.unwrap_or(DEFAULT_BATCH_TOKENS),
+    );
+    let execute = || {
+        work.into_par_iter()
+            .map(|item| score_work(query, documents, offsets, query_tokens, dimension, item))
+            .collect::<Vec<_>>()
+    };
+    let results = if let Some(threads) = threads {
+        ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| format!("could not create MaxSim worker pool: {error}"))?
+            .install(execute)
+    } else {
+        execute()
+    };
+    let mut scores = vec![0.0; document_count];
+    for (first_document, values) in results {
+        scores[first_document..first_document + values.len()].copy_from_slice(&values);
+    }
+    Ok(scores)
+}
