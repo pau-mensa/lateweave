@@ -25,6 +25,13 @@ the contracts, not dependencies of the package. Native engines that already
 own document representations should implement `CandidateScorer` directly and
 ignore optional storage.
 
+The optional `DuckDBMetadataStore` is likewise an integration utility rather
+than a search primitive. It maps a DuckDB expression to generator-internal
+document IDs for one immutable index generation. It does not post-filter
+candidates or define mutation semantics. Integrations rebuild it from the
+generator's authoritative final ID bindings when publishing a new generation;
+engines with native metadata ownership bypass it.
+
 ## Stable search interfaces
 
 `CandidateGenerator.gather(query, limit)` returns ordered, unique internal

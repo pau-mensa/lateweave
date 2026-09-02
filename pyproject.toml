@@ -12,7 +12,8 @@ license = "Apache-2.0"
 dependencies = ["numpy>=1.26,<3"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9", "maturin>=1.8,<2"]
+metadata = ["duckdb>=1.4,<2"]
+dev = ["pytest>=8,<9", "maturin>=1.8,<2", "duckdb>=1.4,<2"]
 
 [tool.maturin]
 module-name = "lateweave._native"

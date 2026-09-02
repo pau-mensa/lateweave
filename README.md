@@ -53,6 +53,39 @@ is owned and versioned by lateweave; it is deliberately not byte-compatible
 with the upstream monolithic jzip CLI. Deletes compact live frames without
 decoding or recompressing them, while appends encode only new documents.
 
+## Optional metadata filtering
+
+`DuckDBMetadataStore` is a static, portable metadata utility for candidate
+generators that accept a document subset but do not own metadata filtering. It
+is immutable for one index generation: after an append, delete, or rebuild, the
+integration creates a replacement store from the generator's final ID
+bindings. Engines that already synchronize their own metadata should keep
+using their native implementation.
+
+Install the optional dependency with `pip install 'lateweave[metadata]'`:
+
+```python
+import duckdb
+from lateweave import DuckDBMetadataStore, MetadataRecord
+
+records = [
+    MetadataRecord(0, "law-1", {"country": "ES", "year": 2024}),
+    MetadataRecord(1, "law-2", {"country": "FR", "year": 2025}),
+]
+store = DuckDBMetadataStore.create("index/metadata.duckdb", records, manifest)
+
+country = duckdb.ColumnExpression("country")
+allowed_ids = store.select(country == duckdb.ConstantExpression("ES"))
+```
+
+The result is a sorted `int64` NumPy array of generator-internal IDs. An
+adapter translates it to its native filter representation, such as a Boolean
+`weight_mask` for bm25s. The store accepts DuckDB expression objects rather
+than raw SQL strings, and validates corpus identity, document-ID digest,
+generator representation, and generation whenever it opens. External-ID
+digests are computed in ascending generator-ID order, including for sparse ID
+spaces.
+
 ## Implementing an external engine
 
 ```python
