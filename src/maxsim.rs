@@ -6,6 +6,7 @@
 //! lateweave; retrieval backends remain external implementations of the
 //! generator/scorer contracts.
 
+#[cfg(any(target_os = "macos", feature = "openblas"))]
 use blas::sgemm;
 use rayon::{prelude::*, ThreadPoolBuilder};
 use std::cell::RefCell;
@@ -153,6 +154,77 @@ fn batches(offsets: &[usize], maximum_tokens: usize) -> Vec<Work> {
     output
 }
 
+/// `out[query_tokens, token_count]` row-major = `query · documentsᵀ`.
+///
+/// Both inputs are row-major and share `dimension` as their minor axis: `query`
+/// is `[query_tokens, dimension]` and `documents` is `[token_count, dimension]`.
+/// One SGEMM is the whole of the kernel's floating-point cost, which is why it
+/// is the only thing here with an alternative implementation.
+///
+/// The implementation is chosen at compile time, never at run time: a symbol
+/// resolved from the environment is how a build ends up quietly paired with a
+/// slower BLAS than the one it was measured against.
+#[inline]
+fn similarities(
+    query: &[f32],
+    documents: &[f32],
+    out: &mut [f32],
+    query_tokens: usize,
+    token_count: usize,
+    dimension: usize,
+) {
+    #[cfg(any(target_os = "macos", feature = "openblas"))]
+    {
+        // BLAS is column-major and the data is row-major, so each operand is
+        // read as its own transpose. Transposing the documents operand is what
+        // makes `out` come back row-major, which is the layout the caller's
+        // maximum reduction scans.
+        unsafe {
+            sgemm(
+                b'T',
+                b'N',
+                token_count as i32,
+                query_tokens as i32,
+                dimension as i32,
+                1.0,
+                documents,
+                dimension as i32,
+                query,
+                dimension as i32,
+                0.0,
+                out,
+                token_count as i32,
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "macos", feature = "openblas")))]
+    {
+        // Strides say the same thing without the transpose flags: `documents`
+        // is passed with its row and column strides swapped, which is its
+        // transpose. Single-threaded on purpose -- the caller already runs one
+        // of these per rayon worker, and a threaded inner kernel would
+        // oversubscribe against that.
+        unsafe {
+            matrixmultiply::sgemm(
+                query_tokens,
+                dimension,
+                token_count,
+                1.0,
+                query.as_ptr(),
+                dimension as isize,
+                1,
+                documents.as_ptr(),
+                1,
+                dimension as isize,
+                0.0,
+                out.as_mut_ptr(),
+                token_count as isize,
+                1,
+            );
+        }
+    }
+}
+
 fn score_work(
     query: &[f32],
     documents: &[f32],
@@ -169,23 +241,14 @@ fn score_work(
     let scores = SIMILARITY_BUFFER.with(|storage| {
         let mut storage = storage.borrow_mut();
         storage.resize(query_tokens * token_count, 0.0);
-        unsafe {
-            sgemm(
-                b'T',
-                b'N',
-                token_count as i32,
-                query_tokens as i32,
-                dimension as i32,
-                1.0,
-                documents,
-                dimension as i32,
-                query,
-                dimension as i32,
-                0.0,
-                storage.as_mut_slice(),
-                token_count as i32,
-            );
-        }
+        similarities(
+            query,
+            documents,
+            storage.as_mut_slice(),
+            query_tokens,
+            token_count,
+            dimension,
+        );
 
         (work.first_document..work.last_document)
             .map(|document| {

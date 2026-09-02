@@ -11,15 +11,29 @@ name = "_native"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-blas = "0.23"
+matrixmultiply = "0.3"
 numpy = "0.24.0"
 pyo3 = "0.24.2"
 rayon = "1.10"
 thiserror = "2.0"
 zstd = "0.13"
 
+# Only reachable through the `openblas` feature, or on macOS where Accelerate
+# is part of the operating system and therefore always present.
+blas = { version = "0.23", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
+blas = "0.23"
 blas-src = { version = "0.11", default-features = false, features = ["accelerate"] }
+
+[features]
+default = []
+# Route the MaxSim SGEMM through a system OpenBLAS rather than the bundled
+# pure-Rust kernel. Worth about 1.75x on the kernel, at the cost of requiring
+# `libopenblas.so.0` -- exporting the plain Fortran symbol `sgemm_` -- at both
+# link and load time. Set OPENBLAS_LIB_DIR if it lives outside the linker's
+# default search path. See ARCHITECTURE.md, "The SGEMM dependency".
+openblas = ["dep:blas"]
 
 [profile.release]
 lto = true

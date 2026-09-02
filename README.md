@@ -13,13 +13,50 @@ The package supplies:
 - `Query`, `Candidate`, `Score`, and `IndexManifest` value contracts;
 - `CandidateGenerator` and `CandidateScorer` protocols;
 - orchestration, compatibility checks, timings, and resource budgets;
-- a packed CPU `maxsim_scores_packed` kernel using BLAS, SIMD maximum
+- a packed CPU `maxsim_scores_packed` kernel using SGEMM, SIMD maximum
   reduction, bounded token batches, and optional worker pools; and
 - optional vector stores for generators, such as BM25, that do not own a
   document-vector representation.
 
 Native late-interaction engines can ignore lateweave storage entirely. A scorer
 owns every representation-specific transition behind `CandidateScorer.score`.
+
+## Building
+
+```bash
+pip install maturin
+maturin build --release
+```
+
+That default build has no external library dependency: the MaxSim kernel's
+SGEMM comes from the bundled pure-Rust `matrixmultiply`, so the extension
+imports on any host.
+
+For a deployment, take the OpenBLAS kernel instead — about 1.75x faster on the
+shapes this kernel sees, bit-identical results:
+
+```bash
+maturin build --release --features pyo3/extension-module,openblas
+```
+
+`maturin` runs auditwheel's repair step, which **vendors** `libopenblas.so.0`
+into `lateweave.libs/` inside the wheel. So this is self-contained too: it needs
+OpenBLAS on the machine that *builds* the wheel, not on the machines that
+install it. Set `OPENBLAS_LIB_DIR` if `libopenblas.so.0` lives outside the
+linker's default search path.
+
+Two things to know about that command line:
+
+- `pyo3/extension-module` must be repeated. `--features` replaces the list in
+  `[tool.maturin]` instead of extending it, and without `extension-module`
+  pyo3 links `libpython`, which auditwheel then bundles into the wheel.
+- The library lateweave needs exports the plain Fortran symbol `sgemm_`.
+  `scipy-openblas32` on PyPI does not qualify -- it is a real threaded
+  OpenBLAS, but every symbol carries a `scipy_` prefix.
+
+macOS needs no feature flag: Accelerate ships with the OS and is used
+automatically. [ARCHITECTURE.md](ARCHITECTURE.md#the-sgemm-dependency) explains
+why Linux does not have an equivalent default.
 
 ## Optional vector stores
 
