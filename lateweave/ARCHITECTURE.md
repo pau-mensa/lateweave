@@ -20,7 +20,7 @@ private representation -> scores   ---> Score contract
 Optional lateweave store ----------> StoredMaxSimScorer -> CPU MaxSim
 ```
 
-BM25X, FastPLAID, WARP, and Tachiom are potential implementors or consumers of
+bm25s, FastPLAID, WARP, and Tachiom are potential implementors or consumers of
 the contracts, not dependencies of the package. Native engines that already
 own document representations should implement `CandidateScorer` directly and
 ignore optional storage.

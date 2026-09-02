@@ -88,4 +88,4 @@ and scoring. Lateweave only requires it to declare qualified semantics and
 score exactly the candidate set it receives.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the ownership rules and
-[cookbook/README.md](cookbook/README.md) for BM25X plus stored-vector examples.
+[cookbook/README.md](cookbook/README.md) for BM25 plus stored-vector examples.

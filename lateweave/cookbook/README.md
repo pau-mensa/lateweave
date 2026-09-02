@@ -1,15 +1,27 @@
-# Cookbook: BM25X + stored vectors + MaxSim
+# Cookbook: BM25 + stored vectors + MaxSim
 
-This recipe maintains one retrieval index: BM25X. Its only other persistent
-artifact is an optional lateweave vector store used to rerank BM25 candidates.
-There are no vector postings or second candidate index.
+This recipe maintains one retrieval index: a bm25s lexical index. Its only other
+persistent artifact is an optional lateweave vector store used to rerank BM25
+candidates. There are no vector postings or second candidate index.
 
-BM25X is declared in the script's PEP 723 metadata rather than in lateweave's
+bm25s is declared in the script's PEP 723 metadata rather than in lateweave's
 package dependencies:
 
 ```bash
 uv run --with-editable . cookbook/bm25_stored_maxsim.py --help
 ```
+
+## The lexical stage
+
+Documents and queries are analyzed the same way: casefold, strip combining
+marks, take `\w+` runs. `--stemmer` adds a Snowball algorithm (`spanish`,
+`portuguese`, `english`, ...) and defaults to none, which is language-agnostic.
+
+The chain is recorded in the generator manifest's `build_parameters` and read
+back on every open and every mutation, so an index cannot be queried through a
+different chain than its postings were built with. Analysis silently diverging
+from the postings is the one failure in a lexical stage that produces no error
+and no warning — it just returns fewer documents.
 
 ## Store choices
 
@@ -77,7 +89,9 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py update \
 
 Existing external IDs are rejected. Fixed-record stores create replacement
 arrays; jzip appends newly compressed document frames without touching existing
-frames.
+frames. The lexical index has no incremental append, so it is rebuilt over the
+whole corpus from `documents.jsonl` — a few seconds for tens of thousands of
+documents, and O(corpus) rather than O(delta).
 
 ## Delete
 
@@ -88,9 +102,11 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py delete \
   --document-id law-42
 ```
 
-Internal IDs are compacted in the same order as BM25X. INT8 and TurboQuant copy
-live token records. Jzip copies live compressed frames without decoding or
-recompressing them.
+Remaining documents are renumbered 0..n-1 in document order. The lexical index
+is rebuilt over the survivors, so it lands on that numbering by construction
+rather than by two implementations agreeing. INT8 and TurboQuant copy live token
+records. Jzip copies live compressed frames without decoding or recompressing
+them.
 
 ## Search
 

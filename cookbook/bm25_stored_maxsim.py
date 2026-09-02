@@ -1,29 +1,50 @@
 # /// script
 # requires-python = ">=3.11,<3.14"
 # dependencies = [
-#   "bm25x==0.3.1",
+#   "bm25s==0.3.11",
 #   "numpy>=1.26,<3",
+#   "PyStemmer>=2.2,<4",
+#   "scipy>=1.11",
 # ]
 # ///
-"""BM25X gathering + optional lateweave vector storage + MaxSim.
+"""BM25 gathering + optional lateweave vector storage + MaxSim.
 
 Run from the lateweave package directory:
 
     uv run --with-editable . cookbook/bm25_stored_maxsim.py --help
+
+The lexical stage is bm25s. It owns no analysis chain of its own: queries arrive
+as token strings mapped through the vocabulary the index itself persisted, so
+nothing inside the index can fall out of step with the postings, and a persisted
+index returns exactly what an in-memory one built from the same text returns.
+
+What a caller can still get wrong is building with one analyzer and querying
+with another, which loses terms silently. So the analyzer lives in the generator
+manifest and is read back from it on every open and every mutation.
+
+bm25s has no incremental append or delete, so ``update`` and ``delete`` rebuild
+the lexical index from ``documents.jsonl``, which this recipe maintains anyway.
+The vector store keeps its incremental paths. Rebuilding is O(corpus) rather
+than O(delta) -- a few seconds for tens of thousands of documents -- and it
+makes the internal ID compaction after a delete exact by construction rather
+than by agreement between two implementations.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import fcntl
 import gc
 import json
 from pathlib import Path
+import re
 import shutil
+import sys
 import tempfile
 from typing import Any, Iterator, Sequence
+import unicodedata
 import uuid
 
 import numpy as np
@@ -47,6 +68,95 @@ GENERATOR_MANIFEST = "generator-manifest.json"
 SCORER_MANIFEST = "scorer-manifest.json"
 DOCUMENTS_FILE = "documents.jsonl"
 VECTOR_DIRECTORY = "vectors"
+LEXICAL_DIRECTORY = "bm25"
+
+# Lucene's defaults, spelled out so a bm25s default change cannot move results.
+LEXICAL_METHOD = "lucene"
+LEXICAL_K1 = 1.5
+LEXICAL_B = 0.75
+#: Name recorded in the generator manifest for the tokenizer below.
+LEXICAL_TOKENIZER = "unicode-fold"
+
+_TOKEN = re.compile(r"\w+")
+
+
+@dataclass(frozen=True)
+class Analyzer:
+    """Text to terms, identically for documents and queries.
+
+    ``stemmer`` is a Snowball algorithm name (``"spanish"``, ``"portuguese"``,
+    ``"english"``, ...) or ``None``. None is the default because it is
+    language-agnostic: on a Spanish corpus it reached the same gold recall at
+    the gather depth as a stemmed chain, and a corpus whose language varies per
+    document has no single right answer.
+    """
+
+    stemmer: str | None = None
+
+    def __post_init__(self) -> None:
+        stem = None
+        if self.stemmer is not None:
+            import Stemmer
+
+            if self.stemmer not in Stemmer.algorithms():
+                raise ValueError(
+                    f"unknown Snowball algorithm {self.stemmer!r}; available: "
+                    f"{', '.join(sorted(Stemmer.algorithms()))}"
+                )
+            stem = Stemmer.Stemmer(self.stemmer).stemWords
+        object.__setattr__(self, "_stem", stem)
+
+    def tokens(self, text: str) -> list[str]:
+        """Casefolded, accent-stripped ``\\w+`` runs, optionally stemmed."""
+        normalized = unicodedata.normalize("NFKD", text.casefold())
+        folded = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        terms = _TOKEN.findall(folded)
+        if self._stem is not None:
+            terms = self._stem(terms)
+        return [sys.intern(term) for term in terms]
+
+    def build_parameters(self) -> dict[str, Any]:
+        """The analysis chain, as it is recorded in the generator manifest."""
+        return {
+            "method": LEXICAL_METHOD,
+            "tokenizer": LEXICAL_TOKENIZER,
+            "stemmer": self.stemmer,
+            "stopwords": None,
+            "k1": LEXICAL_K1,
+            "b": LEXICAL_B,
+        }
+
+    @classmethod
+    def from_manifest(cls, manifest: IndexManifest) -> "Analyzer":
+        """Recover the chain an index was built with, refusing an unknown one.
+
+        Querying through a different chain than the postings were built with
+        loses terms silently, so it is refused rather than tolerated.
+        """
+        parameters = manifest.build_parameters or {}
+        tokenizer = parameters.get("tokenizer")
+        if tokenizer != LEXICAL_TOKENIZER:
+            raise ValueError(
+                f"index was built with tokenizer {tokenizer!r}, which this "
+                f"recipe cannot reproduce; expected {LEXICAL_TOKENIZER!r}"
+            )
+        return cls(stemmer=parameters.get("stemmer"))
+
+
+def write_lexical_index(
+    path: Path, texts: Sequence[str], analyzer: Analyzer
+) -> None:
+    """Build the lexical index at ``path``, replacing anything already there."""
+    import bm25s
+
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    index = bm25s.BM25(method=LEXICAL_METHOD, k1=LEXICAL_K1, b=LEXICAL_B)
+    index.index([analyzer.tokens(text) for text in texts], show_progress=False)
+    index.save(str(path), show_progress=False)
+    del index
+    gc.collect()
 
 
 @contextmanager
@@ -107,42 +217,63 @@ def mutated_manifest(
     )
 
 
-class BM25XCandidateGenerator:
-    """Cookbook adapter; BM25X remains external to lateweave."""
+class LexicalCandidateGenerator:
+    """Cookbook adapter; the lexical index remains external to lateweave."""
 
-    def __init__(self, index: Any, manifest: IndexManifest) -> None:
+    def __init__(
+        self, index: Any, manifest: IndexManifest, analyzer: Analyzer
+    ) -> None:
         self.index = index
         self.manifest = manifest
+        self.analyzer = analyzer
 
     @classmethod
-    def open(cls, path: Path, manifest: IndexManifest) -> "BM25XCandidateGenerator":
-        from bm25x import BM25
+    def open(
+        cls, path: Path, manifest: IndexManifest
+    ) -> "LexicalCandidateGenerator":
+        """Open the index, analyzing queries the way its postings were built."""
+        import bm25s
 
-        return cls(
-            BM25(
-                index=str(path),
-                method="lucene",
-                tokenizer="unicode",
-                use_stopwords=False,
-                cuda=False,
-            ),
-            manifest,
+        analyzer = Analyzer.from_manifest(manifest)
+        index = bm25s.BM25.load(
+            str(path), mmap=True, load_corpus=False, show_progress=False
         )
+        stored = int(index.scores["num_docs"])
+        if stored != manifest.document_count:
+            raise RuntimeError(
+                f"lexical index holds {stored:,} documents but the manifest "
+                f"declares {manifest.document_count:,}"
+            )
+        return cls(index, manifest, analyzer)
 
     def gather(self, query: Query, limit: int) -> tuple[Candidate, ...]:
-        rows = self.index.search([query.text], k=limit)
-        if len(rows) != 1:
-            raise RuntimeError(f"BM25X returned {len(rows)} result rows for one query")
+        terms = self.analyzer.tokens(query.text)
+        if not terms:
+            return ()
+        # bm25s raises when the limit exceeds the corpus; it never pads.
+        documents, scores = self.index.retrieve(
+            [terms],
+            k=min(limit, self.manifest.document_count),
+            show_progress=False,
+        )
         candidates = []
         seen: set[int] = set()
-        for rank, (raw_document_id, raw_score) in enumerate(rows[0]):
+        for raw_document_id, raw_score in zip(
+            documents[0].tolist(), scores[0].tolist()
+        ):
+            score = float(raw_score)
+            # Under the Lucene idf a zero score shares no term with the query.
+            if score != score or score <= 0.0:
+                continue
             document_id = int(raw_document_id)
             if not 0 <= document_id < self.manifest.document_count:
-                raise RuntimeError(f"BM25X returned out-of-range ID {document_id}")
+                raise RuntimeError(f"bm25s returned out-of-range ID {document_id}")
             if document_id in seen:
-                raise RuntimeError(f"BM25X returned duplicate ID {document_id}")
+                raise RuntimeError(f"bm25s returned duplicate ID {document_id}")
             seen.add(document_id)
-            candidates.append(Candidate(document_id, float(raw_score), rank, "bm25x"))
+            candidates.append(
+                Candidate(document_id, score, len(candidates), "bm25s")
+            )
         return tuple(candidates)
 
 
@@ -194,9 +325,8 @@ def write_documents(path: Path, documents: Sequence[dict[str, str]]) -> None:
 
 
 def build_index(args: argparse.Namespace) -> None:
-    from bm25x import BM25
-
     destination = args.index.expanduser().resolve()
+    analyzer = Analyzer(stemmer=args.stemmer)
     documents = load_documents(args.documents)
     packed, lengths = load_packed_embeddings(args.embeddings, args.document_lengths)
     if len(documents) != len(lengths):
@@ -224,9 +354,9 @@ def build_index(args: argparse.Namespace) -> None:
     )
     generator_manifest = replace(
         common,
-        representation="bm25x-inverted-index",
-        score_semantics="bm25x-lucene",
-        build_parameters={"method": "lucene", "tokenizer": "unicode"},
+        representation="bm25s-sparse-index",
+        score_semantics="bm25s-lucene",
+        build_parameters=analyzer.build_parameters(),
     )
     scorer_manifest = replace(
         common,
@@ -253,14 +383,11 @@ def build_index(args: argparse.Namespace) -> None:
         )
         try:
             write_documents(temporary / DOCUMENTS_FILE, documents)
-            bm25 = BM25(
-                index=str(temporary / "bm25x"),
-                method="lucene",
-                tokenizer="unicode",
-                use_stopwords=False,
-                cuda=False,
+            write_lexical_index(
+                temporary / LEXICAL_DIRECTORY,
+                [row["text"] for row in documents],
+                analyzer,
             )
-            bm25.add([row["text"] for row in documents])
             store_options = {
                 "chunk_tokens": args.chunk_tokens,
                 "threads": args.threads,
@@ -272,8 +399,6 @@ def build_index(args: argparse.Namespace) -> None:
             )
             generator_manifest.write(temporary / GENERATOR_MANIFEST)
             scorer_manifest.write(temporary / SCORER_MANIFEST)
-            del bm25
-            gc.collect()
             temporary.replace(destination)
         finally:
             if temporary.exists():
@@ -282,8 +407,6 @@ def build_index(args: argparse.Namespace) -> None:
 
 
 def update_index(args: argparse.Namespace) -> None:
-    from bm25x import BM25
-
     source = args.index.expanduser().resolve()
     additions = load_documents(args.documents)
     packed, lengths = load_packed_embeddings(args.embeddings, args.document_lengths)
@@ -301,16 +424,9 @@ def update_index(args: argparse.Namespace) -> None:
         generator_manifest = IndexManifest.read(source / GENERATOR_MANIFEST)
         scorer_manifest = IndexManifest.read(source / SCORER_MANIFEST)
         generator_manifest.assert_compatible(scorer_manifest)
+        analyzer = Analyzer.from_manifest(generator_manifest)
         replacement = staged_index_copy(source)
         try:
-            bm25 = BM25(
-                index=str(replacement / "bm25x"),
-                method="lucene",
-                tokenizer="unicode",
-                use_stopwords=False,
-                cuda=False,
-            )
-            bm25.add([row["text"] for row in additions])
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
             store.append(
                 packed,
@@ -320,6 +436,13 @@ def update_index(args: argparse.Namespace) -> None:
                 threads=args.threads,
             )
             updated_documents = [*existing, *additions]
+            # bm25s has no incremental append, so the lexical index is rebuilt
+            # over the whole corpus. The vector store still appends in place.
+            write_lexical_index(
+                replacement / LEXICAL_DIRECTORY,
+                [row["text"] for row in updated_documents],
+                analyzer,
+            )
             write_documents(replacement / DOCUMENTS_FILE, updated_documents)
             mutated_manifest(
                 generator_manifest,
@@ -333,7 +456,7 @@ def update_index(args: argparse.Namespace) -> None:
                 operation="append",
                 affected=len(additions),
             ).write(replacement / SCORER_MANIFEST)
-            del bm25, store
+            del store
             gc.collect()
             publish_replacement(source, replacement)
         finally:
@@ -346,8 +469,6 @@ def update_index(args: argparse.Namespace) -> None:
 
 
 def delete_index(args: argparse.Namespace) -> None:
-    from bm25x import BM25
-
     source = args.index.expanduser().resolve()
     requested = list(dict.fromkeys(args.document_id))
     with index_lock(source, exclusive=True):
@@ -370,18 +491,18 @@ def delete_index(args: argparse.Namespace) -> None:
         generator_manifest = IndexManifest.read(source / GENERATOR_MANIFEST)
         scorer_manifest = IndexManifest.read(source / SCORER_MANIFEST)
         generator_manifest.assert_compatible(scorer_manifest)
+        analyzer = Analyzer.from_manifest(generator_manifest)
         replacement = staged_index_copy(source)
         try:
-            bm25 = BM25(
-                index=str(replacement / "bm25x"),
-                method="lucene",
-                tokenizer="unicode",
-                use_stopwords=False,
-                cuda=False,
-            )
-            bm25.delete(internal_ids)
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
             store.delete(internal_ids, copy_chunk_tokens=args.copy_chunk_tokens)
+            # Rebuilding over the survivors compacts internal IDs to 0..n-1 in
+            # document order, which is the order the store compacts to as well.
+            write_lexical_index(
+                replacement / LEXICAL_DIRECTORY,
+                [row["text"] for row in remaining],
+                analyzer,
+            )
             write_documents(replacement / DOCUMENTS_FILE, remaining)
             mutated_manifest(
                 generator_manifest,
@@ -395,7 +516,7 @@ def delete_index(args: argparse.Namespace) -> None:
                 operation="delete",
                 affected=len(internal_ids),
             ).write(replacement / SCORER_MANIFEST)
-            del bm25, store
+            del store
             gc.collect()
             publish_replacement(source, replacement)
         finally:
@@ -413,7 +534,9 @@ def search_index(args: argparse.Namespace) -> None:
         documents = load_documents(source / DOCUMENTS_FILE)
         generator_manifest = IndexManifest.read(source / GENERATOR_MANIFEST)
         scorer_manifest = IndexManifest.read(source / SCORER_MANIFEST)
-        generator = BM25XCandidateGenerator.open(source / "bm25x", generator_manifest)
+        generator = LexicalCandidateGenerator.open(
+            source / LEXICAL_DIRECTORY, generator_manifest
+        )
         scorer = StoredMaxSimScorer(
             open_vector_store(source / VECTOR_DIRECTORY), scorer_manifest
         )
@@ -466,7 +589,7 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     commands = value.add_subparsers(dest="command", required=True)
 
-    build = commands.add_parser("build", help="build BM25X and a vector store")
+    build = commands.add_parser("build", help="build BM25 and a vector store")
     build.add_argument("--index", type=Path, required=True)
     build.add_argument("--documents", type=Path, required=True)
     build.add_argument("--embeddings", type=Path, required=True)
@@ -484,6 +607,14 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--document-template", default="")
     build.add_argument("--chunk-tokens", type=int, default=131_072)
     build.add_argument("--threads", type=int)
+    build.add_argument(
+        "--stemmer",
+        default=None,
+        help="Snowball algorithm for the lexical stage (e.g. spanish, "
+             "portuguese). Default: none, which is language-agnostic. Recorded "
+             "in the generator manifest and reused by update, delete and "
+             "search.",
+    )
     build.set_defaults(function=build_index)
 
     update = commands.add_parser("update", help="append documents and vectors")

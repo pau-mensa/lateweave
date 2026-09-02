@@ -1,8 +1,9 @@
 # /// script
 # requires-python = ">=3.11,<3.14"
 # dependencies = [
-#   "bm25x==0.3.1",
+#   "bm25s==0.3.11",
 #   "numpy>=1.26,<3",
+#   "scipy>=1.11",
 # ]
 # ///
 
@@ -16,12 +17,14 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import resource
 import shutil
 import sys
 import tarfile
 import time
 from typing import Iterator, TextIO
+import unicodedata
 
 import numpy as np
 
@@ -49,7 +52,7 @@ class BenchmarkPaths:
 
     @property
     def bm25(self) -> Path:
-        return self.workspace / "bm25x"
+        return self.workspace / "bm25"
 
     def store(self, name: str) -> Path:
         return self.workspace / f"store-{name}"
@@ -302,6 +305,39 @@ def prepare(
     )
 
 
+# The lexical stage matches cookbook/bm25_stored_maxsim.py: casefold, strip
+# combining marks, take \w+ runs, no stopwords and no stemming.
+_TOKEN = re.compile(r"\w+")
+
+
+def analyze(text: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKD", text.casefold())
+    folded = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return [sys.intern(token) for token in _TOKEN.findall(folded)]
+
+
+def open_bm25(path: Path):
+    """Reopen a persisted lexical index for searching."""
+    import bm25s
+
+    return bm25s.BM25.load(str(path), mmap=True, load_corpus=False, show_progress=False)
+
+
+def bm25_rows(index, query: str, limit: int) -> list[tuple[int, float]]:
+    """Top-``limit`` ``(document, score)`` pairs, matches only."""
+    terms = analyze(query)
+    if not terms:
+        return []
+    documents, scores = index.retrieve(
+        [terms], k=min(limit, int(index.scores["num_docs"])), show_progress=False
+    )
+    return [
+        (int(document), float(score))
+        for document, score in zip(documents[0].tolist(), scores[0].tolist())
+        if score > 0.0
+    ]
+
+
 def load_documents(paths: BenchmarkPaths) -> list[dict[str, str]]:
     with (paths.data / "documents.jsonl").open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle]
@@ -310,23 +346,23 @@ def load_documents(paths: BenchmarkPaths) -> list[dict[str, str]]:
 def benchmark_bm25(
     paths: BenchmarkPaths, config: BenchmarkConfig, overwrite: bool
 ) -> None:
-    from bm25x import BM25
+    import bm25s
 
     documents = load_documents(paths)
     queries = json.loads((paths.data / "queries.json").read_text(encoding="utf-8"))
     prepare_output(paths.bm25, paths.workspace, overwrite)
     started = time.perf_counter()
-    index = BM25(
-        index=str(paths.bm25),
-        method="lucene",
-        tokenizer="unicode",
-        use_stopwords=False,
-        cuda=False,
-    )
-    index.add([row["text"] for row in documents])
+    builder = bm25s.BM25(method="lucene", k1=1.5, b=0.75)
+    builder.index([analyze(row["text"]) for row in documents], show_progress=False)
+    paths.bm25.mkdir(parents=True, exist_ok=True)
+    builder.save(str(paths.bm25), show_progress=False)
     build_seconds = time.perf_counter() - started
+    del builder
+    gc.collect()
 
-    index.search([queries[0]], k=config.candidates)
+    # Search the reopened index, which is the shape a deployment runs.
+    index = open_bm25(paths.bm25)
+    bm25_rows(index, queries[0], config.candidates)
     candidate_ids = np.full(
         (config.query_count, config.candidates), -1, dtype=np.int64
     )
@@ -334,7 +370,7 @@ def benchmark_bm25(
     timings_ms: list[float] = []
     for position, query in enumerate(queries):
         started = time.perf_counter()
-        rows = index.search([query], k=config.candidates)[0]
+        rows = bm25_rows(index, query, config.candidates)
         timings_ms.append((time.perf_counter() - started) * 1000)
         count = min(len(rows), config.candidates)
         counts[position] = count
@@ -450,7 +486,7 @@ def run_score_pass(
     for position in range(config.query_count):
         ids = candidate_ids[position, : counts[position]]
         candidates = tuple(
-            Candidate(int(document_id), 0.0, rank, "bm25x-benchmark")
+            Candidate(int(document_id), 0.0, rank, "bm25s-benchmark")
             for rank, document_id in enumerate(ids)
         )
         query = Query(
@@ -468,7 +504,6 @@ def run_score_pass(
 def benchmark_search(
     paths: BenchmarkPaths, config: BenchmarkConfig, name: str
 ) -> None:
-    from bm25x import BM25
     from lateweave import (
         Candidate,
         Query,
@@ -515,13 +550,7 @@ def benchmark_search(
 
     end_to_end = bm25_ms + np.asarray(second_pass)
     queries = json.loads((paths.data / "queries.json").read_text(encoding="utf-8"))
-    bm25 = BM25(
-        index=str(paths.bm25),
-        method="lucene",
-        tokenizer="unicode",
-        use_stopwords=False,
-        cuda=False,
-    )
+    bm25 = open_bm25(paths.bm25)
     budget = ResourceBudget(
         max_batch_tokens=config.max_batch_tokens,
         max_documents_per_batch=config.candidates,
@@ -532,9 +561,9 @@ def benchmark_search(
         timings: list[float] = []
         for position, query_text in enumerate(queries):
             started = time.perf_counter()
-            rows = bm25.search([query_text], k=config.candidates)[0]
+            rows = bm25_rows(bm25, query_text, config.candidates)
             candidates = tuple(
-                Candidate(int(document_id), float(score), rank, "bm25x-benchmark")
+                Candidate(int(document_id), float(score), rank, "bm25s-benchmark")
                 for rank, (document_id, score) in enumerate(rows)
             )
             scorer.score(
