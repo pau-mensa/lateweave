@@ -1,6 +1,0 @@
-/.venv/
-/target/
-/.pytest_cache/
-**/__pycache__/
-/python/lateweave/*.so
-

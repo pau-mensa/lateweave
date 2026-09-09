@@ -14,7 +14,6 @@ from .interfaces import (
     SearchTimings,
 )
 from .manifest import IncompatibleIndexError, IndexManifest, document_ids_digest
-from .metadata import DuckDBMetadataStore, MetadataRecord
 from .pipeline import SearchPipeline
 from .scorers import StoredMaxSimScorer
 from .storage import (
@@ -28,10 +27,8 @@ __all__ = [
     "Candidate",
     "CandidateGenerator",
     "CandidateScorer",
-    "DuckDBMetadataStore",
     "IncompatibleIndexError",
     "IndexManifest",
-    "MetadataRecord",
     "Query",
     "RankedDocument",
     "ResourceBudget",
