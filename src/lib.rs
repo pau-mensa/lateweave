@@ -13,7 +13,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 type PyInt8StorageArrays<'py> = (Bound<'py, PyArray2<i8>>, Bound<'py, PyArray1<f32>>);
-type PyJzipStorageArrays<'py> = (Bound<'py, PyArray1<u8>>, Bound<'py, PyArray1<u64>>);
 
 #[pyclass(name = "Candidate", frozen, get_all, module = "lateweave._native")]
 #[derive(Clone, Debug)]
@@ -69,7 +68,6 @@ impl PyScore {
 #[pyclass(name = "ResourceBudget", frozen, get_all, module = "lateweave._native")]
 #[derive(Clone, Debug)]
 struct PyResourceBudget {
-    max_memory_bytes: Option<u64>,
     max_batch_tokens: usize,
     max_documents_per_batch: usize,
     threads: Option<usize>,
@@ -78,9 +76,8 @@ struct PyResourceBudget {
 #[pymethods]
 impl PyResourceBudget {
     #[new]
-    #[pyo3(signature = (*, max_memory_bytes=None, max_batch_tokens=131_072, max_documents_per_batch=256, threads=None))]
+    #[pyo3(signature = (*, max_batch_tokens=131_072, max_documents_per_batch=256, threads=None))]
     fn new(
-        max_memory_bytes: Option<u64>,
         max_batch_tokens: usize,
         max_documents_per_batch: usize,
         threads: Option<usize>,
@@ -97,50 +94,10 @@ impl PyResourceBudget {
             return Err(PyValueError::new_err("threads must be positive"));
         }
         Ok(Self {
-            max_memory_bytes,
             max_batch_tokens,
             max_documents_per_batch,
             threads,
         })
-    }
-}
-
-#[pyclass(
-    name = "ScorerCapabilities",
-    frozen,
-    get_all,
-    module = "lateweave._native"
-)]
-#[derive(Clone, Debug)]
-struct PyScorerCapabilities {
-    preferred_batch_tokens: usize,
-    supports_mmap: bool,
-    supports_prefetch: bool,
-    supports_candidate_reordering: bool,
-    supports_cpu_gpu_sharding: bool,
-    score_semantics: String,
-}
-
-#[pymethods]
-impl PyScorerCapabilities {
-    #[new]
-    #[pyo3(signature = (*, preferred_batch_tokens, supports_mmap=false, supports_prefetch=false, supports_candidate_reordering=false, supports_cpu_gpu_sharding=false, score_semantics))]
-    fn new(
-        preferred_batch_tokens: usize,
-        supports_mmap: bool,
-        supports_prefetch: bool,
-        supports_candidate_reordering: bool,
-        supports_cpu_gpu_sharding: bool,
-        score_semantics: String,
-    ) -> Self {
-        Self {
-            preferred_batch_tokens,
-            supports_mmap,
-            supports_prefetch,
-            supports_candidate_reordering,
-            supports_cpu_gpu_sharding,
-            score_semantics,
-        }
     }
 }
 
@@ -308,170 +265,14 @@ fn storage_int8_decode<'py>(
     Ok(output.into_pyarray(py))
 }
 
-#[pyfunction(name = "_storage_turboquant4_encode")]
-#[pyo3(signature = (embeddings, *, threads=None))]
-fn storage_turboquant4_encode<'py>(
-    py: Python<'py>,
-    embeddings: PyReadonlyArray2<'py, f32>,
-    threads: Option<usize>,
-) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let shape = embeddings.shape();
-    let values = embeddings.as_slice()?;
-    let output = py
-        .allow_threads(|| storage::turboquant4_encode(values, shape[0], shape[1], threads))
-        .map_err(PyValueError::new_err)?;
-    let output = Array2::from_shape_vec((shape[0], shape[1] / 2), output)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(output.into_pyarray(py))
-}
-
-#[pyfunction(name = "_storage_turboquant4_decode_rotated")]
-#[pyo3(signature = (codes, dimension, *, normalize=true, threads=None))]
-fn storage_turboquant4_decode_rotated<'py>(
-    py: Python<'py>,
-    codes: PyReadonlyArray2<'py, u8>,
-    dimension: usize,
-    normalize: bool,
-    threads: Option<usize>,
-) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    let shape = codes.shape();
-    let values = codes.as_slice()?;
-    let output = py
-        .allow_threads(|| {
-            storage::turboquant4_decode_rotated(values, shape[0], dimension, normalize, threads)
-        })
-        .map_err(PyValueError::new_err)?;
-    let output = Array2::from_shape_vec((shape[0], dimension), output)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(output.into_pyarray(py))
-}
-
-#[pyfunction(name = "_storage_turboquant_rotate")]
-#[pyo3(signature = (embeddings, *, threads=None))]
-fn storage_turboquant_rotate<'py>(
-    py: Python<'py>,
-    embeddings: PyReadonlyArray2<'py, f32>,
-    threads: Option<usize>,
-) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    let shape = embeddings.shape();
-    let values = embeddings.as_slice()?;
-    let output = py
-        .allow_threads(|| storage::turboquant_rotate(values, shape[0], shape[1], threads))
-        .map_err(PyValueError::new_err)?;
-    let output = Array2::from_shape_vec((shape[0], shape[1]), output)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(output.into_pyarray(py))
-}
-
-#[pyfunction(name = "_storage_jzip_encode_documents")]
-#[pyo3(signature = (embeddings, document_lengths, *, compression_level=1, threads=None))]
-fn storage_jzip_encode_documents<'py>(
-    py: Python<'py>,
-    embeddings: PyReadonlyArray2<'py, f32>,
-    document_lengths: PyReadonlyArray1<'py, i64>,
-    compression_level: i32,
-    threads: Option<usize>,
-) -> PyResult<PyJzipStorageArrays<'py>> {
-    let shape = embeddings.shape();
-    let values = embeddings.as_slice()?;
-    let lengths = document_lengths
-        .as_slice()?
-        .iter()
-        .enumerate()
-        .map(|(position, &length)| {
-            usize::try_from(length).map_err(|_| {
-                PyValueError::new_err(format!(
-                    "document length at position {position} must be positive"
-                ))
-            })
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    if lengths.contains(&0) {
-        return Err(PyValueError::new_err("document lengths must be positive"));
-    }
-    let (payload, frame_lengths) = py
-        .allow_threads(|| {
-            storage::jzip_encode_documents(
-                values,
-                shape[0],
-                shape[1],
-                &lengths,
-                compression_level,
-                threads,
-            )
-        })
-        .map_err(PyValueError::new_err)?;
-    Ok((
-        Array1::from_vec(payload).into_pyarray(py),
-        Array1::from_vec(frame_lengths).into_pyarray(py),
-    ))
-}
-
-#[pyfunction(name = "_storage_jzip_decode_documents")]
-#[pyo3(signature = (payload, frame_lengths, document_lengths, dimension, *, threads=None))]
-fn storage_jzip_decode_documents<'py>(
-    py: Python<'py>,
-    payload: PyReadonlyArray1<'py, u8>,
-    frame_lengths: PyReadonlyArray1<'py, u64>,
-    document_lengths: PyReadonlyArray1<'py, i64>,
-    dimension: usize,
-    threads: Option<usize>,
-) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    let lengths = document_lengths
-        .as_slice()?
-        .iter()
-        .enumerate()
-        .map(|(position, &length)| {
-            usize::try_from(length).map_err(|_| {
-                PyValueError::new_err(format!(
-                    "document length at position {position} must be positive"
-                ))
-            })
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    if lengths.contains(&0) {
-        return Err(PyValueError::new_err("document lengths must be positive"));
-    }
-    let total_rows = lengths.iter().try_fold(0usize, |total, &length| {
-        total
-            .checked_add(length)
-            .ok_or_else(|| PyValueError::new_err("document lengths overflow usize"))
-    })?;
-    let payload_values = payload.as_slice()?;
-    let frame_length_values = frame_lengths.as_slice()?;
-    let output = py
-        .allow_threads(|| {
-            storage::jzip_decode_documents(
-                payload_values,
-                frame_length_values,
-                &lengths,
-                dimension,
-                threads,
-            )
-        })
-        .map_err(PyValueError::new_err)?;
-    let output = Array2::from_shape_vec((total_rows, dimension), output)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    Ok(output.into_pyarray(py))
-}
-
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCandidate>()?;
     module.add_class::<PyScore>()?;
     module.add_class::<PyResourceBudget>()?;
-    module.add_class::<PyScorerCapabilities>()?;
     module.add_function(wrap_pyfunction!(validate_and_rank, module)?)?;
     module.add_function(wrap_pyfunction!(maxsim_scores_packed, module)?)?;
     module.add_function(wrap_pyfunction!(storage_int8_encode, module)?)?;
     module.add_function(wrap_pyfunction!(storage_int8_decode, module)?)?;
-    module.add_function(wrap_pyfunction!(storage_turboquant4_encode, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        storage_turboquant4_decode_rotated,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(storage_turboquant_rotate, module)?)?;
-    module.add_function(wrap_pyfunction!(storage_jzip_encode_documents, module)?)?;
-    module.add_function(wrap_pyfunction!(storage_jzip_decode_documents, module)?)?;
     Ok(())
 }

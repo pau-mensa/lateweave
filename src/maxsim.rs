@@ -3,8 +3,8 @@
 //! The batching and SIMD reduction are derived from the Apache-2.0 licensed
 //! `maxsim-cpu` implementation by Benjamin Clavie and Mixedbread. Keeping the
 //! kernel here makes MaxSim the one concrete scoring primitive supplied by
-//! lateweave; retrieval backends remain external implementations of the
-//! generator/scorer contracts.
+//! lateweave; retrieval engines remain external implementations of the
+//! gatherer and reranker contracts.
 
 #[cfg(any(target_os = "macos", feature = "openblas"))]
 use blas::sgemm;

@@ -1,17 +1,30 @@
+"""Identity contracts checked before any search runs.
+
+Two identities are kept apart. A :class:`CorpusManifest` says *which documents*
+a stage indexes: every stage in a pipeline must agree on it. A
+:class:`Representation` says *which encoder* produced a vector feature: a stage
+that consumes such a feature must agree on it with the query that supplies it.
+"""
+
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 class IncompatibleIndexError(ValueError):
-    pass
+    """Two stages do not index the same documents."""
+
+
+class IncompatibleQueryError(ValueError):
+    """A query lacks a feature a stage needs, or supplies it from another encoder."""
 
 
 def document_ids_digest(document_ids: Sequence[str]) -> str:
+    """SHA-256 over external IDs in internal-ID order; identifies an ID binding."""
     digest = hashlib.sha256()
     for document_id in document_ids:
         encoded = document_id.encode("utf-8")
@@ -20,57 +33,36 @@ def document_ids_digest(document_ids: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
+def _mismatches(left: Any, right: Any) -> list[str]:
+    return [
+        f"{field.name}: {getattr(left, field.name)!r} != {getattr(right, field.name)!r}"
+        for field in fields(left)
+        if getattr(left, field.name) != getattr(right, field.name)
+    ]
+
+
 @dataclass(frozen=True)
-class IndexManifest:
+class CorpusManifest:
+    """Identity of one indexed document set at one mutation generation."""
+
     corpus_id: str
     corpus_version: str
     document_count: int
     document_ids_sha256: str
-    encoder: str
-    encoder_revision: str
-    tokenizer: str
-    dimension: int
-    dtype: str
-    normalized: bool
-    similarity: str = "dot"
-    query_template: str = ""
-    document_template: str = ""
-    truncation: str = ""
-    token_filtering: str = ""
-    representation: str = "unknown"
-    representation_version: int = 1
-    score_semantics: str = "unknown"
     generation: int = 0
-    build_parameters: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        for name in (
-            "corpus_id",
-            "corpus_version",
-            "document_ids_sha256",
-            "encoder",
-            "encoder_revision",
-            "tokenizer",
-            "dtype",
-            "similarity",
-            "representation",
-            "score_semantics",
-        ):
+        for name in ("corpus_id", "corpus_version", "document_ids_sha256"):
             if not getattr(self, name):
-                raise ValueError(f"manifest {name} must not be empty")
+                raise ValueError(f"corpus manifest {name} must not be empty")
         if self.document_count < 0:
-            raise ValueError("manifest document_count must not be negative")
-        if self.dimension <= 0:
-            raise ValueError("manifest dimension must be positive")
-        if self.representation_version <= 0:
-            raise ValueError("manifest representation_version must be positive")
+            raise ValueError("corpus manifest document_count must not be negative")
         if self.generation < 0:
-            raise ValueError("manifest generation must not be negative")
+            raise ValueError("corpus manifest generation must not be negative")
 
     @classmethod
-    def read(cls, path: str | Path) -> "IndexManifest":
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(**value)
+    def read(cls, path: str | Path) -> "CorpusManifest":
+        return cls(**json.loads(Path(path).read_text(encoding="utf-8")))
 
     def write(self, path: str | Path) -> None:
         Path(path).write_text(
@@ -78,32 +70,43 @@ class IndexManifest:
             encoding="utf-8",
         )
 
-    def assert_compatible(self, other: "IndexManifest") -> None:
-        fields = (
-            "corpus_id",
-            "corpus_version",
-            "document_count",
-            "document_ids_sha256",
-            "encoder",
-            "encoder_revision",
-            "tokenizer",
-            "dimension",
-            "normalized",
-            "similarity",
-            "query_template",
-            "document_template",
-            "truncation",
-            "token_filtering",
-            "generation",
-        )
-        mismatches = [
-            f"{name}: {getattr(self, name)!r} != {getattr(other, name)!r}"
-            for name in fields
-            if getattr(self, name) != getattr(other, name)
-        ]
+    def assert_compatible(self, other: "CorpusManifest") -> None:
+        mismatches = _mismatches(self, other)
         if mismatches:
             raise IncompatibleIndexError(
-                "generator and scorer indexes are incompatible ("
-                + "; ".join(mismatches)
-                + ")"
+                "stages index different corpora (" + "; ".join(mismatches) + ")"
+            )
+
+
+@dataclass(frozen=True)
+class Representation:
+    """Identity of the encoder that produced a vector feature."""
+
+    encoder: str
+    encoder_revision: str
+    dimension: int
+    normalized: bool
+    similarity: str = "dot"
+    query_template: str = ""
+    document_template: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("encoder", "encoder_revision", "similarity"):
+            if not getattr(self, name):
+                raise ValueError(f"representation {name} must not be empty")
+        if self.dimension <= 0:
+            raise ValueError("representation dimension must be positive")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "Representation":
+        return cls(**value)
+
+    def assert_compatible(self, other: "Representation") -> None:
+        mismatches = _mismatches(self, other)
+        if mismatches:
+            raise IncompatibleQueryError(
+                "representations differ (" + "; ".join(mismatches) + ")"
             )

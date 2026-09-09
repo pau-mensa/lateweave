@@ -2,24 +2,35 @@ from __future__ import annotations
 
 import time
 
-from ._native import ResourceBudget, validate_and_rank
+import numpy as np
+
+from ._native import ResourceBudget, Score, validate_and_rank
 from .interfaces import (
     CandidateGenerator,
-    CandidateScorer,
     Query,
     RankedDocument,
+    Reranker,
     SearchResult,
     SearchTimings,
 )
 
 
 class SearchPipeline:
-    """Generic gather, score, and top-k orchestration."""
+    """Gather, optionally rerank, then deterministic top-k.
 
-    def __init__(self, generator: CandidateGenerator, scorer: CandidateScorer) -> None:
-        generator.manifest.assert_compatible(scorer.manifest)
-        self.generator = generator
-        self.scorer = scorer
+    Stages must index the same corpus; that is checked once, here. Each stage
+    must be able to consume the query; that is checked per search, before any
+    stage runs, so a query that cannot be served fails without gathering.
+    Without a reranker the gather scores rank the results.
+    """
+
+    def __init__(
+        self, gatherer: CandidateGenerator, reranker: Reranker | None = None
+    ) -> None:
+        if reranker is not None:
+            gatherer.corpus.assert_compatible(reranker.corpus)
+        self.gatherer = gatherer
+        self.reranker = reranker
 
     def search(
         self,
@@ -27,6 +38,7 @@ class SearchPipeline:
         *,
         gather_limit: int,
         limit: int,
+        subset: np.ndarray | None = None,
         budget: ResourceBudget | None = None,
     ) -> SearchResult:
         if gather_limit <= 0:
@@ -38,18 +50,30 @@ class SearchPipeline:
         if isinstance(query, str):
             query = Query(query)
         budget = budget or ResourceBudget()
+        stages = [self.gatherer] if self.reranker is None else [self.gatherer, self.reranker]
+        for stage in stages:
+            for name, representation in stage.requires.items():
+                query.feature(name, representation)
 
         started = time.perf_counter()
-        candidates = tuple(self.generator.gather(query, gather_limit))
+        candidates = tuple(self.gatherer.gather(query, gather_limit, subset=subset))
         gathered = time.perf_counter()
         if len(candidates) > gather_limit:
-            raise ValueError("generator returned more candidates than requested")
+            raise ValueError("gatherer returned more candidates than requested")
         if [candidate.gather_rank for candidate in candidates] != list(
             range(len(candidates))
         ):
             raise ValueError("candidate gather ranks must be contiguous and zero-based")
-        scores = tuple(self.scorer.score(query, candidates, budget=budget))
-        scored = time.perf_counter()
+        if self.reranker is None:
+            scores = tuple(
+                Score(candidate.document_id, candidate.gather_score)
+                for candidate in candidates
+            )
+            score_semantics = self.gatherer.score_semantics
+        else:
+            scores = tuple(self.reranker.rerank(query, candidates, budget=budget))
+            score_semantics = self.reranker.score_semantics
+        reranked = time.perf_counter()
 
         positions = validate_and_rank(
             [item.document_id for item in candidates],
@@ -73,14 +97,13 @@ class SearchPipeline:
             scores=scores,
             timings=SearchTimings(
                 gather_seconds=gathered - started,
-                score_seconds=scored - gathered,
+                rerank_seconds=reranked - gathered,
                 total_seconds=finished - started,
             ),
             diagnostics={
                 "candidate_count": len(candidates),
-                "scored_count": len(scores),
-                "generator": type(self.generator).__name__,
-                "scorer": type(self.scorer).__name__,
-                "score_semantics": self.scorer.capabilities.score_semantics,
+                "gatherer": type(self.gatherer).__name__,
+                "reranker": None if self.reranker is None else type(self.reranker).__name__,
+                "score_semantics": score_semantics,
             },
         )

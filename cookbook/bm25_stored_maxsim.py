@@ -7,34 +7,33 @@
 #   "scipy>=1.11",
 # ]
 # ///
-"""BM25 gathering + optional lateweave vector storage + MaxSim.
+"""BM25 gathering with an optional stored-MaxSim rerank.
 
 Run from the lateweave package directory:
 
     uv run --with-editable . cookbook/bm25_stored_maxsim.py --help
 
-The lexical stage is bm25s. It owns no analysis chain of its own: queries arrive
-as token strings mapped through the vocabulary the index itself persisted, so
-nothing inside the index can fall out of step with the postings, and a persisted
-index returns exactly what an in-memory one built from the same text returns.
+The lexical stage is bm25s. It consumes only the query text, so it declares no
+query features. What a caller can still get wrong is building with one analyzer
+and querying with another, which loses terms silently. So the analyzer is
+persisted next to the index and read back on every open and every mutation.
 
-What a caller can still get wrong is building with one analyzer and querying
-with another, which loses terms silently. So the analyzer lives in the generator
-manifest and is read back from it on every open and every mutation.
+The rerank stage is lateweave's MaxSim reranker over a lateweave vector store.
+The store carries the encoder representation it was built from, and a search
+that supplies token embeddings must supply them from that encoder. A search
+without embeddings is gather-only: BM25 scores rank.
 
 bm25s has no incremental append or delete, so ``update`` and ``delete`` rebuild
 the lexical index from ``documents.jsonl``, which this recipe maintains anyway.
-The vector store keeps its incremental paths. Rebuilding is O(corpus) rather
-than O(delta) -- a few seconds for tens of thousands of documents -- and it
-makes the internal ID compaction after a delete exact by construction rather
-than by agreement between two implementations.
+The vector store keeps its incremental paths. Rebuilding makes the internal ID
+compaction after a delete exact by construction.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import fcntl
 import gc
 import json
@@ -51,30 +50,31 @@ import numpy as np
 
 from lateweave import (
     Candidate,
-    IndexManifest,
+    CorpusManifest,
+    Feature,
+    Float32VectorStore,
     Int8VectorStore,
-    JzipVectorStore,
+    MaxSimReranker,
     Query,
+    Representation,
     ResourceBudget,
     SearchPipeline,
-    StoredMaxSimScorer,
-    TurboQuantVectorStore,
     document_ids_digest,
     open_vector_store,
 )
 
 
-GENERATOR_MANIFEST = "generator-manifest.json"
-SCORER_MANIFEST = "scorer-manifest.json"
+CORPUS_MANIFEST = "corpus-manifest.json"
+ANALYZER_FILE = "analyzer.json"
 DOCUMENTS_FILE = "documents.jsonl"
 VECTOR_DIRECTORY = "vectors"
 LEXICAL_DIRECTORY = "bm25"
+STORES = {"float32": Float32VectorStore, "int8": Int8VectorStore}
 
 # Lucene's defaults, spelled out so a bm25s default change cannot move results.
 LEXICAL_METHOD = "lucene"
 LEXICAL_K1 = 1.5
 LEXICAL_B = 0.75
-#: Name recorded in the generator manifest for the tokenizer below.
 LEXICAL_TOKENIZER = "unicode-fold"
 
 _TOKEN = re.compile(r"\w+")
@@ -84,11 +84,8 @@ _TOKEN = re.compile(r"\w+")
 class Analyzer:
     """Text to terms, identically for documents and queries.
 
-    ``stemmer`` is a Snowball algorithm name (``"spanish"``, ``"portuguese"``,
-    ``"english"``, ...) or ``None``. None is the default because it is
-    language-agnostic: on a Spanish corpus it reached the same gold recall at
-    the gather depth as a stemmed chain, and a corpus whose language varies per
-    document has no single right answer.
+    ``stemmer`` is a Snowball algorithm name (``"spanish"``, ``"english"``, ...)
+    or ``None``. None is the default because it is language-agnostic.
     """
 
     stemmer: str | None = None
@@ -115,25 +112,25 @@ class Analyzer:
             terms = self._stem(terms)
         return [sys.intern(term) for term in terms]
 
-    def build_parameters(self) -> dict[str, Any]:
-        """The analysis chain, as it is recorded in the generator manifest."""
-        return {
-            "method": LEXICAL_METHOD,
-            "tokenizer": LEXICAL_TOKENIZER,
-            "stemmer": self.stemmer,
-            "stopwords": None,
-            "k1": LEXICAL_K1,
-            "b": LEXICAL_B,
-        }
+    def write(self, path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "method": LEXICAL_METHOD,
+                    "tokenizer": LEXICAL_TOKENIZER,
+                    "stemmer": self.stemmer,
+                    "k1": LEXICAL_K1,
+                    "b": LEXICAL_B,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
 
     @classmethod
-    def from_manifest(cls, manifest: IndexManifest) -> "Analyzer":
-        """Recover the chain an index was built with, refusing an unknown one.
-
-        Querying through a different chain than the postings were built with
-        loses terms silently, so it is refused rather than tolerated.
-        """
-        parameters = manifest.build_parameters or {}
+    def read(cls, path: Path) -> "Analyzer":
+        """Recover the chain an index was built with, refusing an unknown one."""
+        parameters = json.loads(path.read_text(encoding="utf-8"))
         tokenizer = parameters.get("tokenizer")
         if tokenizer != LEXICAL_TOKENIZER:
             raise ValueError(
@@ -143,9 +140,7 @@ class Analyzer:
         return cls(stemmer=parameters.get("stemmer"))
 
 
-def write_lexical_index(
-    path: Path, texts: Sequence[str], analyzer: Analyzer
-) -> None:
+def write_lexical_index(path: Path, texts: Sequence[str], analyzer: Analyzer) -> None:
     """Build the lexical index at ``path``, replacing anything already there."""
     import bm25s
 
@@ -172,9 +167,7 @@ def index_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
 
 
 def staged_index_copy(source: Path) -> Path:
-    temporary = Path(
-        tempfile.mkdtemp(prefix=f".{source.name}.mutation.", dir=source.parent)
-    )
+    temporary = Path(tempfile.mkdtemp(prefix=f".{source.name}.mutation.", dir=source.parent))
     shutil.copytree(source, temporary, dirs_exist_ok=True)
     return temporary
 
@@ -191,89 +184,74 @@ def publish_replacement(source: Path, replacement: Path) -> None:
         shutil.rmtree(backup)
 
 
-def mutated_manifest(
-    manifest: IndexManifest,
-    documents: Sequence[dict[str, str]],
-    *,
-    operation: str,
-    affected: int,
-) -> IndexManifest:
-    parameters = dict(manifest.build_parameters or {})
-    history = list(parameters.get("cookbook_mutations", []))
-    history.append(
-        {
-            "generation": manifest.generation + 1,
-            "operation": operation,
-            "affected_documents": affected,
-        }
-    )
-    parameters["cookbook_mutations"] = history
-    return replace(
-        manifest,
+def corpus_manifest(
+    documents: Sequence[dict[str, str]], *, corpus_id: str, corpus_version: str, generation: int
+) -> CorpusManifest:
+    return CorpusManifest(
+        corpus_id=corpus_id,
+        corpus_version=corpus_version,
         document_count=len(documents),
         document_ids_sha256=document_ids_digest([row["id"] for row in documents]),
-        generation=manifest.generation + 1,
-        build_parameters=parameters,
+        generation=generation,
     )
 
 
 class LexicalCandidateGenerator:
     """Cookbook adapter; the lexical index remains external to lateweave."""
 
-    def __init__(
-        self, index: Any, manifest: IndexManifest, analyzer: Analyzer
-    ) -> None:
+    requires: dict[str, Representation] = {}
+    score_semantics = "bm25s-lucene"
+
+    def __init__(self, index: Any, corpus: CorpusManifest, analyzer: Analyzer) -> None:
         self.index = index
-        self.manifest = manifest
+        self.corpus = corpus
         self.analyzer = analyzer
 
     @classmethod
-    def open(
-        cls, path: Path, manifest: IndexManifest
-    ) -> "LexicalCandidateGenerator":
-        """Open the index, analyzing queries the way its postings were built."""
+    def open(cls, path: Path, corpus: CorpusManifest, analyzer: Analyzer) -> "LexicalCandidateGenerator":
         import bm25s
 
-        analyzer = Analyzer.from_manifest(manifest)
-        index = bm25s.BM25.load(
-            str(path), mmap=True, load_corpus=False, show_progress=False
-        )
+        index = bm25s.BM25.load(str(path), mmap=True, load_corpus=False, show_progress=False)
         stored = int(index.scores["num_docs"])
-        if stored != manifest.document_count:
+        if stored != corpus.document_count:
             raise RuntimeError(
                 f"lexical index holds {stored:,} documents but the manifest "
-                f"declares {manifest.document_count:,}"
+                f"declares {corpus.document_count:,}"
             )
-        return cls(index, manifest, analyzer)
+        return cls(index, corpus, analyzer)
 
-    def gather(self, query: Query, limit: int) -> tuple[Candidate, ...]:
+    def gather(
+        self, query: Query, limit: int, *, subset: np.ndarray | None = None
+    ) -> tuple[Candidate, ...]:
         terms = self.analyzer.tokens(query.text)
         if not terms:
             return ()
-        # bm25s raises when the limit exceeds the corpus; it never pads.
+        weight_mask = None
+        if subset is not None:
+            # bm25s multiplies scores by the mask; masked documents score zero
+            # and are dropped below with every other non-matching document.
+            weight_mask = np.zeros(self.corpus.document_count, dtype=np.float32)
+            weight_mask[subset] = 1.0
         documents, scores = self.index.retrieve(
             [terms],
-            k=min(limit, self.manifest.document_count),
+            k=min(limit, self.corpus.document_count),
             show_progress=False,
+            weight_mask=weight_mask,
         )
         candidates = []
         seen: set[int] = set()
-        for raw_document_id, raw_score in zip(
-            documents[0].tolist(), scores[0].tolist()
-        ):
+        for raw_document_id, raw_score in zip(documents[0].tolist(), scores[0].tolist()):
             score = float(raw_score)
             # Under the Lucene idf a zero score shares no term with the query.
             if score != score or score <= 0.0:
                 continue
             document_id = int(raw_document_id)
-            if not 0 <= document_id < self.manifest.document_count:
+            if not 0 <= document_id < self.corpus.document_count:
                 raise RuntimeError(f"bm25s returned out-of-range ID {document_id}")
             if document_id in seen:
                 raise RuntimeError(f"bm25s returned duplicate ID {document_id}")
             seen.add(document_id)
-            candidates.append(
-                Candidate(document_id, score, len(candidates), "bm25s")
-            )
+            candidates.append(Candidate(document_id, score, len(candidates), "bm25s"))
         return tuple(candidates)
 
 
@@ -285,11 +263,9 @@ def load_documents(path: Path) -> list[dict[str, str]]:
                 continue
             try:
                 row = json.loads(line)
-                document_id = str(row["id"])
-                text = str(row["text"])
+                documents.append({"id": str(row["id"]), "text": str(row["text"])})
             except (json.JSONDecodeError, KeyError, TypeError) as error:
                 raise ValueError(f"invalid document at {path}:{line_number}") from error
-            documents.append({"id": document_id, "text": text})
     if not documents:
         raise ValueError("document input is empty")
     ids = [row["id"] for row in documents]
@@ -298,9 +274,7 @@ def load_documents(path: Path) -> list[dict[str, str]]:
     return documents
 
 
-def load_packed_embeddings(
-    embeddings_path: Path, lengths_path: Path
-) -> tuple[np.ndarray, np.ndarray]:
+def load_packed_embeddings(embeddings_path: Path, lengths_path: Path) -> tuple[np.ndarray, np.ndarray]:
     embeddings = np.load(embeddings_path, mmap_mode="r")
     lengths = np.asarray(np.load(lengths_path), dtype=np.int64)
     if embeddings.ndim != 2 or embeddings.dtype != np.float32:
@@ -309,12 +283,6 @@ def load_packed_embeddings(
         raise ValueError("document lengths must be a positive int64 vector")
     if int(lengths.sum()) != len(embeddings):
         raise ValueError("document lengths do not match the packed embedding rows")
-    for start in range(0, len(embeddings), 1_000_000):
-        chunk = embeddings[start : start + 1_000_000]
-        if not np.isfinite(chunk).all() or not np.allclose(
-            np.linalg.norm(chunk, axis=1), 1.0, rtol=1e-3, atol=1e-4
-        ):
-            raise ValueError("document embeddings must be finite unit vectors")
     return embeddings, lengths
 
 
@@ -331,74 +299,38 @@ def build_index(args: argparse.Namespace) -> None:
     packed, lengths = load_packed_embeddings(args.embeddings, args.document_lengths)
     if len(documents) != len(lengths):
         raise ValueError("document and embedding counts differ")
-    stores = {
-        "int8": Int8VectorStore,
-        "turboquant4": TurboQuantVectorStore,
-        "jzip": JzipVectorStore,
-    }
-    store_type = stores[args.storage]
-
-    common = IndexManifest(
-        corpus_id=args.corpus_id,
-        corpus_version=args.corpus_version,
-        document_count=len(documents),
-        document_ids_sha256=document_ids_digest([row["id"] for row in documents]),
+    representation = Representation(
         encoder=args.encoder,
         encoder_revision=args.encoder_revision,
-        tokenizer=args.tokenizer,
         dimension=int(packed.shape[1]),
-        dtype="float32",
         normalized=True,
         query_template=args.query_template,
         document_template=args.document_template,
     )
-    generator_manifest = replace(
-        common,
-        representation="bm25s-sparse-index",
-        score_semantics="bm25s-lucene",
-        build_parameters=analyzer.build_parameters(),
-    )
-    scorer_manifest = replace(
-        common,
-        representation=store_type.format,
-        score_semantics=store_type.score_semantics,
-        build_parameters={
-            "storage": args.storage,
-            "chunk_tokens": args.chunk_tokens,
-            **(
-                {"compression_level": args.compression_level}
-                if args.storage == "jzip"
-                else {}
-            ),
-            "device": "cpu",
-        },
+    manifest = corpus_manifest(
+        documents, corpus_id=args.corpus_id, corpus_version=args.corpus_version, generation=0
     )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with index_lock(destination, exclusive=True):
         if destination.exists():
             raise FileExistsError(f"index already exists: {destination}")
-        temporary = Path(
-            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
-        )
+        temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
         try:
             write_documents(temporary / DOCUMENTS_FILE, documents)
+            analyzer.write(temporary / ANALYZER_FILE)
             write_lexical_index(
-                temporary / LEXICAL_DIRECTORY,
-                [row["text"] for row in documents],
-                analyzer,
+                temporary / LEXICAL_DIRECTORY, [row["text"] for row in documents], analyzer
             )
-            store_options = {
-                "chunk_tokens": args.chunk_tokens,
-                "threads": args.threads,
-            }
-            if args.storage == "jzip":
-                store_options["compression_level"] = args.compression_level
-            store_type.create(
-                temporary / VECTOR_DIRECTORY, packed, lengths, **store_options
+            STORES[args.storage].create(
+                temporary / VECTOR_DIRECTORY,
+                packed,
+                lengths,
+                representation,
+                chunk_tokens=args.chunk_tokens,
+                threads=args.threads,
             )
-            generator_manifest.write(temporary / GENERATOR_MANIFEST)
-            scorer_manifest.write(temporary / SCORER_MANIFEST)
+            manifest.write(temporary / CORPUS_MANIFEST)
             temporary.replace(destination)
         finally:
             if temporary.exists():
@@ -421,10 +353,8 @@ def update_index(args: argparse.Namespace) -> None:
         collisions = [row["id"] for row in additions if row["id"] in existing_ids]
         if collisions:
             raise ValueError(f"external document ID already exists: {collisions[0]}")
-        generator_manifest = IndexManifest.read(source / GENERATOR_MANIFEST)
-        scorer_manifest = IndexManifest.read(source / SCORER_MANIFEST)
-        generator_manifest.assert_compatible(scorer_manifest)
-        analyzer = Analyzer.from_manifest(generator_manifest)
+        manifest = CorpusManifest.read(source / CORPUS_MANIFEST)
+        analyzer = Analyzer.read(source / ANALYZER_FILE)
         replacement = staged_index_copy(source)
         try:
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
@@ -435,37 +365,24 @@ def update_index(args: argparse.Namespace) -> None:
                 copy_chunk_tokens=args.copy_chunk_tokens,
                 threads=args.threads,
             )
-            updated_documents = [*existing, *additions]
-            # bm25s has no incremental append, so the lexical index is rebuilt
-            # over the whole corpus. The vector store still appends in place.
+            documents = [*existing, *additions]
             write_lexical_index(
-                replacement / LEXICAL_DIRECTORY,
-                [row["text"] for row in updated_documents],
-                analyzer,
+                replacement / LEXICAL_DIRECTORY, [row["text"] for row in documents], analyzer
             )
-            write_documents(replacement / DOCUMENTS_FILE, updated_documents)
-            mutated_manifest(
-                generator_manifest,
-                updated_documents,
-                operation="append",
-                affected=len(additions),
-            ).write(replacement / GENERATOR_MANIFEST)
-            mutated_manifest(
-                scorer_manifest,
-                updated_documents,
-                operation="append",
-                affected=len(additions),
-            ).write(replacement / SCORER_MANIFEST)
+            write_documents(replacement / DOCUMENTS_FILE, documents)
+            corpus_manifest(
+                documents,
+                corpus_id=manifest.corpus_id,
+                corpus_version=manifest.corpus_version,
+                generation=manifest.generation + 1,
+            ).write(replacement / CORPUS_MANIFEST)
             del store
             gc.collect()
             publish_replacement(source, replacement)
         finally:
             if replacement.exists():
                 shutil.rmtree(replacement)
-    print(
-        f"appended {len(additions):,} documents to {source}; "
-        f"generation {generator_manifest.generation + 1}"
-    )
+    print(f"appended {len(additions):,} documents to {source}; generation {manifest.generation + 1}")
 
 
 def delete_index(args: argparse.Namespace) -> None:
@@ -475,9 +392,7 @@ def delete_index(args: argparse.Namespace) -> None:
         if not source.is_dir():
             raise FileNotFoundError(f"index not found: {source}")
         documents = load_documents(source / DOCUMENTS_FILE)
-        internal_by_external = {
-            document["id"]: internal for internal, document in enumerate(documents)
-        }
+        internal_by_external = {row["id"]: internal for internal, row in enumerate(documents)}
         missing = [item for item in requested if item not in internal_by_external]
         if missing:
             raise ValueError(f"external document ID not found: {missing[0]}")
@@ -485,13 +400,9 @@ def delete_index(args: argparse.Namespace) -> None:
             raise ValueError("delete cannot remove every document from the index")
         internal_ids = sorted(internal_by_external[item] for item in requested)
         deleted = set(internal_ids)
-        remaining = [
-            document for internal, document in enumerate(documents) if internal not in deleted
-        ]
-        generator_manifest = IndexManifest.read(source / GENERATOR_MANIFEST)
-        scorer_manifest = IndexManifest.read(source / SCORER_MANIFEST)
-        generator_manifest.assert_compatible(scorer_manifest)
-        analyzer = Analyzer.from_manifest(generator_manifest)
+        remaining = [row for internal, row in enumerate(documents) if internal not in deleted]
+        manifest = CorpusManifest.read(source / CORPUS_MANIFEST)
+        analyzer = Analyzer.read(source / ANALYZER_FILE)
         replacement = staged_index_copy(source)
         try:
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
@@ -499,65 +410,59 @@ def delete_index(args: argparse.Namespace) -> None:
             # Rebuilding over the survivors compacts internal IDs to 0..n-1 in
             # document order, which is the order the store compacts to as well.
             write_lexical_index(
-                replacement / LEXICAL_DIRECTORY,
-                [row["text"] for row in remaining],
-                analyzer,
+                replacement / LEXICAL_DIRECTORY, [row["text"] for row in remaining], analyzer
             )
             write_documents(replacement / DOCUMENTS_FILE, remaining)
-            mutated_manifest(
-                generator_manifest,
+            corpus_manifest(
                 remaining,
-                operation="delete",
-                affected=len(internal_ids),
-            ).write(replacement / GENERATOR_MANIFEST)
-            mutated_manifest(
-                scorer_manifest,
-                remaining,
-                operation="delete",
-                affected=len(internal_ids),
-            ).write(replacement / SCORER_MANIFEST)
+                corpus_id=manifest.corpus_id,
+                corpus_version=manifest.corpus_version,
+                generation=manifest.generation + 1,
+            ).write(replacement / CORPUS_MANIFEST)
             del store
             gc.collect()
             publish_replacement(source, replacement)
         finally:
             if replacement.exists():
                 shutil.rmtree(replacement)
-    print(
-        f"deleted {len(internal_ids):,} documents from {source}; "
-        f"generation {generator_manifest.generation + 1}"
-    )
+    print(f"deleted {len(internal_ids):,} documents from {source}; generation {manifest.generation + 1}")
 
 
 def search_index(args: argparse.Namespace) -> None:
     source = args.index.expanduser().resolve()
     with index_lock(source, exclusive=False):
         documents = load_documents(source / DOCUMENTS_FILE)
-        generator_manifest = IndexManifest.read(source / GENERATOR_MANIFEST)
-        scorer_manifest = IndexManifest.read(source / SCORER_MANIFEST)
-        generator = LexicalCandidateGenerator.open(
-            source / LEXICAL_DIRECTORY, generator_manifest
+        manifest = CorpusManifest.read(source / CORPUS_MANIFEST)
+        gatherer = LexicalCandidateGenerator.open(
+            source / LEXICAL_DIRECTORY, manifest, Analyzer.read(source / ANALYZER_FILE)
         )
-        scorer = StoredMaxSimScorer(
-            open_vector_store(source / VECTOR_DIRECTORY), scorer_manifest
-        )
-        query_embeddings = np.ascontiguousarray(
-            np.load(args.query_embeddings), dtype=np.float32
-        )
-        budget = ResourceBudget(
-            max_memory_bytes=(
-                int(args.max_memory_gb * 2**30)
-                if args.max_memory_gb is not None
-                else None
-            ),
-            max_batch_tokens=args.max_batch_tokens,
-            max_documents_per_batch=args.max_documents_per_batch,
-            threads=args.threads,
-        )
-        result = SearchPipeline(generator, scorer).search(
-            Query(args.query, embeddings=query_embeddings),
+        reranker = None
+        features: dict[str, Feature] = {}
+        if args.query_embeddings is not None:
+            store = open_vector_store(source / VECTOR_DIRECTORY)
+            reranker = MaxSimReranker(store, manifest)
+            features["multi_vector"] = Feature(
+                store.representation,
+                provider=lambda: np.ascontiguousarray(
+                    np.load(args.query_embeddings), dtype=np.float32
+                ),
+            )
+        subset = None
+        if args.subset_id:
+            internal_by_external = {row["id"]: internal for internal, row in enumerate(documents)}
+            subset = np.asarray(
+                sorted(internal_by_external[item] for item in args.subset_id), dtype=np.int64
+            )
+        result = SearchPipeline(gatherer, reranker).search(
+            Query(args.query, **features),
             gather_limit=args.gather_limit,
             limit=args.limit,
-            budget=budget,
+            subset=subset,
+            budget=ResourceBudget(
+                max_batch_tokens=args.max_batch_tokens,
+                max_documents_per_batch=args.max_documents_per_batch,
+                threads=args.threads,
+            ),
         )
         output = {
             "results": [
@@ -571,18 +476,12 @@ def search_index(args: argparse.Namespace) -> None:
             ],
             "timings": {
                 "gather_seconds": result.timings.gather_seconds,
-                "score_seconds": result.timings.score_seconds,
+                "rerank_seconds": result.timings.rerank_seconds,
                 "total_seconds": result.timings.total_seconds,
             },
             "diagnostics": result.diagnostics,
         }
     print(json.dumps(output, ensure_ascii=False, indent=2))
-
-
-def _add_mutation_execution_arguments(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--chunk-tokens", type=int, default=131_072)
-    command.add_argument("--copy-chunk-tokens", type=int, default=1_000_000)
-    command.add_argument("--threads", type=int)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -594,15 +493,11 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--documents", type=Path, required=True)
     build.add_argument("--embeddings", type=Path, required=True)
     build.add_argument("--document-lengths", type=Path, required=True)
-    build.add_argument(
-        "--storage", choices=("int8", "turboquant4", "jzip"), default="int8"
-    )
-    build.add_argument("--compression-level", type=int, choices=range(1, 23), default=1)
+    build.add_argument("--storage", choices=tuple(STORES), default="float32")
     build.add_argument("--corpus-id", required=True)
     build.add_argument("--corpus-version", required=True)
     build.add_argument("--encoder", required=True)
     build.add_argument("--encoder-revision", required=True)
-    build.add_argument("--tokenizer", required=True)
     build.add_argument("--query-template", default="")
     build.add_argument("--document-template", default="")
     build.add_argument("--chunk-tokens", type=int, default=131_072)
@@ -610,10 +505,8 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--stemmer",
         default=None,
-        help="Snowball algorithm for the lexical stage (e.g. spanish, "
-             "portuguese). Default: none, which is language-agnostic. Recorded "
-             "in the generator manifest and reused by update, delete and "
-             "search.",
+        help="Snowball algorithm for the lexical stage (e.g. spanish, english). "
+        "Default: none. Persisted with the index and reused by every command.",
     )
     build.set_defaults(function=build_index)
 
@@ -622,7 +515,9 @@ def parser() -> argparse.ArgumentParser:
     update.add_argument("--documents", type=Path, required=True)
     update.add_argument("--embeddings", type=Path, required=True)
     update.add_argument("--document-lengths", type=Path, required=True)
-    _add_mutation_execution_arguments(update)
+    update.add_argument("--chunk-tokens", type=int, default=131_072)
+    update.add_argument("--copy-chunk-tokens", type=int, default=1_000_000)
+    update.add_argument("--threads", type=int)
     update.set_defaults(function=update_index)
 
     delete = commands.add_parser("delete", help="delete external document IDs")
@@ -631,15 +526,21 @@ def parser() -> argparse.ArgumentParser:
     delete.add_argument("--copy-chunk-tokens", type=int, default=1_000_000)
     delete.set_defaults(function=delete_index)
 
-    search = commands.add_parser("search", help="BM25 gather then stored MaxSim")
+    search = commands.add_parser("search", help="BM25 gather, MaxSim rerank when embeddings are given")
     search.add_argument("--index", type=Path, required=True)
     search.add_argument("--query", required=True)
-    search.add_argument("--query-embeddings", type=Path, required=True)
+    search.add_argument(
+        "--query-embeddings",
+        type=Path,
+        help="float32 [query_tokens, dimension] .npy from the index's encoder; omit for gather-only",
+    )
+    search.add_argument(
+        "--subset-id", action="append", help="restrict the search to this external ID (repeatable)"
+    )
     search.add_argument("--gather-limit", type=int, default=500)
     search.add_argument("--limit", type=int, default=100)
     search.add_argument("--max-batch-tokens", type=int, default=131_072)
     search.add_argument("--max-documents-per-batch", type=int, default=256)
-    search.add_argument("--max-memory-gb", type=float)
     search.add_argument("--threads", type=int)
     search.set_defaults(function=search_index)
     return value
