@@ -7,163 +7,153 @@ import pytest
 
 from lateweave import (
     Candidate,
+    CorpusManifest,
+    Feature,
     IncompatibleIndexError,
-    IndexManifest,
+    IncompatibleQueryError,
     Query,
+    Representation,
     ResourceBudget,
     Score,
-    ScorerCapabilities,
     SearchPipeline,
     maxsim_scores_packed,
 )
 
 
-def manifest(**changes: object) -> IndexManifest:
-    value = IndexManifest(
-        corpus_id="laws",
-        corpus_version="v1",
-        document_count=3,
-        document_ids_sha256="abc",
-        encoder="encoder",
-        encoder_revision="rev",
-        tokenizer="tokenizer",
-        dimension=2,
-        dtype="float32",
-        normalized=True,
-        representation="external-test-representation",
-        score_semantics="external-test-score",
-    )
-    return replace(value, **changes)
+CORPUS = CorpusManifest("corpus", "1", 3, "abc")
+REPRESENTATION = Representation("encoder", "1", 2, True)
 
 
-class ExternalGenerator:
-    def __init__(self, index_manifest: IndexManifest) -> None:
-        self.manifest = index_manifest
+class TextGatherer:
+    requires: dict[str, Representation] = {}
+    score_semantics = "external-gather"
 
-    def gather(self, query: Query, limit: int) -> tuple[Candidate, ...]:
+    def __init__(self, corpus: CorpusManifest = CORPUS) -> None:
+        self.corpus = corpus
+        self.calls = 0
+        self.subsets: list[np.ndarray | None] = []
+
+    def gather(self, query: Query, limit: int, *, subset=None) -> tuple[Candidate, ...]:
+        self.calls += 1
+        self.subsets.append(subset)
         assert query.text == "query"
+        rows = [(2, 100.0), (0, 10.0), (1, 10.0)]
         return tuple(
-            Candidate(document_id, gather_score, rank, "external-generator")
-            for rank, (document_id, gather_score) in enumerate(
-                [(2, 100.0), (0, 10.0), (1, 1.0)][:limit]
-            )
+            Candidate(document_id, gather_score, rank, "external")
+            for rank, (document_id, gather_score) in enumerate(rows[:limit])
         )
 
 
-class ExternalScorer:
-    capabilities = ScorerCapabilities(
-        preferred_batch_tokens=1024,
-        supports_mmap=True,
-        supports_candidate_reordering=True,
-        score_semantics="external-test-score",
-    )
+class VectorReranker:
+    requires = {"multi_vector": REPRESENTATION}
+    score_semantics = "external-rerank"
 
-    def __init__(self, index_manifest: IndexManifest) -> None:
-        self.manifest = index_manifest
+    def __init__(self, corpus: CorpusManifest = CORPUS) -> None:
+        self.corpus = corpus
         self.received: list[int] = []
 
-    def score(
-        self,
-        query: Query,
-        candidates: tuple[Candidate, ...],
-        *,
-        budget: ResourceBudget,
-    ) -> tuple[Score, ...]:
+    def rerank(self, query, candidates, *, budget: ResourceBudget) -> tuple[Score, ...]:
+        assert query.feature("multi_vector", REPRESENTATION).shape == (1, 2)
         self.received = [candidate.document_id for candidate in candidates]
         values = {0: 3.0, 1: 5.0, 2: 2.0}
-        return tuple(Score(document_id, values[document_id]) for document_id in self.received)
+        return tuple(Score(item, values[item]) for item in self.received)
 
 
-def test_external_implementations_compose_without_backend_dependencies() -> None:
-    index_manifest = manifest()
-    scorer = ExternalScorer(index_manifest)
-    result = SearchPipeline(ExternalGenerator(index_manifest), scorer).search(
-        Query("query"), gather_limit=3, limit=2
+def vector_query() -> Query:
+    return Query(
+        "query", multi_vector=Feature(REPRESENTATION, np.ones((1, 2), dtype=np.float32))
     )
 
-    assert scorer.received == [2, 0, 1]
+
+def test_gatherer_and_reranker_compose_without_backend_dependencies() -> None:
+    reranker = VectorReranker()
+    result = SearchPipeline(TextGatherer(), reranker).search(
+        vector_query(), gather_limit=3, limit=2
+    )
+
+    assert reranker.received == [2, 0, 1]
     assert [row.document_id for row in result.documents] == [1, 0]
     assert result.diagnostics == {
         "candidate_count": 3,
-        "scored_count": 3,
-        "generator": "ExternalGenerator",
-        "scorer": "ExternalScorer",
-        "score_semantics": "external-test-score",
+        "gatherer": "TextGatherer",
+        "reranker": "VectorReranker",
+        "score_semantics": "external-rerank",
     }
 
 
-def test_gather_scores_do_not_leak_into_final_ranking() -> None:
-    index_manifest = manifest()
-    result = SearchPipeline(
-        ExternalGenerator(index_manifest), ExternalScorer(index_manifest)
-    ).search(Query("query"), gather_limit=3, limit=3)
-
+def test_gather_scores_do_not_leak_into_a_reranked_result() -> None:
+    result = SearchPipeline(TextGatherer(), VectorReranker()).search(
+        vector_query(), gather_limit=3, limit=3
+    )
     assert [row.document_id for row in result.documents] == [1, 0, 2]
 
 
-def test_pipeline_rejects_manifest_mismatch_before_search() -> None:
+def test_without_a_reranker_gather_scores_rank_with_gather_rank_tie_break() -> None:
+    result = SearchPipeline(TextGatherer()).search("query", gather_limit=3, limit=3)
+
+    assert [row.document_id for row in result.documents] == [2, 0, 1]
+    assert [row.score for row in result.documents] == [100.0, 10.0, 10.0]
+    assert result.diagnostics["reranker"] is None
+    assert result.diagnostics["score_semantics"] == "external-gather"
+
+
+def test_stages_must_index_the_same_corpus() -> None:
     with pytest.raises(IncompatibleIndexError, match="generation"):
-        SearchPipeline(ExternalGenerator(manifest()), ExternalScorer(manifest(generation=1)))
+        SearchPipeline(TextGatherer(), VectorReranker(replace(CORPUS, generation=1)))
 
 
-def test_query_embedding_provider_is_lazy_and_cached() -> None:
-    calls = 0
+def test_an_unservable_query_fails_before_gathering() -> None:
+    gatherer = TextGatherer()
+    with pytest.raises(IncompatibleQueryError, match="'multi_vector'"):
+        SearchPipeline(gatherer, VectorReranker()).search("query", gather_limit=3, limit=1)
+    assert gatherer.calls == 0
 
-    def encode(query: Query) -> np.ndarray:
-        nonlocal calls
-        calls += 1
-        return np.ones((2, 2), dtype=np.float32)
+    foreign = Query(
+        "query",
+        multi_vector=Feature(
+            replace(REPRESENTATION, encoder="other"), np.ones((1, 2), dtype=np.float32)
+        ),
+    )
+    with pytest.raises(IncompatibleQueryError, match="encoder"):
+        SearchPipeline(gatherer, VectorReranker()).search(foreign, gather_limit=3, limit=1)
+    assert gatherer.calls == 0
 
-    query = Query("query", embedding_provider=encode)
-    assert calls == 0
-    assert query.embeddings is query.embeddings
-    assert calls == 1
+
+def test_subset_reaches_the_gatherer_verbatim() -> None:
+    gatherer = TextGatherer()
+    subset = np.asarray([0, 2], dtype=np.int64)
+    SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=subset)
+    assert gatherer.subsets[0] is subset
 
 
-def test_native_ranking_rejects_scorer_candidate_drift() -> None:
-    class BrokenScorer(ExternalScorer):
-        def score(self, query, candidates, *, budget):  # type: ignore[no-untyped-def]
+def test_native_ranking_rejects_reranker_candidate_drift() -> None:
+    class BrokenReranker(VectorReranker):
+        def rerank(self, query, candidates, *, budget):  # type: ignore[no-untyped-def]
             return ()
 
-    index_manifest = manifest()
     with pytest.raises(ValueError, match="omitted candidate"):
-        SearchPipeline(ExternalGenerator(index_manifest), BrokenScorer(index_manifest)).search(
-            Query("query"), gather_limit=3, limit=2
+        SearchPipeline(TextGatherer(), BrokenReranker()).search(
+            vector_query(), gather_limit=3, limit=2
         )
 
 
 def test_pipeline_rejects_noncanonical_gather_ranks() -> None:
-    class BrokenGenerator(ExternalGenerator):
-        def gather(self, query: Query, limit: int) -> tuple[Candidate, ...]:
+    class BrokenGatherer(TextGatherer):
+        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
             return (Candidate(0, 1.0, 4, "broken"),)
 
-    index_manifest = manifest()
     with pytest.raises(ValueError, match="contiguous and zero-based"):
-        SearchPipeline(BrokenGenerator(index_manifest), ExternalScorer(index_manifest)).search(
-            Query("query"), gather_limit=1, limit=1
-        )
+        SearchPipeline(BrokenGatherer()).search("query", gather_limit=1, limit=1)
 
 
 def test_packed_maxsim_matches_reference_with_bounded_batches() -> None:
     query = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
     documents = np.asarray(
-        [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [2**-0.5, 2**-0.5],
-            [-1.0, 0.0],
-        ],
-        dtype=np.float32,
+        [[1.0, 0.0], [0.0, 1.0], [2**-0.5, 2**-0.5], [-1.0, 0.0]], dtype=np.float32
     )
     lengths = np.asarray([2, 1, 1], dtype=np.int64)
 
-    scores = maxsim_scores_packed(
-        query,
-        documents,
-        lengths,
-        max_batch_tokens=2,
-        threads=2,
-    )
+    scores = maxsim_scores_packed(query, documents, lengths, max_batch_tokens=2, threads=2)
 
     assert scores.tolist() == pytest.approx([2.0, 2**0.5, -1.0], abs=1e-6)
 
@@ -191,11 +181,7 @@ def test_packed_maxsim_matches_numpy_for_variable_documents(threads: int) -> Non
         start += int(length)
 
     observed = maxsim_scores_packed(
-        query,
-        documents,
-        lengths,
-        max_batch_tokens=6,
-        threads=threads,
+        query, documents, lengths, max_batch_tokens=6, threads=threads
     )
 
     assert observed.tolist() == pytest.approx(expected, abs=2e-5)
