@@ -201,7 +201,7 @@ fn maxsim_scores_packed<'py>(
         )));
     }
     let scores = py
-        .allow_threads(|| {
+        .detach(|| {
             maxsim::maxsim_scores_packed(
                 query_values,
                 document_values,
@@ -226,7 +226,7 @@ fn storage_int8_encode<'py>(
     let shape = embeddings.shape();
     let values = embeddings.as_slice()?;
     let (codes, scales) = py
-        .allow_threads(|| storage::int8_encode(values, shape[0], shape[1], threads))
+        .detach(|| storage::int8_encode(values, shape[0], shape[1], threads))
         .map_err(PyValueError::new_err)?;
     let codes = Array2::from_shape_vec((shape[0], shape[1]), codes)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -249,7 +249,7 @@ fn storage_int8_decode<'py>(
     let code_values = codes.as_slice()?;
     let scale_values = scales.as_slice()?;
     let output = py
-        .allow_threads(|| {
+        .detach(|| {
             storage::int8_decode(
                 code_values,
                 scale_values,

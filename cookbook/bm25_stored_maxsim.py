@@ -1,8 +1,9 @@
 # /// script
-# requires-python = ">=3.11,<3.14"
+# requires-python = ">=3.11,<3.15"
 # dependencies = [
 #   "bm25s==0.3.11",
-#   "numpy>=1.26,<3",
+#   "numpy>=1.26,<3; python_version < '3.14'",
+#   "numpy>=2.3,<3; python_version >= '3.14'",
 #   "PyStemmer>=2.2,<4",
 #   "scipy>=1.11",
 # ]
