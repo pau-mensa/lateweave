@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import pytest
 
-from lateweave import CorpusManifest, IncompatibleQueryError, Representation
+from lateweave import CorpusManifest
 
 
 SCRIPT = Path(__file__).parents[1] / "cookbook" / "bm25_stored_maxsim.py"

@@ -1,25 +1,33 @@
 # lateweave
 
-`lateweave` is a Rust/PyO3 package for composing late-interaction retrieval
-systems. It does not implement BM25, PLAID, WARP, Tachiom, or their index
-formats. Those libraries participate through two stable interfaces:
+`lateweave` is a Rust/PyO3 package for composing retrieval pipelines out of
+engines it does not implement:
 
 ```text
-Query -> CandidateGenerator -> CandidateScorer -> deterministic top-k
+Query -> CandidateGenerator -> [Reranker] -> deterministic top-k
 ```
+
+A `Query` is raw text plus named features, each stamped with the
+`Representation` (encoder identity) that produced it and materialized at most
+once. A stage declares the features it consumes and the `CorpusManifest`
+(document-set identity) it indexes. Stages must agree on the corpus; each stage
+must agree with the query on the representation of every feature it uses. The
+reranker is optional: without one, gather scores rank.
 
 The package supplies:
 
-- `Query`, `Candidate`, `Score`, and `IndexManifest` value contracts;
-- `CandidateGenerator` and `CandidateScorer` protocols;
-- orchestration, compatibility checks, timings, and resource budgets;
-- a packed CPU `maxsim_scores_packed` kernel using SGEMM, SIMD maximum
-  reduction, bounded token batches, and optional worker pools; and
-- optional vector stores for generators, such as BM25, that do not own a
-  document-vector representation.
+- `Query`, `Feature`, `Candidate`, `Score`, `CorpusManifest`, `Representation`;
+- the `CandidateGenerator`, `Reranker`, and `MultiVectorSource` protocols;
+- `SearchPipeline`: compatibility checks, optional rerank, subset filtering,
+  deterministic ranking, timings;
+- `MaxSimReranker` over any `MultiVectorSource`, backed by a packed CPU
+  `maxsim_scores_packed` kernel (SGEMM, SIMD maximum reduction, bounded token
+  batches, worker pools);
+- `Float32VectorStore` and `Int8VectorStore`: memory-mapped multi-vector
+  sources for gatherers, such as BM25, that keep no document vectors.
 
-Native late-interaction engines can ignore lateweave storage entirely. A scorer
-owns every representation-specific transition behind `CandidateScorer.score`.
+Nothing in the package names an engine. bm25s, FastPLAID, NextPlaid and others
+appear only in cookbooks.
 
 ## Building
 
@@ -58,104 +66,119 @@ macOS needs no feature flag: Accelerate ships with the OS and is used
 automatically. [ARCHITECTURE.md](ARCHITECTURE.md#the-sgemm-dependency) explains
 why Linux does not have an equivalent default.
 
-## Optional vector stores
-
-`StoredMaxSimScorer` composes the MaxSim kernel with one of three stores:
-
-| Store | Physical representation | Fidelity |
-|---|---|---|
-| `Int8VectorStore` | symmetric INT8 row plus one float32 scale per token | lossy |
-| `TurboQuantVectorStore` | training-free TurboQuant-MSE, four bits per coordinate | lossy |
-| `JzipVectorStore` | spherical coordinates, byte shuffle, and one zstd frame per document | near-lossless, not bit-exact |
-
-Each store owns its files, query preparation, candidate reconstruction,
-append, and delete behavior. Encoding and decoding functions are private native
-implementation details rather than public codec primitives.
+## Queries and features
 
 ```python
-from lateweave import JzipVectorStore, StoredMaxSimScorer
+from lateweave import Feature, Query, Representation
 
-store = JzipVectorStore.create(
-    "index/vectors",
-    packed_document_embeddings,
-    document_lengths,
-    compression_level=1,
-    threads=8,
+representation = Representation(
+    encoder="lightonai/LateOn-Code", encoder_revision="main", dimension=128, normalized=True
 )
-scorer = StoredMaxSimScorer(store, scorer_manifest)
+query = Query(
+    "CUDA_ERROR_ILLEGAL_ADDRESS after switching to bf16 attention",
+    multi_vector=Feature(representation, provider=lambda: encode(text)),
+)
 ```
 
-Jzip frames are document-aligned for candidate-level random access. The format
-is owned and versioned by lateweave; it is deliberately not byte-compatible
-with the upstream monolithic jzip CLI. Deletes compact live frames without
-decoding or recompressing them, while appends encode only new documents.
+`provider` runs the first time a stage asks for the feature, so a text-only
+gatherer never pays for encoding, and a gatherer and reranker share one matrix.
+A stage that needs the feature from another encoder is refused before anything
+runs.
 
-## Optional metadata filtering
-
-`DuckDBMetadataStore` is a static, portable metadata utility for candidate
-generators that accept a document subset but do not own metadata filtering. It
-is immutable for one index generation: after an append, delete, or rebuild, the
-integration creates a replacement store from the generator's final ID
-bindings. Engines that already synchronize their own metadata should keep
-using their native implementation.
-
-Install the optional dependency with `pip install 'lateweave[metadata]'`:
+## Implementing a gatherer
 
 ```python
-import duckdb
-from lateweave import DuckDBMetadataStore, MetadataRecord
-
-records = [
-    MetadataRecord(0, "law-1", {"country": "ES", "year": 2024}),
-    MetadataRecord(1, "law-2", {"country": "FR", "year": 2025}),
-]
-store = DuckDBMetadataStore.create("index/metadata.duckdb", records, manifest)
-
-country = duckdb.ColumnExpression("country")
-allowed_ids = store.select(country == duckdb.ConstantExpression("ES"))
-```
-
-The result is a sorted `int64` NumPy array of generator-internal IDs. An
-adapter translates it to its native filter representation, such as a Boolean
-`weight_mask` for bm25s. The store accepts DuckDB expression objects rather
-than raw SQL strings, and validates corpus identity, document-ID digest,
-generator representation, and generation whenever it opens. External-ID
-digests are computed in ascending generator-ID order, including for sparse ID
-spaces.
-
-## Implementing an external engine
-
-```python
-from lateweave import Candidate, ResourceBudget, Score, ScorerCapabilities
+from lateweave import Candidate, CorpusManifest
 
 
-class MyGenerator:
-    def gather(self, query, limit):
-        rows = self.index.retrieve(query.text, limit=limit)
+class MyGatherer:
+    requires = {}                      # consumes query.text only
+    score_semantics = "my-gather-score"
+
+    def __init__(self, index, corpus: CorpusManifest):
+        self.index = index
+        self.corpus = corpus
+
+    def gather(self, query, limit, *, subset=None):
+        rows = self.index.retrieve(query.text, limit=limit, allowed=subset)
         return tuple(
-            Candidate(document_id, gather_score, rank, "my-generator")
-            for rank, (document_id, gather_score) in enumerate(rows)
-        )
-
-
-class MyScorer:
-    capabilities = ScorerCapabilities(
-        preferred_batch_tokens=131_072,
-        supports_candidate_reordering=True,
-        score_semantics="my-qualified-score-semantics",
-    )
-
-    def score(self, query, candidates, *, budget: ResourceBudget):
-        values = self.index.score_candidates(query, candidates, budget=budget)
-        return tuple(
-            Score(candidate.document_id, value)
-            for candidate, value in zip(candidates, values, strict=True)
+            Candidate(document_id, score, rank, "my-engine")
+            for rank, (document_id, score) in enumerate(rows)
         )
 ```
 
-The scorer may reconstruct vectors, evaluate compressed codes, or fuse access
-and scoring. Lateweave only requires it to declare qualified semantics and
-score exactly the candidate set it receives.
+`subset` is a sorted int64 array of internal IDs, or `None`. A gatherer that
+cannot honour it must raise. A gatherer that consumes a vector feature declares
+it: `requires = {"multi_vector": representation}`.
+
+## Implementing a reranker or a source
+
+A reranker owns whatever it needs to score. When what it needs is the token
+vectors of candidate documents, implement `MultiVectorSource` and let
+`MaxSimReranker` do the scoring:
+
+```python
+from lateweave import MaxSimReranker
+
+
+class EngineVectors:
+    """Token vectors an engine already holds; no second copy."""
+
+    representation = representation
+    score_semantics = "engine-reconstructed-full-maxsim"
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.document_count = engine.document_count
+
+    def document_lengths(self, document_ids):
+        return {item: self.engine.length(item) for item in document_ids}
+
+    def fetch(self, document_ids, *, threads=None):
+        rows = [self.engine.vectors(item) for item in document_ids]   # float32 [tokens, D]
+        return np.concatenate(rows), np.asarray([len(r) for r in rows], dtype=np.int64)
+
+
+reranker = MaxSimReranker(EngineVectors(engine), corpus)
+```
+
+Or write a reranker directly:
+
+```python
+class MyReranker:
+    requires = {"multi_vector": representation}
+    score_semantics = "my-qualified-score-semantics"
+
+    def __init__(self, corpus):
+        self.corpus = corpus
+
+    def rerank(self, query, candidates, *, budget):
+        vectors = query.feature("multi_vector", representation)
+        return tuple(Score(c.document_id, self.score_one(vectors, c.document_id)) for c in candidates)
+```
+
+The pipeline requires exactly one score per candidate, never NaN.
+
+## Stores
+
+`Float32VectorStore` and `Int8VectorStore` are `MultiVectorSource`
+implementations for gatherers without document vectors. A store is created with
+the `Representation` of its vectors and refuses queries from any other encoder.
+
+```python
+from lateweave import Float32VectorStore, MaxSimReranker, SearchPipeline
+
+store = Float32VectorStore.create("index/vectors", packed_embeddings, lengths, representation)
+pipeline = SearchPipeline(gatherer, MaxSimReranker(store, corpus))
+result = pipeline.search(query, gather_limit=500, limit=100)
+```
+
+| Store | Bytes per token | Score semantics |
+|---|---|---|
+| `Float32VectorStore` | `4D` | `float32-exact-full-maxsim` |
+| `Int8VectorStore` | `D + 4` | `int8-reconstructed-approximate-full-maxsim` |
+
+Both append and delete in place; a delete compacts internal IDs to `0..n-1`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the ownership rules and
-[cookbook/README.md](cookbook/README.md) for BM25 plus stored-vector examples.
+[cookbook/README.md](cookbook/README.md) for the BM25 recipe.

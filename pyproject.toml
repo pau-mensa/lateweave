@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "lateweave"
 version = "0.1.0"
-description = "Composable candidate generation and late-interaction scoring"
+description = "Composable candidate generation and optional late-interaction reranking"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"

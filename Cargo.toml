@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 license = "Apache-2.0"
-description = "Composable late-interaction retrieval primitives"
+description = "Composable candidate generation and optional late-interaction reranking"
 
 [lib]
 name = "_native"
