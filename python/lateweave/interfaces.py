@@ -1,72 +1,98 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
-from ._native import Candidate, ResourceBudget, Score, ScorerCapabilities
-from .manifest import IndexManifest
+from ._native import Candidate, ResourceBudget, Score
+from .manifest import CorpusManifest, IncompatibleQueryError, Representation
 
 
-EmbeddingProvider = Callable[["Query"], np.ndarray]
+class Feature:
+    """One query representation, materialized at most once.
 
-
-@dataclass
-class Query:
-    """A query with lazily shared features.
-
-    `embedding_provider` is invoked at most once. A text-only gatherer therefore
-    never pays query-encoding cost, while a gatherer and scorer can share the
-    same materialized array.
+    A feature is whatever an encoder produced for the query text: a token
+    matrix, a dense vector, a sparse weighting. Its :class:`Representation`
+    names that encoder so a stage can refuse a feature it was not built for.
+    Pass ``value`` when it is already computed, or ``provider`` to defer the
+    encoding until a stage asks for it.
     """
 
-    text: str
-    token_ids: np.ndarray | None = None
-    _embeddings: np.ndarray | None = field(default=None, repr=False)
-    embedding_provider: EmbeddingProvider | None = field(default=None, repr=False)
+    __slots__ = ("representation", "_value", "_provider")
 
     def __init__(
         self,
-        text: str,
+        representation: Representation,
+        value: Any = None,
         *,
-        token_ids: np.ndarray | None = None,
-        embeddings: np.ndarray | None = None,
-        embedding_provider: EmbeddingProvider | None = None,
+        provider: Callable[[], Any] | None = None,
     ) -> None:
-        self.text = text
-        self.token_ids = token_ids
-        self._embeddings = embeddings
-        self.embedding_provider = embedding_provider
+        if (value is None) == (provider is None):
+            raise ValueError("a feature needs exactly one of value or provider")
+        self.representation = representation
+        self._value = value
+        self._provider = provider
 
     @property
-    def embeddings(self) -> np.ndarray:
-        if self._embeddings is None:
-            if self.embedding_provider is None:
-                raise ValueError("query embeddings were requested but no provider is configured")
-            self._embeddings = self.embedding_provider(self)
-        value = np.asarray(self._embeddings, dtype=np.float32)
-        if value.ndim != 2 or value.shape[0] == 0 or value.shape[1] == 0:
-            raise ValueError("query embeddings must have shape [tokens, dimension]")
-        if not value.flags.c_contiguous:
-            value = np.ascontiguousarray(value)
-        self._embeddings = value
-        return value
+    def value(self) -> Any:
+        if self._value is None:
+            assert self._provider is not None
+            self._value = self._provider()
+            self._provider = None
+        return self._value
+
+
+class Query:
+    """Raw text plus the named features stages may consume."""
+
+    __slots__ = ("text", "features")
+
+    def __init__(self, text: str, **features: Feature) -> None:
+        self.text = text
+        self.features: Mapping[str, Feature] = features
+
+    def feature(self, name: str, representation: Representation) -> Any:
+        """The value of feature ``name``, which must come from ``representation``."""
+        try:
+            feature = self.features[name]
+        except KeyError:
+            raise IncompatibleQueryError(
+                f"query has no {name!r} feature; available: {sorted(self.features)}"
+            ) from None
+        representation.assert_compatible(feature.representation)
+        return feature.value
 
 
 @runtime_checkable
 class CandidateGenerator(Protocol):
-    manifest: IndexManifest
+    """First stage: selects candidate documents from the whole corpus.
 
-    def gather(self, query: Query, limit: int) -> Sequence[Candidate]: ...
+    ``requires`` maps feature names to the representation the gatherer was built
+    with; a text-only gatherer declares an empty mapping. ``score_semantics``
+    qualifies ``gather_score`` and ranks results when no reranker follows.
+    ``subset`` restricts the search to those internal IDs; a gatherer that cannot
+    honour it must raise rather than ignore it.
+    """
+
+    corpus: CorpusManifest
+    requires: Mapping[str, Representation]
+    score_semantics: str
+
+    def gather(
+        self, query: Query, limit: int, *, subset: np.ndarray | None = None
+    ) -> Sequence[Candidate]: ...
 
 
 @runtime_checkable
-class CandidateScorer(Protocol):
-    manifest: IndexManifest
-    capabilities: ScorerCapabilities
+class Reranker(Protocol):
+    """Second stage: one qualified score for every candidate it is given."""
 
-    def score(
+    corpus: CorpusManifest
+    requires: Mapping[str, Representation]
+    score_semantics: str
+
+    def rerank(
         self,
         query: Query,
         candidates: Sequence[Candidate],
@@ -85,7 +111,7 @@ class RankedDocument:
 @dataclass(frozen=True)
 class SearchTimings:
     gather_seconds: float
-    score_seconds: float
+    rerank_seconds: float
     total_seconds: float
 
 
@@ -96,4 +122,3 @@ class SearchResult:
     scores: tuple[Score, ...]
     timings: SearchTimings
     diagnostics: dict[str, Any]
-

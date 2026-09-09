@@ -1,8 +1,4 @@
-//! Language-independent search contracts.
-//!
-//! Backends own representation access and decoding.  The traits deliberately
-//! meet only after document candidate selection, so a scorer may reconstruct
-//! vectors, evaluate compressed codes, or fuse the complete operation.
+//! Deterministic ranking and the reranker-output contract it enforces.
 
 use std::collections::HashSet;
 
@@ -23,72 +19,21 @@ pub fn all_finite(values: &[f32]) -> bool {
     })
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Candidate {
-    pub document_id: u64,
-    pub gather_score: f32,
-    pub gather_rank: usize,
-    pub provenance: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Score {
-    pub document_id: u64,
-    pub value: f32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResourceBudget {
-    pub max_memory_bytes: Option<u64>,
-    pub max_batch_tokens: usize,
-    pub max_documents_per_batch: usize,
-    pub threads: Option<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScorerCapabilities {
-    pub preferred_batch_tokens: usize,
-    pub supports_mmap: bool,
-    pub supports_prefetch: bool,
-    pub supports_candidate_reordering: bool,
-    pub supports_cpu_gpu_sharding: bool,
-    pub score_semantics: String,
-}
-
-pub trait CandidateGenerator<Q> {
-    type Error;
-
-    fn gather(&self, query: &Q, limit: usize) -> Result<Vec<Candidate>, Self::Error>;
-}
-
-pub trait CandidateScorer<Q> {
-    type Error;
-
-    fn capabilities(&self) -> &ScorerCapabilities;
-
-    fn score(
-        &self,
-        query: &Q,
-        candidates: &[Candidate],
-        budget: &ResourceBudget,
-    ) -> Result<Vec<Score>, Self::Error>;
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum RankingError {
     #[error("candidate document ID {0} occurs more than once")]
     DuplicateCandidate(u64),
     #[error("score document ID {0} occurs more than once")]
     DuplicateScore(u64),
-    #[error("scorer omitted candidate document ID {0}")]
+    #[error("reranker omitted candidate document ID {0}")]
     MissingScore(u64),
-    #[error("scorer returned document ID {0}, which was not a candidate")]
+    #[error("reranker returned document ID {0}, which was not a candidate")]
     UnexpectedScore(u64),
     #[error("score for document ID {0} is NaN")]
     NanScore(u64),
 }
 
-/// Validate the scorer contract and return score positions in final rank order.
+/// Validate the reranker contract and return score positions in final rank order.
 ///
 /// Ties are stable by the original gather rank and then document ID. Gather
 /// scores never participate in final ranking.
@@ -153,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn ranking_rejects_a_scorer_that_changes_the_candidate_set() {
+    fn ranking_rejects_a_reranker_that_changes_the_candidate_set() {
         let error = validate_and_rank(&[1], &[0], &[2], &[1.0], 1).unwrap_err();
         assert_eq!(error, RankingError::UnexpectedScore(2));
     }
