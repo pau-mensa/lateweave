@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -50,3 +52,50 @@ def test_feature_from_another_encoder_is_refused_before_materializing() -> None:
 def test_query_text_is_always_available() -> None:
     assert Query("query").text == "query"
     assert Query("query").features == {}
+
+
+DEADLOCK_PROBE = """
+import threading, time
+import numpy as np
+from lateweave import (
+    Candidate, CorpusManifest, Feature, MaxSimReranker, Query, Representation, SearchPipeline,
+)
+
+representation = Representation("encoder", "1", 2, True)
+corpus = CorpusManifest("corpus", "1", 2, "abc")
+
+class Source:
+    representation = representation
+    score_semantics = "in-memory"
+    document_count = 2
+    def document_lengths(self, document_ids):
+        return {item: 1 for item in document_ids}
+    def fetch(self, document_ids, *, threads=None):
+        rows = np.eye(2, dtype=np.float32)[list(document_ids)]
+        return rows, np.ones(len(document_ids), dtype=np.int64)
+
+class Gatherer:
+    corpus = corpus
+    requires = {}
+    score_semantics = "gather"
+    def gather(self, query, limit, *, subset=None):
+        return (Candidate(0, 1.0, 0, "t"), Candidate(1, 1.0, 1, "t"))
+
+def encode():
+    time.sleep(0.3)
+    return np.asarray([[0.0, 1.0]], dtype=np.float32)
+
+query = Query("query", multi_vector=Feature(representation, provider=encode))
+pipeline = SearchPipeline(Gatherer(), MaxSimReranker(Source(), corpus))
+search = threading.Thread(target=lambda: pipeline.search(query, gather_limit=2, limit=2))
+search.start()
+time.sleep(0.05)
+query.feature("multi_vector", representation)
+search.join()
+"""
+
+
+def test_a_feature_shared_with_a_running_search_does_not_deadlock() -> None:
+    # The search materializes the feature without the GIL while this thread
+    # asks for it with the GIL held.
+    subprocess.run([sys.executable, "-c", DEADLOCK_PROBE], check=True, timeout=30)

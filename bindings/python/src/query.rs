@@ -102,7 +102,10 @@ impl PyFeature {
 
     #[getter]
     fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        value_to_py(py, self.inner.value().map_err(to_py)?)
+        // Detached, because a provider running on another thread holds the
+        // feature's lock while it waits for the GIL.
+        let value = py.detach(|| self.inner.value()).map_err(to_py)?;
+        value_to_py(py, value)
     }
 }
 
@@ -161,10 +164,10 @@ impl PyQuery {
         representation: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let representation = self::representation(representation)?;
-        value_to_py(
-            py,
-            self.inner.feature(name, &representation).map_err(to_py)?,
-        )
+        let value = py
+            .detach(|| self.inner.feature(name, &representation))
+            .map_err(to_py)?;
+        value_to_py(py, value)
     }
 
     fn __repr__(&self) -> String {
