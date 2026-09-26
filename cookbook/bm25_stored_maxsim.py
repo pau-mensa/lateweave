@@ -328,7 +328,6 @@ def build_index(args: argparse.Namespace) -> None:
                 packed,
                 lengths,
                 representation,
-                chunk_tokens=args.chunk_tokens,
                 threads=args.threads,
             )
             manifest.write(temporary / CORPUS_MANIFEST)
@@ -359,13 +358,7 @@ def update_index(args: argparse.Namespace) -> None:
         replacement = staged_index_copy(source)
         try:
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
-            store.append(
-                packed,
-                lengths,
-                chunk_tokens=args.chunk_tokens,
-                copy_chunk_tokens=args.copy_chunk_tokens,
-                threads=args.threads,
-            )
+            store.append(packed, lengths, threads=args.threads)
             documents = [*existing, *additions]
             write_lexical_index(
                 replacement / LEXICAL_DIRECTORY, [row["text"] for row in documents], analyzer
@@ -407,7 +400,7 @@ def delete_index(args: argparse.Namespace) -> None:
         replacement = staged_index_copy(source)
         try:
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
-            store.delete(internal_ids, copy_chunk_tokens=args.copy_chunk_tokens)
+            store.delete(internal_ids)
             # Rebuilding over the survivors compacts internal IDs to 0..n-1 in
             # document order, which is the order the store compacts to as well.
             write_lexical_index(
@@ -501,7 +494,6 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--encoder-revision", required=True)
     build.add_argument("--query-template", default="")
     build.add_argument("--document-template", default="")
-    build.add_argument("--chunk-tokens", type=int, default=131_072)
     build.add_argument("--threads", type=int)
     build.add_argument(
         "--stemmer",
@@ -516,15 +508,12 @@ def parser() -> argparse.ArgumentParser:
     update.add_argument("--documents", type=Path, required=True)
     update.add_argument("--embeddings", type=Path, required=True)
     update.add_argument("--document-lengths", type=Path, required=True)
-    update.add_argument("--chunk-tokens", type=int, default=131_072)
-    update.add_argument("--copy-chunk-tokens", type=int, default=1_000_000)
     update.add_argument("--threads", type=int)
     update.set_defaults(function=update_index)
 
     delete = commands.add_parser("delete", help="delete external document IDs")
     delete.add_argument("--index", type=Path, required=True)
     delete.add_argument("--document-id", action="append", required=True)
-    delete.add_argument("--copy-chunk-tokens", type=int, default=1_000_000)
     delete.set_defaults(function=delete_index)
 
     search = commands.add_parser("search", help="BM25 gather, MaxSim rerank when embeddings are given")

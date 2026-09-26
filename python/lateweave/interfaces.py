@@ -1,67 +1,17 @@
+"""Structural contracts for stages and sources implemented in Python.
+
+The pipeline itself is native; these protocols describe what it calls on a
+Python object passed as a gatherer, a reranker, or a ``MaxSimReranker`` source.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
-from ._native import Candidate, ResourceBudget, Score
-from .manifest import CorpusManifest, IncompatibleQueryError, Representation
-
-
-class Feature:
-    """One query representation, materialized at most once.
-
-    A feature is whatever an encoder produced for the query text: a token
-    matrix, a dense vector, a sparse weighting. Its :class:`Representation`
-    names that encoder so a stage can refuse a feature it was not built for.
-    Pass ``value`` when it is already computed, or ``provider`` to defer the
-    encoding until a stage asks for it.
-    """
-
-    __slots__ = ("representation", "_value", "_provider")
-
-    def __init__(
-        self,
-        representation: Representation,
-        value: Any = None,
-        *,
-        provider: Callable[[], Any] | None = None,
-    ) -> None:
-        if (value is None) == (provider is None):
-            raise ValueError("a feature needs exactly one of value or provider")
-        self.representation = representation
-        self._value = value
-        self._provider = provider
-
-    @property
-    def value(self) -> Any:
-        if self._value is None:
-            assert self._provider is not None
-            self._value = self._provider()
-            self._provider = None
-        return self._value
-
-
-class Query:
-    """Raw text plus the named features stages may consume."""
-
-    __slots__ = ("text", "features")
-
-    def __init__(self, text: str, **features: Feature) -> None:
-        self.text = text
-        self.features: Mapping[str, Feature] = features
-
-    def feature(self, name: str, representation: Representation) -> Any:
-        """The value of feature ``name``, which must come from ``representation``."""
-        try:
-            feature = self.features[name]
-        except KeyError:
-            raise IncompatibleQueryError(
-                f"query has no {name!r} feature; available: {sorted(self.features)}"
-            ) from None
-        representation.assert_compatible(feature.representation)
-        return feature.value
+from ._native import Candidate, Query, ResourceBudget, Score
+from .manifest import CorpusManifest, Representation
 
 
 @runtime_checkable
@@ -71,8 +21,10 @@ class CandidateGenerator(Protocol):
     ``requires`` maps feature names to the representation the gatherer was built
     with; a text-only gatherer declares an empty mapping. ``score_semantics``
     qualifies ``gather_score`` and ranks results when no reranker follows.
-    ``subset`` restricts the search to those internal IDs; a gatherer that cannot
-    honour it must raise rather than ignore it.
+    ``subset`` is an ascending int64 array of the internal IDs the search is
+    restricted to; a gatherer that cannot honour it must raise rather than
+    ignore it. ``corpus``, ``requires``, and ``score_semantics`` are read once,
+    when the pipeline is built.
     """
 
     corpus: CorpusManifest
@@ -101,24 +53,22 @@ class Reranker(Protocol):
     ) -> Sequence[Score]: ...
 
 
-@dataclass(frozen=True)
-class RankedDocument:
-    document_id: int
-    score: float
-    rank: int
+@runtime_checkable
+class MultiVectorSource(Protocol):
+    """Token vectors of documents, fetched by internal ID.
 
+    ``fetch`` returns a float32 ``[tokens, dimension]`` matrix holding the
+    requested documents in the requested order, plus their int64 lengths.
+    ``score_semantics`` qualifies what MaxSim over those vectors means, since a
+    source may reconstruct from a lossy code.
+    """
 
-@dataclass(frozen=True)
-class SearchTimings:
-    gather_seconds: float
-    rerank_seconds: float
-    total_seconds: float
+    representation: Representation
+    score_semantics: str
+    document_count: int
 
+    def document_lengths(self, document_ids: Sequence[int]) -> Mapping[int, int]: ...
 
-@dataclass(frozen=True)
-class SearchResult:
-    documents: tuple[RankedDocument, ...]
-    candidates: tuple[Candidate, ...]
-    scores: tuple[Score, ...]
-    timings: SearchTimings
-    diagnostics: dict[str, Any]
+    def fetch(
+        self, document_ids: Sequence[int], *, threads: int | None = None
+    ) -> tuple[np.ndarray, np.ndarray]: ...

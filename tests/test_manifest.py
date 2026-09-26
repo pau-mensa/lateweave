@@ -46,3 +46,4 @@ def test_manifests_reject_empty_identity() -> None:
 def test_document_ids_digest_depends_on_order_and_boundaries() -> None:
     assert document_ids_digest(["a", "b"]) != document_ids_digest(["b", "a"])
     assert document_ids_digest(["ab", "c"]) != document_ids_digest(["a", "bc"])
+    assert document_ids_digest(name for name in ["a", "b"]) == document_ids_digest(("a", "b"))

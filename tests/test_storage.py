@@ -10,6 +10,7 @@ from lateweave import (
     CorpusManifest,
     Feature,
     Float32VectorStore,
+    IncompatibleIndexError,
     IncompatibleQueryError,
     Int8VectorStore,
     MaxSimReranker,
@@ -166,3 +167,26 @@ def test_reranker_refuses_a_source_that_disagrees_with_the_corpus(tmp_path) -> N
     store = Float32VectorStore.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION)
     with pytest.raises(ValueError, match="document counts"):
         MaxSimReranker(store, corpus(99))
+
+
+@pytest.mark.parametrize("store_type", STORES)
+def test_stores_accept_non_contiguous_embeddings(tmp_path, store_type) -> None:
+    doubled = np.repeat(DOCUMENTS, 2, axis=0)[::2]
+    assert not doubled.flags.c_contiguous
+    store = store_type.create(tmp_path / "vectors", doubled, LENGTHS, REPRESENTATION)
+    store.append(np.asfortranarray(DOCUMENTS[:1]), [1])
+    expected = store_type.create(tmp_path / "expected", DOCUMENTS, LENGTHS, REPRESENTATION)
+    expected.append(DOCUMENTS[:1], [1])
+    np.testing.assert_array_equal(store.fetch([0, 1, 2, 3])[0], expected.fetch([0, 1, 2, 3])[0])
+
+
+def test_a_reranker_refuses_a_store_mutated_after_it_was_built(tmp_path) -> None:
+    store = Float32VectorStore.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION)
+    reranker = MaxSimReranker(store, corpus(3))
+    query = Query("query", multi_vector=Feature(REPRESENTATION, DOCUMENTS[:1]))
+    candidates = [Candidate(1, 0.0, 0, "test")]
+    reranker.rerank(query, candidates, budget=ResourceBudget())
+    store.delete([0])
+    store.append(DOCUMENTS[:1], [1])
+    with pytest.raises(IncompatibleIndexError, match="mutated"):
+        reranker.rerank(query, candidates, budget=ResourceBudget())

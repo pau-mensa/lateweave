@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "bindings/python"]
+resolver = "2"
+
 [package]
 name = "lateweave"
 version = "0.1.0"
@@ -6,15 +10,13 @@ rust-version = "1.74"
 license = "Apache-2.0"
 description = "Composable candidate generation and optional late-interaction reranking"
 
-[lib]
-name = "_native"
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 matrixmultiply = "0.3"
-numpy = "0.26"
-pyo3 = "0.26"
+memmap2 = "0.9"
 rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 
 # Only reachable through the `openblas` feature, or on macOS where Accelerate
@@ -24,6 +26,9 @@ blas = { version = "0.23", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 blas = "0.23"
 blas-src = { version = "0.11", default-features = false, features = ["accelerate"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = []

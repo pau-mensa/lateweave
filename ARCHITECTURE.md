@@ -24,6 +24,39 @@ Optional lateweave store ---------------->  MultiVectorSource -> MaxSimReranker
 No engine is named in the package. Adapters live with their engine or in
 cookbooks.
 
+A service built on lateweave owns what surrounds a search: collections,
+persistence of its own records, authorization, HTTP/MCP, quotas, billing, and
+choosing which gatherer, reranker, and source make up a retrieval recipe.
+Lateweave owns the recipe's execution: candidate generation contracts,
+optional reranking, representation compatibility, search results with
+provenance, the pipeline entrypoint, and the vector stores a MaxSim rerank
+reads.
+
+## One implementation, two languages
+
+```text
+lateweave (crate)            no PyO3, no NumPy; the only implementation
+  ^
+  |  Rust contracts
+  |
+lateweave-python             PyO3 module lateweave._native
+  (bindings/python)           adapts Python stages, sources, and features
+  ^
+  |
+lateweave (Python package)   manifest dataclasses, protocols, type stubs
+```
+
+A Rust service depends on the crate directly. The Python package is a binding:
+`SearchPipeline`, `MaxSimReranker`, `Query`, `Feature`, and the stores are
+native classes, and a Python gatherer, reranker, or `MultiVectorSource` is
+wrapped so the Rust pipeline can call it. An exception raised by Python code
+crosses the pipeline as `Error::External` and reaches the caller unchanged.
+Search releases the GIL and reacquires it only to call back into Python, so a
+pipeline built entirely from native stages runs without it.
+
+A Python feature value is kept as the Python object for Python stages; a Rust
+stage that needs a token matrix gets it converted, once, on first use.
+
 ## Two identities
 
 **Corpus identity** (`CorpusManifest`): which documents, in which internal
@@ -58,8 +91,9 @@ stages that consume them. The package fixes none; `MaxSimReranker` defaults to
 
 `CandidateGenerator.gather(query, limit, subset=None)` returns ordered, unique
 internal IDs with gather scores, dense zero-based ranks, and provenance.
-`subset` restricts the search to those IDs; a gatherer that cannot honour it
-raises rather than ignores it. The gatherer's `score_semantics` qualifies its
+`subset` restricts the search to those IDs, strictly ascending and inside the
+corpus; a gatherer that cannot honour it raises rather than ignores it, and the
+pipeline refuses any candidate outside it or outside the corpus. The gatherer's `score_semantics` qualifies its
 gather scores, which rank the results when no reranker follows.
 
 `Reranker.rerank(query, candidates, budget=...)` returns exactly one qualified
@@ -93,14 +127,21 @@ FixedRecordVectorStore
 
 Both use memory-mapped fixed-width token records, one `.npy` per array, a
 `document-offsets.npy`, and `storage.json` carrying format, representation,
-and counts. Append writes a replacement array set and publishes it atomically;
-delete copies live records and compacts IDs. The Rust side supplies INT8
-encode/decode only.
+and counts. In Rust they are one `VectorStore` parameterized by `StoreFormat`.
+Append streams the existing records and the new ones into a replacement file
+set, then moves the live files aside and renames the new ones into place,
+moving the old ones back if any step fails; delete copies the surviving runs
+of records and compacts IDs. Reads and mutations can run from several threads:
+mutations run one at a time and stage while reads continue, and reads wait
+only for the renames. A mutation moves the store's generation, and a
+`MaxSimReranker` built before it refuses to score afterwards, since a compacted
+ID may name another document; build a new one over the new corpus manifest.
+The files are ordinary little-endian `.npy`, readable by NumPy.
 
 ## Native scoring and execution
 
-`maxsim_scores_packed` accepts a contiguous float32 token matrix plus document
-lengths. Rust performs batched SGEMM, SIMD maximum reduction, and deterministic
+`maxsim_scores` (`maxsim_scores_packed` in Python) accepts a contiguous
+float32 token matrix plus document lengths. Rust performs batched SGEMM, SIMD maximum reduction, and deterministic
 document-order restoration. Token batch size and worker count are explicit.
 The kernel knows nothing about where vectors came from.
 
@@ -110,8 +151,9 @@ internally nests inside that and oversubscribes: on a 16-core host, capping the
 inner layer with `OMP_NUM_THREADS=4` is worth about 24% against leaving it to
 spawn a thread per core.
 
-`validate_and_rank` enforces the reranker contract (every candidate scored once,
-nothing extra, no NaN) and orders by score, then gather rank, then ID.
+The pipeline's ranking step enforces the reranker contract (every candidate
+scored once, nothing extra, no NaN) and orders by score, then gather rank, then
+ID.
 
 ## The SGEMM dependency
 
@@ -125,11 +167,11 @@ decided at compile time, never at run time.
 | `--features openblas` | system OpenBLAS | `libopenblas.so.0` at build time |
 | macOS | Accelerate | none; part of the OS |
 
-The pure-Rust kernel is the default because it makes the extension module
-importable everywhere with no system dependency at all. It is roughly 1.75x
-slower than OpenBLAS on the shapes this kernel sees -- a tall, skinny product
-where `k` is the embedding dimension and `n` is a batch of document tokens --
-and produces bit-identical results.
+The pure-Rust kernel is the default because it makes the crate link and the
+extension module import everywhere with no system dependency at all. It is
+roughly 1.75x slower than OpenBLAS on the shapes this kernel sees -- a tall,
+skinny product where `k` is the embedding dimension and `n` is a batch of
+document tokens -- and produces bit-identical results.
 
 `--features openblas` is worth taking for a deployment. Combined with
 auditwheel's repair step, which `maturin` runs by default, the resulting wheel
@@ -172,5 +214,6 @@ others.
 - The CPU kernel reranks host-resident sources. A source on an accelerator
   pays a device-to-host copy to be reranked here; on such deployments the
   engine's own scoring is the reranker.
-- Protocols are structural. Conformance is established by tests against real
-  adapters, not by type hints.
+- Python protocols are structural. Conformance is established by tests
+  against real adapters, not by type hints; the Rust traits are checked by the
+  compiler.

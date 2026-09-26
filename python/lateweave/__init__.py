@@ -1,27 +1,27 @@
-from ._native import Candidate, ResourceBudget, Score, maxsim_scores_packed
-from .interfaces import (
-    CandidateGenerator,
+from ._native import (
+    Candidate,
     Feature,
+    Float32VectorStore,
+    Int8VectorStore,
+    MaxSimReranker,
     Query,
     RankedDocument,
-    Reranker,
+    ResourceBudget,
+    Score,
+    SearchPipeline,
     SearchResult,
     SearchTimings,
+    VectorStore,
+    maxsim_scores_packed,
+    open_vector_store,
 )
+from .interfaces import CandidateGenerator, MultiVectorSource, Reranker
 from .manifest import (
     CorpusManifest,
     IncompatibleIndexError,
     IncompatibleQueryError,
     Representation,
     document_ids_digest,
-)
-from .maxsim import MaxSimReranker
-from .pipeline import SearchPipeline
-from .storage import (
-    Float32VectorStore,
-    Int8VectorStore,
-    MultiVectorSource,
-    open_vector_store,
 )
 
 __all__ = [
@@ -44,6 +44,7 @@ __all__ = [
     "SearchPipeline",
     "SearchResult",
     "SearchTimings",
+    "VectorStore",
     "document_ids_digest",
     "maxsim_scores_packed",
     "open_vector_store",
