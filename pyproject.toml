@@ -19,6 +19,7 @@ dependencies = [
 dev = ["pytest>=8,<9", "maturin>=1.8,<2"]
 
 [tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
 module-name = "lateweave._native"
 python-source = "python"
 features = ["pyo3/extension-module"]

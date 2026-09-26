@@ -1,0 +1,21 @@
+[package]
+name = "lateweave-python"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+description = "Python bindings for lateweave"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+lateweave = { path = "../.." }
+numpy = "0.26"
+pyo3 = "0.26"
+
+[features]
+default = []
+openblas = ["lateweave/openblas"]

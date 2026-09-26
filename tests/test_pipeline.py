@@ -38,6 +38,8 @@ class TextGatherer:
         self.subsets.append(subset)
         assert query.text == "query"
         rows = [(2, 100.0), (0, 10.0), (1, 10.0)]
+        if subset is not None:
+            rows = [row for row in rows if row[0] in subset]
         return tuple(
             Candidate(document_id, gather_score, rank, "external")
             for rank, (document_id, gather_score) in enumerate(rows[:limit])
@@ -119,11 +121,41 @@ def test_an_unservable_query_fails_before_gathering() -> None:
     assert gatherer.calls == 0
 
 
-def test_subset_reaches_the_gatherer_verbatim() -> None:
+def test_subset_reaches_the_gatherer_as_ascending_ids() -> None:
     gatherer = TextGatherer()
-    subset = np.asarray([0, 2], dtype=np.int64)
-    SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=subset)
-    assert gatherer.subsets[0] is subset
+    result = SearchPipeline(gatherer).search(
+        "query", gather_limit=3, limit=2, subset=np.asarray([0, 2], dtype=np.int64)
+    )
+    assert gatherer.subsets[0].tolist() == [0, 2]
+    assert [row.document_id for row in result.documents] == [2, 0]
+
+
+def test_subset_must_be_ascending_and_inside_the_corpus() -> None:
+    gatherer = TextGatherer()
+    for subset in ([2, 0], [0, 3]):
+        with pytest.raises(ValueError, match="subset"):
+            SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=subset)
+    assert gatherer.calls == 0
+
+
+def test_a_gatherer_that_ignores_the_subset_is_refused() -> None:
+    class IgnoringGatherer(TextGatherer):
+        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
+            return super().gather(query, limit)
+
+    with pytest.raises(ValueError, match="outside the subset"):
+        SearchPipeline(IgnoringGatherer()).search(
+            "query", gather_limit=3, limit=1, subset=np.asarray([0], dtype=np.int64)
+        )
+
+
+def test_gatherer_exceptions_reach_the_caller_unchanged() -> None:
+    class FailingGatherer(TextGatherer):
+        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
+            raise KeyError("engine unavailable")
+
+    with pytest.raises(KeyError, match="engine unavailable"):
+        SearchPipeline(FailingGatherer()).search("query", gather_limit=3, limit=1)
 
 
 def test_native_ranking_rejects_reranker_candidate_drift() -> None:
