@@ -65,6 +65,13 @@ pub trait MultiVectorSource: Send + Sync {
 
     fn document_count(&self) -> u64;
 
+    /// Changes whenever a mutation may have changed which vectors an ID
+    /// holds. A reranker built over the source refuses to score once it has
+    /// moved; a source that never mutates keeps the default.
+    fn generation(&self) -> u64 {
+        0
+    }
+
     /// Token counts of `document_ids`, in the same order.
     fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>>;
 

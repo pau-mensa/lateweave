@@ -6,9 +6,10 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::kernel::maxsim_scores;
 use crate::manifest::CorpusManifest;
-use crate::query::Query;
+use crate::query::{Query, TokenMatrix};
 use crate::source::MultiVectorSource;
 use crate::stage::{Candidate, Requirements, Reranker, ResourceBudget, Score};
+use crate::threads::install;
 
 /// The feature name a [`MaxSimReranker`] reads unless told otherwise.
 pub const DEFAULT_FEATURE: &str = "multi_vector";
@@ -17,9 +18,12 @@ pub const DEFAULT_FEATURE: &str = "multi_vector";
 ///
 /// The reranker requires its query feature to carry the source's
 /// representation, so vectors from a different encoder are refused before
-/// anything is fetched.
+/// anything is fetched. It is bound to the source as it was when built: once
+/// the source is mutated, `rerank` fails rather than score IDs that may now
+/// name other documents, and a new reranker over a new manifest is needed.
 pub struct MaxSimReranker {
     source: Arc<dyn MultiVectorSource>,
+    source_generation: u64,
     corpus: CorpusManifest,
     feature: String,
     requires: Requirements,
@@ -31,17 +35,13 @@ impl MaxSimReranker {
         corpus: CorpusManifest,
         feature: impl Into<String>,
     ) -> Result<Self> {
-        if source.document_count() != corpus.document_count() {
-            return Err(Error::IncompatibleIndex(format!(
-                "source and corpus manifest document counts differ ({} != {})",
-                source.document_count(),
-                corpus.document_count()
-            )));
-        }
+        let source_generation = source.generation();
+        check_document_count(source.as_ref(), &corpus)?;
         let feature = feature.into();
         let requires = BTreeMap::from([(feature.clone(), source.representation().clone())]);
         Ok(Self {
             source,
+            source_generation,
             corpus,
             feature,
             requires,
@@ -55,6 +55,26 @@ impl MaxSimReranker {
     pub fn feature(&self) -> &str {
         &self.feature
     }
+
+    fn check_source(&self) -> Result<()> {
+        if self.source.generation() != self.source_generation {
+            return Err(Error::IncompatibleIndex(
+                "the source was mutated after this reranker was built".to_string(),
+            ));
+        }
+        check_document_count(self.source.as_ref(), &self.corpus)
+    }
+}
+
+fn check_document_count(source: &dyn MultiVectorSource, corpus: &CorpusManifest) -> Result<()> {
+    if source.document_count() != corpus.document_count() {
+        return Err(Error::IncompatibleIndex(format!(
+            "source and corpus manifest document counts differ ({} != {})",
+            source.document_count(),
+            corpus.document_count()
+        )));
+    }
+    Ok(())
 }
 
 /// Groups documents, shortest first, into batches of at most `maximum_tokens`
@@ -82,6 +102,53 @@ fn token_batches(
         batches.push(batch);
     }
     batches
+}
+
+impl MaxSimReranker {
+    fn score(
+        &self,
+        vectors: &TokenMatrix,
+        candidate_ids: &[u64],
+        budget: &ResourceBudget,
+    ) -> Result<HashMap<u64, f32>> {
+        let representation = self.source.representation();
+        let lengths = self.source.document_lengths(candidate_ids)?;
+        if lengths.len() != candidate_ids.len() {
+            return Err(Error::invalid(
+                "source returned a different number of document lengths than requested",
+            ));
+        }
+        let lengths = candidate_ids
+            .iter()
+            .copied()
+            .zip(lengths)
+            .collect::<HashMap<_, _>>();
+
+        let mut scores = HashMap::with_capacity(candidate_ids.len());
+        for window in candidate_ids.chunks(budget.max_documents_per_batch()) {
+            for batch in token_batches(window, &lengths, budget.max_batch_tokens()) {
+                let documents = self.source.fetch(&batch, budget.threads())?;
+                let expected = batch.iter().map(|document_id| lengths[document_id]);
+                if documents.dimension() != representation.dimension()
+                    || !documents.lengths().iter().copied().eq(expected)
+                {
+                    return Err(Error::invalid(
+                        "source fetched vectors that disagree with its declared lengths or dimension",
+                    ));
+                }
+                let values = maxsim_scores(
+                    vectors.values(),
+                    documents.vectors(),
+                    documents.lengths(),
+                    vectors.dimension(),
+                    Some(budget.max_batch_tokens()),
+                    budget.threads(),
+                )?;
+                scores.extend(batch.into_iter().zip(values));
+            }
+        }
+        Ok(scores)
+    }
 }
 
 impl Reranker for MaxSimReranker {
@@ -129,41 +196,13 @@ impl Reranker for MaxSimReranker {
             .iter()
             .map(|candidate| candidate.document_id)
             .collect::<Vec<_>>();
-        let lengths = self.source.document_lengths(&candidate_ids)?;
-        if lengths.len() != candidate_ids.len() {
-            return Err(Error::invalid(
-                "source returned a different number of document lengths than requested",
-            ));
-        }
-        let lengths = candidate_ids
-            .iter()
-            .copied()
-            .zip(lengths)
-            .collect::<HashMap<_, _>>();
-
-        let mut scores = HashMap::with_capacity(candidate_ids.len());
-        for window in candidate_ids.chunks(budget.max_documents_per_batch()) {
-            for batch in token_batches(window, &lengths, budget.max_batch_tokens()) {
-                let documents = self.source.fetch(&batch, budget.threads())?;
-                let expected = batch.iter().map(|document_id| lengths[document_id]);
-                if documents.dimension() != representation.dimension()
-                    || !documents.lengths().iter().copied().eq(expected)
-                {
-                    return Err(Error::invalid(
-                        "source fetched vectors that disagree with its declared lengths or dimension",
-                    ));
-                }
-                let values = maxsim_scores(
-                    vectors.values(),
-                    documents.vectors(),
-                    documents.lengths(),
-                    vectors.dimension(),
-                    Some(budget.max_batch_tokens()),
-                    budget.threads(),
-                )?;
-                scores.extend(batch.into_iter().zip(values));
-            }
-        }
+        // Checked before the first read and after the last, so every length
+        // and vector comes from the source this reranker was built over.
+        self.check_source()?;
+        let scores = install(budget.threads(), || {
+            self.score(vectors, &candidate_ids, budget)
+        })??;
+        self.check_source()?;
         Ok(candidate_ids
             .into_iter()
             .map(|document_id| Score {

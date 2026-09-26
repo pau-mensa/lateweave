@@ -16,9 +16,10 @@ mod npy;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -192,14 +193,32 @@ impl State {
 
 /// A memory-mapped multi-vector store.
 ///
-/// Reads and mutations may run concurrently from several threads: `append`
-/// and `delete` take an exclusive lock only while they publish, so an
-/// `Arc<VectorStore>` can back a reranker and be mutated in place.
+/// Reads and mutations may run concurrently from several threads. Mutations
+/// run one at a time and stage their files while reads continue; reads wait
+/// only while the staged files are renamed into place. A mutation moves
+/// [`MultiVectorSource::generation`], so a reranker built before it refuses
+/// to score afterwards instead of reading IDs that now name other documents.
 pub struct VectorStore {
     path: PathBuf,
     format: StoreFormat,
     representation: Representation,
-    state: RwLock<State>,
+    /// Serializes mutations, so staging needs only a shared lock on `state`.
+    mutation: Mutex<()>,
+    generation: AtomicU64,
+    /// `None` once a failed publish could not reload the previous files.
+    state: RwLock<Option<State>>,
+}
+
+struct ReadState<'a>(RwLockReadGuard<'a, Option<State>>);
+
+impl Deref for ReadState<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.0
+            .as_ref()
+            .expect("a read guard is only handed out over a loaded state")
+    }
 }
 
 impl VectorStore {
@@ -265,7 +284,9 @@ impl VectorStore {
             path,
             format,
             representation: metadata.representation,
-            state: RwLock::new(state),
+            mutation: Mutex::new(()),
+            generation: AtomicU64::new(0),
+            state: RwLock::new(Some(state)),
         })
     }
 
@@ -285,17 +306,24 @@ impl VectorStore {
         self.representation.dimension()
     }
 
+    /// Zero once a failed mutation has left the store unreadable.
     pub fn document_count(&self) -> u64 {
-        self.read().document_count
+        self.read().map_or(0, |state| state.document_count)
     }
 
+    /// Zero once a failed mutation has left the store unreadable.
     pub fn token_count(&self) -> u64 {
-        self.read().token_count
+        self.read().map_or(0, |state| state.token_count)
+    }
+
+    /// Counts published mutations since the store was opened.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Token counts of `document_ids`, which must be unique, in order.
     pub fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>> {
-        let state = self.read();
+        let state = self.read()?;
         state.validate_document_ids(document_ids)?;
         Ok(document_ids
             .iter()
@@ -305,7 +333,7 @@ impl VectorStore {
 
     /// Decoded vectors of `document_ids`, which must be unique, in order.
     pub fn fetch(&self, document_ids: &[u64], threads: Option<usize>) -> Result<PackedDocuments> {
-        let state = self.read();
+        let state = self.read()?;
         state.validate_document_ids(document_ids)?;
         let dimension = self.dimension();
         let lengths = document_ids
@@ -345,118 +373,122 @@ impl VectorStore {
         threads: Option<usize>,
     ) -> Result<()> {
         validate_embeddings(embeddings, dimension, lengths, &self.representation)?;
-        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        let _mutation = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
         let suffix = unique_suffix();
-        let old_tokens = state.token_count as usize;
-        let tokens = old_tokens + embeddings.len() / dimension;
         let specs = self.format.arrays(dimension);
-        let staged = (|| {
-            let mut writers = specs
-                .iter()
-                .map(|spec| {
-                    NpyWriter::create(
-                        spec.path(&self.path, &suffix),
-                        spec.dtype,
-                        &spec.shape(tokens),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for (writer, array) in writers.iter_mut().zip(&state.arrays) {
-                writer.write_bytes(array.bytes())?;
-            }
-            self.format
-                .encode(embeddings, dimension, threads, &mut writers)?;
-            writers.into_iter().try_for_each(NpyWriter::finish)?;
-            write_offsets(
-                &self.path.join(format!("{OFFSETS_FILE}{suffix}")),
-                old_tokens as u64,
-                lengths.iter().copied(),
-                state.offsets(),
-            )?;
-            write_metadata(
-                &self.path,
-                &suffix,
-                self.format,
-                &self.representation,
-                state.document_count as usize + lengths.len(),
-                tokens,
-            )
-        })();
-        self.publish(&mut state, &specs, &suffix, staged)
+        let staged = {
+            let state = self.read()?;
+            let old_tokens = state.token_count as usize;
+            let tokens = old_tokens + embeddings.len() / dimension;
+            (|| {
+                let mut writers = specs
+                    .iter()
+                    .map(|spec| {
+                        NpyWriter::create(
+                            spec.path(&self.path, &suffix),
+                            spec.dtype,
+                            &spec.shape(tokens),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for (writer, array) in writers.iter_mut().zip(&state.arrays) {
+                    writer.write_bytes(array.bytes())?;
+                }
+                self.format
+                    .encode(embeddings, dimension, threads, &mut writers)?;
+                writers.into_iter().try_for_each(NpyWriter::finish)?;
+                write_offsets(
+                    &self.path.join(format!("{OFFSETS_FILE}{suffix}")),
+                    old_tokens as u64,
+                    lengths.iter().copied(),
+                    state.offsets(),
+                )?;
+                write_metadata(
+                    &self.path,
+                    &suffix,
+                    self.format,
+                    &self.representation,
+                    state.document_count as usize + lengths.len(),
+                    tokens,
+                )
+            })()
+        };
+        self.publish(&specs, &suffix, staged)
     }
 
     /// Removes documents and compacts the survivors' internal IDs to
     /// `0..n-1`, preserving their order.
     pub fn delete(&self, document_ids: &[u64]) -> Result<()> {
-        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
-        state.validate_document_ids(document_ids)?;
-        if document_ids.is_empty() {
-            return Ok(());
-        }
-        if document_ids.len() as u64 == state.document_count {
-            return Err(Error::invalid(
-                "delete cannot remove every vector-store document",
-            ));
-        }
-        let mut deleted = document_ids.to_vec();
-        deleted.sort_unstable();
-        let mut retained_runs = Vec::with_capacity(deleted.len() + 1);
-        let mut first = 0;
-        for &document_id in deleted.iter().chain(std::iter::once(&state.document_count)) {
-            if first < document_id {
-                retained_runs.push((first, document_id));
-            }
-            first = document_id + 1;
-        }
-        let retained_lengths = retained_runs
-            .iter()
-            .flat_map(|&(first, last)| first..last)
-            .map(|document_id| state.document_length(document_id))
-            .collect::<Vec<_>>();
-        let tokens = retained_lengths.iter().sum::<usize>();
-
+        let _mutation = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
         let suffix = unique_suffix();
         let specs = self.format.arrays(self.dimension());
-        let staged = (|| {
-            for (index, spec) in specs.iter().enumerate() {
-                let mut writer = NpyWriter::create(
-                    spec.path(&self.path, &suffix),
-                    spec.dtype,
-                    &spec.shape(tokens),
-                )?;
-                for &(first, last) in &retained_runs {
-                    writer.write_bytes(state.record_bytes(index, spec, first, last))?;
-                }
-                writer.finish()?;
+        let staged = {
+            let state = self.read()?;
+            state.validate_document_ids(document_ids)?;
+            if document_ids.is_empty() {
+                return Ok(());
             }
-            write_offsets(
-                &self.path.join(format!("{OFFSETS_FILE}{suffix}")),
-                0,
-                retained_lengths.iter().copied(),
-                &[],
-            )?;
-            write_metadata(
-                &self.path,
-                &suffix,
-                self.format,
-                &self.representation,
-                retained_lengths.len(),
-                tokens,
-            )
-        })();
-        self.publish(&mut state, &specs, &suffix, staged)
+            if document_ids.len() as u64 == state.document_count {
+                return Err(Error::invalid(
+                    "delete cannot remove every vector-store document",
+                ));
+            }
+            let mut deleted = document_ids.to_vec();
+            deleted.sort_unstable();
+            let mut retained_runs = Vec::with_capacity(deleted.len() + 1);
+            let mut first = 0;
+            for &document_id in deleted.iter().chain(std::iter::once(&state.document_count)) {
+                if first < document_id {
+                    retained_runs.push((first, document_id));
+                }
+                first = document_id + 1;
+            }
+            let retained_lengths = retained_runs
+                .iter()
+                .flat_map(|&(first, last)| first..last)
+                .map(|document_id| state.document_length(document_id))
+                .collect::<Vec<_>>();
+            let tokens = retained_lengths.iter().sum::<usize>();
+            (|| {
+                for (index, spec) in specs.iter().enumerate() {
+                    let mut writer = NpyWriter::create(
+                        spec.path(&self.path, &suffix),
+                        spec.dtype,
+                        &spec.shape(tokens),
+                    )?;
+                    for &(first, last) in &retained_runs {
+                        writer.write_bytes(state.record_bytes(index, spec, first, last))?;
+                    }
+                    writer.finish()?;
+                }
+                write_offsets(
+                    &self.path.join(format!("{OFFSETS_FILE}{suffix}")),
+                    0,
+                    retained_lengths.iter().copied(),
+                    &[],
+                )?;
+                write_metadata(
+                    &self.path,
+                    &suffix,
+                    self.format,
+                    &self.representation,
+                    retained_lengths.len(),
+                    tokens,
+                )
+            })()
+        };
+        self.publish(&specs, &suffix, staged)
     }
 
     /// Renames staged files over the live ones and reloads, or removes them
     /// if staging failed.
-    fn publish(
-        &self,
-        state: &mut State,
-        specs: &[ArraySpec],
-        suffix: &str,
-        staged: Result<()>,
-    ) -> Result<()> {
-        let staged_paths = specs
+    ///
+    /// The live files are unmapped first, since a mapped file cannot be
+    /// replaced on every platform, and moved aside rather than overwritten:
+    /// if any rename or the reload fails, they are moved back and reloaded, so
+    /// the store is left as it was.
+    fn publish(&self, specs: &[ArraySpec], suffix: &str, staged: Result<()>) -> Result<()> {
+        let files = specs
             .iter()
             .map(|spec| (spec.path(&self.path, suffix), spec.path(&self.path, "")))
             .chain([
@@ -470,23 +502,72 @@ impl VectorStore {
                 ),
             ])
             .collect::<Vec<_>>();
-        if let Err(error) = staged {
-            for (staged, _) in &staged_paths {
+        let remove_staged = || {
+            for (staged, _) in &files {
                 let _ = fs::remove_file(staged);
             }
+        };
+        if let Err(error) = staged {
+            remove_staged();
             return Err(error);
         }
-        for (staged, live) in &staged_paths {
-            fs::rename(staged, live)?;
+        let backup_suffix = unique_suffix();
+        let backup = |live: &Path| {
+            let mut name = live.as_os_str().to_owned();
+            name.push(&backup_suffix);
+            PathBuf::from(name)
+        };
+
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *state = None;
+        let published = files
+            .iter()
+            .try_for_each(|(_, live)| fs::rename(live, backup(live)))
+            .and_then(|()| {
+                files
+                    .iter()
+                    .try_for_each(|(staged, live)| fs::rename(staged, live))
+            })
+            .map_err(Error::from)
+            .and_then(|()| self.load());
+        match published {
+            Ok(published) => {
+                *state = Some(published);
+                for (_, live) in &files {
+                    let _ = fs::remove_file(backup(live));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                for (_, live) in &files {
+                    let backup = backup(live);
+                    if backup.exists() {
+                        let _ = fs::rename(backup, live);
+                    }
+                }
+                remove_staged();
+                *state = self.load().ok();
+                Err(error)
+            }
         }
-        let metadata: Metadata = serde_json::from_slice(&fs::read(self.path.join(METADATA_FILE))?)
-            .map_err(|error| Error::storage(error.to_string()))?;
-        *state = load_state(&self.path, self.format, &metadata)?;
-        Ok(())
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, State> {
-        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    fn load(&self) -> Result<State> {
+        let metadata: Metadata = serde_json::from_slice(&fs::read(self.path.join(METADATA_FILE))?)
+            .map_err(|error| Error::storage(error.to_string()))?;
+        load_state(&self.path, self.format, &metadata)
+    }
+
+    fn read(&self) -> Result<ReadState<'_>> {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        if state.is_none() {
+            return Err(Error::storage(format!(
+                "vector store {} could not be reloaded after a failed mutation; reopen it",
+                self.path.display()
+            )));
+        }
+        Ok(ReadState(state))
     }
 }
 
@@ -501,6 +582,10 @@ impl MultiVectorSource for VectorStore {
 
     fn document_count(&self) -> u64 {
         VectorStore::document_count(self)
+    }
+
+    fn generation(&self) -> u64 {
+        VectorStore::generation(self)
     }
 
     fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>> {
@@ -675,6 +760,8 @@ fn unique_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     const DIMENSION: usize = 4;
@@ -747,19 +834,99 @@ mod tests {
 
             let reopened = VectorStore::open(&path).unwrap();
             assert_eq!((reopened.document_count(), reopened.token_count()), (3, 3));
-            let leftovers = fs::read_dir(&path)
-                .unwrap()
-                .filter(|entry| {
-                    entry
-                        .as_ref()
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .contains(".tmp")
-                })
-                .count();
-            assert_eq!(leftovers, 0);
+            assert_eq!(temporary_files(&path), 0);
         }
+    }
+
+    fn temporary_files(path: &Path) -> usize {
+        fs::read_dir(path)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_failed_publish_restores_the_previous_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vectors");
+        let store = VectorStore::create(
+            &path,
+            StoreFormat::Int8,
+            &rows(&[0, 1, 2]),
+            DIMENSION,
+            &[1, 2],
+            representation(),
+            None,
+        )
+        .unwrap();
+        let before = store.fetch(&[0, 1], None).unwrap();
+        // Nothing was staged under this suffix, so the first staged rename
+        // fails after every live file has been moved aside.
+        let specs = store.format.arrays(DIMENSION);
+        assert!(store.publish(&specs, &unique_suffix(), Ok(())).is_err());
+        assert_eq!(store.fetch(&[0, 1], None).unwrap(), before);
+        assert_eq!(store.generation(), 1);
+        assert_eq!(temporary_files(&path), 0);
+        assert_eq!(VectorStore::open(&path).unwrap().document_count(), 2);
+    }
+
+    #[test]
+    fn a_reranker_refuses_a_store_mutated_after_it_was_built() {
+        use crate::manifest::CorpusManifest;
+        use crate::maxsim::{MaxSimReranker, DEFAULT_FEATURE};
+        use crate::query::{Feature, Query, TokenMatrix};
+        use crate::stage::{Candidate, Reranker, ResourceBudget};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            VectorStore::create(
+                directory.path().join("vectors"),
+                StoreFormat::Float32,
+                &rows(&[0, 1, 2, 3]),
+                DIMENSION,
+                &[1, 1, 1, 1],
+                representation(),
+                None,
+            )
+            .unwrap(),
+        );
+        let reranker = MaxSimReranker::new(
+            store.clone(),
+            CorpusManifest::new("corpus", "1", 4, "abc").unwrap(),
+            DEFAULT_FEATURE,
+        )
+        .unwrap();
+        let query = Query::new("query").with_feature(
+            DEFAULT_FEATURE,
+            Feature::new(
+                representation(),
+                TokenMatrix::new(rows(&[1]), DIMENSION).unwrap(),
+            ),
+        );
+        let candidates = [Candidate {
+            document_id: 1,
+            gather_score: 0.0,
+            gather_rank: 0,
+            provenance: "test".to_string(),
+        }];
+        let budget = ResourceBudget::default();
+        assert_eq!(
+            reranker.rerank(&query, &candidates, &budget).unwrap()[0].value,
+            1.0
+        );
+
+        // Same document count afterwards, but ID 1 now holds another vector.
+        store.delete(&[0]).unwrap();
+        store.append(&rows(&[0]), DIMENSION, &[1], None).unwrap();
+        let error = reranker.rerank(&query, &candidates, &budget).unwrap_err();
+        assert!(matches!(error, Error::IncompatibleIndex(_)));
     }
 
     #[test]

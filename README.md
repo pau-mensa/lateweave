@@ -234,6 +234,8 @@ result = pipeline.search(query, gather_limit=500, limit=100)
 | `Int8VectorStore` | `D + 4` | `int8-reconstructed-approximate-full-maxsim` |
 
 Both append and delete in place; a delete compacts internal IDs to `0..n-1`.
+A `MaxSimReranker` built over a store refuses to score once the store has been
+mutated, so rebuild it with the new corpus manifest.
 The on-disk format is plain `.npy` files and `storage.json`, the same from
 Rust and Python.
 

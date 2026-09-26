@@ -129,10 +129,14 @@ Both use memory-mapped fixed-width token records, one `.npy` per array, a
 `document-offsets.npy`, and `storage.json` carrying format, representation,
 and counts. In Rust they are one `VectorStore` parameterized by `StoreFormat`.
 Append streams the existing records and the new ones into a replacement file
-set and publishes each file by rename; delete copies the surviving runs of
-records and compacts IDs. Reads and mutations can run from several threads, so
-one `Arc<VectorStore>` backs a reranker and is mutated in place. The files are
-ordinary little-endian `.npy`, readable by NumPy.
+set, then moves the live files aside and renames the new ones into place,
+moving the old ones back if any step fails; delete copies the surviving runs
+of records and compacts IDs. Reads and mutations can run from several threads:
+mutations run one at a time and stage while reads continue, and reads wait
+only for the renames. A mutation moves the store's generation, and a
+`MaxSimReranker` built before it refuses to score afterwards, since a compacted
+ID may name another document; build a new one over the new corpus manifest.
+The files are ordinary little-endian `.npy`, readable by NumPy.
 
 ## Native scoring and execution
 
