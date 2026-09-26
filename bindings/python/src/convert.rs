@@ -1,5 +1,7 @@
 //! Errors and identity values crossing the Python boundary.
 
+use std::borrow::Cow;
+
 use lateweave::{CorpusManifest, Error, Representation, Requirements};
 use numpy::ndarray::ArrayView2;
 use pyo3::create_exception;
@@ -177,13 +179,26 @@ pub(crate) fn assert_representations_compatible(
         .map_err(to_py)
 }
 
+/// Accepts any iterable of strings, as the digest has always done.
 #[pyfunction]
-pub(crate) fn document_ids_digest(document_ids: Vec<String>) -> String {
-    lateweave::document_ids_digest(document_ids)
+pub(crate) fn document_ids_digest(document_ids: &Bound<'_, PyAny>) -> PyResult<String> {
+    let document_ids = document_ids
+        .try_iter()?
+        .map(|document_id| document_id?.extract::<String>())
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(lateweave::document_ids_digest(document_ids))
 }
 
 /// Row-major values of a matrix: one `memcpy` when it is contiguous.
 pub(crate) fn row_major(view: ArrayView2<'_, f32>) -> Vec<f32> {
     view.as_slice()
         .map_or_else(|| view.iter().copied().collect(), <[f32]>::to_vec)
+}
+
+/// Row-major values of a matrix, borrowed when it is already C-contiguous.
+pub(crate) fn row_major_borrowed<'a>(view: ArrayView2<'a, f32>) -> Cow<'a, [f32]> {
+    match view.to_slice() {
+        Some(values) => Cow::Borrowed(values),
+        None => Cow::Owned(view.iter().copied().collect()),
+    }
 }

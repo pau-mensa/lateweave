@@ -564,8 +564,8 @@ impl PySearchPipeline {
         &self,
         py: Python<'_>,
         query: &Bound<'_, PyAny>,
-        gather_limit: usize,
-        limit: usize,
+        gather_limit: i64,
+        limit: i64,
         subset: Option<PyArrayLike1<'_, i64, AllowTypeChange>>,
         budget: Option<&Bound<'_, PyResourceBudget>>,
     ) -> PyResult<PySearchResult> {
@@ -583,9 +583,11 @@ impl PySearchPipeline {
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?;
+        // A negative limit reaches the core as zero, which it rejects with
+        // the same ValueError as any other non-positive limit.
         let request = SearchRequest {
-            gather_limit,
-            limit,
+            gather_limit: usize::try_from(gather_limit).unwrap_or(0),
+            limit: usize::try_from(limit).unwrap_or(0),
             subset: subset.as_deref(),
             budget: budget.map_or_else(ResourceBudget::default, |budget| budget.get().inner),
         };

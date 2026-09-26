@@ -138,6 +138,19 @@ def test_subset_must_be_ascending_and_inside_the_corpus() -> None:
     assert gatherer.calls == 0
 
 
+def test_a_repeated_subset_id_reaches_the_gatherer_once() -> None:
+    gatherer = TextGatherer()
+    SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=[0, 0, 2])
+    assert gatherer.subsets[0].tolist() == [0, 2]
+
+
+@pytest.mark.parametrize("limits", [(-1, 1), (3, -1)])
+def test_negative_limits_are_value_errors(limits) -> None:
+    gather_limit, limit = limits
+    with pytest.raises(ValueError, match="must be positive"):
+        SearchPipeline(TextGatherer()).search("query", gather_limit=gather_limit, limit=limit)
+
+
 def test_a_gatherer_that_ignores_the_subset_is_refused() -> None:
     class IgnoringGatherer(TextGatherer):
         def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]

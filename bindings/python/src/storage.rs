@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -7,11 +8,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
-use crate::convert::{representation, representation_to_py, to_py};
+use crate::convert::{representation, representation_to_py, row_major_borrowed, to_py};
 use crate::stages::lengths;
 
-fn embeddings<'a>(embeddings: &'a PyReadonlyArray2<'_, f32>) -> PyResult<(&'a [f32], usize)> {
-    Ok((embeddings.as_slice()?, embeddings.shape()[1]))
+/// Any float32 matrix, copied only when it is not already C-contiguous.
+fn embeddings<'a>(embeddings: &'a PyReadonlyArray2<'_, f32>) -> (Cow<'a, [f32]>, usize) {
+    (
+        row_major_borrowed(embeddings.as_array()),
+        embeddings.shape()[1],
+    )
 }
 
 fn wrap(py: Python<'_>, store: VectorStore) -> PyResult<Py<PyAny>> {
@@ -57,7 +62,7 @@ fn create(
     representation: &Bound<'_, PyAny>,
     threads: Option<usize>,
 ) -> PyResult<Py<PyAny>> {
-    let (values, dimension) = self::embeddings(&embeddings)?;
+    let (values, dimension) = self::embeddings(&embeddings);
     let lengths = lengths(document_lengths)?;
     let representation = self::representation(representation)?;
     let store = py
@@ -65,7 +70,7 @@ fn create(
             VectorStore::create(
                 &path,
                 format,
-                values,
+                &values,
                 dimension,
                 &lengths,
                 representation,
@@ -149,9 +154,9 @@ impl PyVectorStore {
         document_lengths: &Bound<'_, PyAny>,
         threads: Option<usize>,
     ) -> PyResult<()> {
-        let (values, dimension) = self::embeddings(&embeddings)?;
+        let (values, dimension) = self::embeddings(&embeddings);
         let lengths = lengths(document_lengths)?;
-        py.detach(|| self.inner.append(values, dimension, &lengths, threads))
+        py.detach(|| self.inner.append(&values, dimension, &lengths, threads))
             .map_err(to_py)
     }
 
