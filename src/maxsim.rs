@@ -1,305 +1,280 @@
-//! Packed, allocation-bounded CPU MaxSim.
-//!
-//! The batching and SIMD reduction are derived from the Apache-2.0 licensed
-//! `maxsim-cpu` implementation by Benjamin Clavie and Mixedbread. Keeping the
-//! kernel here makes MaxSim the one concrete scoring primitive supplied by
-//! lateweave; retrieval engines remain external implementations of the
-//! gatherer and reranker contracts.
+//! MaxSim reranking over any multi-vector source.
 
-#[cfg(any(target_os = "macos", feature = "openblas"))]
-use blas::sgemm;
-use rayon::{prelude::*, ThreadPoolBuilder};
-use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-thread_local! {
-    static SIMILARITY_BUFFER: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-}
+use crate::error::{Error, Result};
+use crate::kernel::maxsim_scores;
+use crate::manifest::CorpusManifest;
+use crate::query::Query;
+use crate::source::MultiVectorSource;
+use crate::stage::{Candidate, Requirements, Reranker, ResourceBudget, Score};
 
-#[cfg(target_arch = "aarch64")]
-const DEFAULT_BATCH_TOKENS: usize = 8 * 1024;
+/// The feature name a [`MaxSimReranker`] reads unless told otherwise.
+pub const DEFAULT_FEATURE: &str = "multi_vector";
 
-#[cfg(not(target_arch = "aarch64"))]
-const DEFAULT_BATCH_TOKENS: usize = 32 * 1024;
-
-#[derive(Clone, Copy)]
-struct Work {
-    first_document: usize,
-    last_document: usize,
-}
-
-fn scalar_max(values: &[f32]) -> f32 {
-    values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn avx2_max(values: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
-    if values.len() < 8 {
-        return scalar_max(values);
-    }
-    let mut maximum0 = _mm256_set1_ps(f32::NEG_INFINITY);
-    let mut maximum1 = maximum0;
-    let mut maximum2 = maximum0;
-    let mut maximum3 = maximum0;
-    let mut position = 0;
-    while position + 32 <= values.len() {
-        if position + 64 < values.len() {
-            _mm_prefetch(values.as_ptr().add(position + 64) as *const i8, _MM_HINT_T0);
-        }
-        maximum0 = _mm256_max_ps(maximum0, _mm256_loadu_ps(values.as_ptr().add(position)));
-        maximum1 = _mm256_max_ps(maximum1, _mm256_loadu_ps(values.as_ptr().add(position + 8)));
-        maximum2 = _mm256_max_ps(
-            maximum2,
-            _mm256_loadu_ps(values.as_ptr().add(position + 16)),
-        );
-        maximum3 = _mm256_max_ps(
-            maximum3,
-            _mm256_loadu_ps(values.as_ptr().add(position + 24)),
-        );
-        position += 32;
-    }
-    while position + 8 <= values.len() {
-        maximum0 = _mm256_max_ps(maximum0, _mm256_loadu_ps(values.as_ptr().add(position)));
-        position += 8;
-    }
-    maximum0 = _mm256_max_ps(maximum0, maximum1);
-    maximum2 = _mm256_max_ps(maximum2, maximum3);
-    maximum0 = _mm256_max_ps(maximum0, maximum2);
-    let high = _mm256_extractf128_ps(maximum0, 1);
-    let low = _mm256_castps256_ps128(maximum0);
-    let maximum = _mm_max_ps(high, low);
-    let maximum = _mm_max_ps(maximum, _mm_movehl_ps(maximum, maximum));
-    let maximum = _mm_max_ss(maximum, _mm_shuffle_ps(maximum, maximum, 0b01));
-    let mut result = _mm_cvtss_f32(maximum);
-    for &value in &values[position..] {
-        result = result.max(value);
-    }
-    result
-}
-
-#[cfg(target_arch = "aarch64")]
-fn neon_max(values: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
-
-    if values.len() < 4 {
-        return scalar_max(values);
-    }
-    unsafe {
-        let mut maximum0 = vdupq_n_f32(f32::NEG_INFINITY);
-        let mut maximum1 = maximum0;
-        let mut maximum2 = maximum0;
-        let mut maximum3 = maximum0;
-        let mut position = 0;
-        while position + 16 <= values.len() {
-            maximum0 = vmaxq_f32(maximum0, vld1q_f32(values.as_ptr().add(position)));
-            maximum1 = vmaxq_f32(maximum1, vld1q_f32(values.as_ptr().add(position + 4)));
-            maximum2 = vmaxq_f32(maximum2, vld1q_f32(values.as_ptr().add(position + 8)));
-            maximum3 = vmaxq_f32(maximum3, vld1q_f32(values.as_ptr().add(position + 12)));
-            position += 16;
-        }
-        while position + 4 <= values.len() {
-            maximum0 = vmaxq_f32(maximum0, vld1q_f32(values.as_ptr().add(position)));
-            position += 4;
-        }
-        maximum0 = vmaxq_f32(maximum0, maximum1);
-        maximum2 = vmaxq_f32(maximum2, maximum3);
-        maximum0 = vmaxq_f32(maximum0, maximum2);
-        let mut result = vmaxvq_f32(maximum0);
-        for &value in &values[position..] {
-            result = result.max(value);
-        }
-        result
-    }
-}
-
-#[inline]
-fn simd_max(values: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return unsafe { avx2_max(values) };
-        }
-        scalar_max(values)
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        neon_max(values)
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        scalar_max(values)
-    }
-}
-
-fn batches(offsets: &[usize], maximum_tokens: usize) -> Vec<Work> {
-    let document_count = offsets.len() - 1;
-    let mut output = Vec::new();
-    let mut first_document = 0;
-    while first_document < document_count {
-        let first_token = offsets[first_document];
-        let mut last_document = first_document + 1;
-        while last_document < document_count
-            && offsets[last_document + 1] - first_token <= maximum_tokens
-        {
-            last_document += 1;
-        }
-        output.push(Work {
-            first_document,
-            last_document,
-        });
-        first_document = last_document;
-    }
-    output
-}
-
-/// `out[query_tokens, token_count]` row-major = `query · documentsᵀ`.
+/// MaxSim between the query's token matrix and a source's documents.
 ///
-/// Both inputs are row-major and share `dimension` as their minor axis: `query`
-/// is `[query_tokens, dimension]` and `documents` is `[token_count, dimension]`.
-/// One SGEMM is the whole of the kernel's floating-point cost, which is why it
-/// is the only thing here with an alternative implementation.
-///
-/// The implementation is chosen at compile time, never at run time: a symbol
-/// resolved from the environment is how a build ends up quietly paired with a
-/// slower BLAS than the one it was measured against.
-#[inline]
-fn similarities(
-    query: &[f32],
-    documents: &[f32],
-    out: &mut [f32],
-    query_tokens: usize,
-    token_count: usize,
-    dimension: usize,
-) {
-    #[cfg(any(target_os = "macos", feature = "openblas"))]
-    {
-        // BLAS is column-major and the data is row-major, so each operand is
-        // read as its own transpose. Transposing the documents operand is what
-        // makes `out` come back row-major, which is the layout the caller's
-        // maximum reduction scans.
-        unsafe {
-            sgemm(
-                b'T',
-                b'N',
-                token_count as i32,
-                query_tokens as i32,
-                dimension as i32,
-                1.0,
-                documents,
-                dimension as i32,
-                query,
-                dimension as i32,
-                0.0,
-                out,
-                token_count as i32,
-            );
+/// The reranker requires its query feature to carry the source's
+/// representation, so vectors from a different encoder are refused before
+/// anything is fetched.
+pub struct MaxSimReranker {
+    source: Arc<dyn MultiVectorSource>,
+    corpus: CorpusManifest,
+    feature: String,
+    requires: Requirements,
+}
+
+impl MaxSimReranker {
+    pub fn new(
+        source: Arc<dyn MultiVectorSource>,
+        corpus: CorpusManifest,
+        feature: impl Into<String>,
+    ) -> Result<Self> {
+        if source.document_count() != corpus.document_count() {
+            return Err(Error::IncompatibleIndex(format!(
+                "source and corpus manifest document counts differ ({} != {})",
+                source.document_count(),
+                corpus.document_count()
+            )));
         }
+        let feature = feature.into();
+        let requires = BTreeMap::from([(feature.clone(), source.representation().clone())]);
+        Ok(Self {
+            source,
+            corpus,
+            feature,
+            requires,
+        })
     }
-    #[cfg(not(any(target_os = "macos", feature = "openblas")))]
-    {
-        // Strides say the same thing without the transpose flags: `documents`
-        // is passed with its row and column strides swapped, which is its
-        // transpose. Single-threaded on purpose -- the caller already runs one
-        // of these per rayon worker, and a threaded inner kernel would
-        // oversubscribe against that.
-        unsafe {
-            matrixmultiply::sgemm(
-                query_tokens,
-                dimension,
-                token_count,
-                1.0,
-                query.as_ptr(),
-                dimension as isize,
-                1,
-                documents.as_ptr(),
-                1,
-                dimension as isize,
-                0.0,
-                out.as_mut_ptr(),
-                token_count as isize,
-                1,
-            );
-        }
+
+    pub fn source(&self) -> &Arc<dyn MultiVectorSource> {
+        &self.source
+    }
+
+    pub fn feature(&self) -> &str {
+        &self.feature
     }
 }
 
-fn score_work(
-    query: &[f32],
-    documents: &[f32],
-    offsets: &[usize],
-    query_tokens: usize,
-    dimension: usize,
-    work: Work,
-) -> (usize, Vec<f32>) {
-    let first_token = offsets[work.first_document];
-    let last_token = offsets[work.last_document];
-    let token_count = last_token - first_token;
-    let documents = &documents[first_token * dimension..last_token * dimension];
+/// Groups documents, shortest first, into batches of at most `maximum_tokens`
+/// tokens; a document longer than that is a batch of its own.
+fn token_batches(
+    document_ids: &[u64],
+    lengths: &HashMap<u64, usize>,
+    maximum_tokens: usize,
+) -> Vec<Vec<u64>> {
+    let mut ordered = document_ids.to_vec();
+    ordered.sort_unstable_by_key(|document_id| (lengths[document_id], *document_id));
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut tokens = 0;
+    for document_id in ordered {
+        let length = lengths[&document_id];
+        if !batch.is_empty() && tokens + length > maximum_tokens {
+            batches.push(std::mem::take(&mut batch));
+            tokens = 0;
+        }
+        batch.push(document_id);
+        tokens += length;
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
 
-    let scores = SIMILARITY_BUFFER.with(|storage| {
-        let mut storage = storage.borrow_mut();
-        storage.resize(query_tokens * token_count, 0.0);
-        similarities(
-            query,
-            documents,
-            storage.as_mut_slice(),
-            query_tokens,
-            token_count,
-            dimension,
-        );
+impl Reranker for MaxSimReranker {
+    fn corpus(&self) -> &CorpusManifest {
+        &self.corpus
+    }
 
-        (work.first_document..work.last_document)
-            .map(|document| {
-                let start = offsets[document] - first_token;
-                let end = offsets[document + 1] - first_token;
-                (0..query_tokens)
-                    .map(|query_token| {
-                        let row = query_token * token_count;
-                        simd_max(&storage[row + start..row + end])
-                    })
-                    .sum()
+    fn requires(&self) -> &Requirements {
+        &self.requires
+    }
+
+    fn score_semantics(&self) -> &str {
+        self.source.score_semantics()
+    }
+
+    fn rerank(
+        &self,
+        query: &Query,
+        candidates: &[Candidate],
+        budget: &ResourceBudget,
+    ) -> Result<Vec<Score>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let representation = self.source.representation();
+        let vectors = query
+            .feature(&self.feature, representation)?
+            .token_matrix()
+            .ok_or_else(|| {
+                Error::IncompatibleQuery(format!(
+                    "query feature '{}' must be a [tokens, dimension] matrix",
+                    self.feature
+                ))
+            })?;
+        if vectors.dimension() != representation.dimension() {
+            return Err(Error::IncompatibleQuery(format!(
+                "query feature '{}' has dimension {}, but the representation declares {}",
+                self.feature,
+                vectors.dimension(),
+                representation.dimension()
+            )));
+        }
+
+        let candidate_ids = candidates
+            .iter()
+            .map(|candidate| candidate.document_id)
+            .collect::<Vec<_>>();
+        let lengths = self.source.document_lengths(&candidate_ids)?;
+        if lengths.len() != candidate_ids.len() {
+            return Err(Error::invalid(
+                "source returned a different number of document lengths than requested",
+            ));
+        }
+        let lengths = candidate_ids
+            .iter()
+            .copied()
+            .zip(lengths)
+            .collect::<HashMap<_, _>>();
+
+        let mut scores = HashMap::with_capacity(candidate_ids.len());
+        for window in candidate_ids.chunks(budget.max_documents_per_batch()) {
+            for batch in token_batches(window, &lengths, budget.max_batch_tokens()) {
+                let documents = self.source.fetch(&batch, budget.threads())?;
+                let expected = batch.iter().map(|document_id| lengths[document_id]);
+                if documents.dimension() != representation.dimension()
+                    || !documents.lengths().iter().copied().eq(expected)
+                {
+                    return Err(Error::invalid(
+                        "source fetched vectors that disagree with its declared lengths or dimension",
+                    ));
+                }
+                let values = maxsim_scores(
+                    vectors.values(),
+                    documents.vectors(),
+                    documents.lengths(),
+                    vectors.dimension(),
+                    Some(budget.max_batch_tokens()),
+                    budget.threads(),
+                )?;
+                scores.extend(batch.into_iter().zip(values));
+            }
+        }
+        Ok(candidate_ids
+            .into_iter()
+            .map(|document_id| Score {
+                document_id,
+                value: scores[&document_id],
             })
-            .collect()
-    });
-    (work.first_document, scores)
+            .collect())
+    }
 }
 
-pub fn maxsim_scores_packed(
-    query: &[f32],
-    documents: &[f32],
-    offsets: &[usize],
-    query_tokens: usize,
-    dimension: usize,
-    maximum_batch_tokens: Option<usize>,
-    threads: Option<usize>,
-) -> Result<Vec<f32>, String> {
-    let document_count = offsets.len() - 1;
-    if document_count == 0 {
-        return Ok(Vec::new());
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::manifest::Representation;
+    use crate::query::{Feature, TokenMatrix};
+    use crate::source::PackedDocuments;
+
+    struct InMemorySource {
+        representation: Representation,
+        documents: Vec<Vec<f32>>,
+        fetched: Mutex<Vec<Vec<u64>>>,
     }
-    let work = batches(
-        offsets,
-        maximum_batch_tokens.unwrap_or(DEFAULT_BATCH_TOKENS),
-    );
-    let execute = || {
-        work.into_par_iter()
-            .map(|item| score_work(query, documents, offsets, query_tokens, dimension, item))
-            .collect::<Vec<_>>()
-    };
-    let results = if let Some(threads) = threads {
-        ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|error| format!("could not create MaxSim worker pool: {error}"))?
-            .install(execute)
-    } else {
-        execute()
-    };
-    let mut scores = vec![0.0; document_count];
-    for (first_document, values) in results {
-        scores[first_document..first_document + values.len()].copy_from_slice(&values);
+
+    impl MultiVectorSource for InMemorySource {
+        fn representation(&self) -> &Representation {
+            &self.representation
+        }
+
+        fn score_semantics(&self) -> &str {
+            "in-memory-exact-full-maxsim"
+        }
+
+        fn document_count(&self) -> u64 {
+            self.documents.len() as u64
+        }
+
+        fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>> {
+            Ok(document_ids
+                .iter()
+                .map(|&document_id| self.documents[document_id as usize].len() / 2)
+                .collect())
+        }
+
+        fn fetch(&self, document_ids: &[u64], _: Option<usize>) -> Result<PackedDocuments> {
+            self.fetched.lock().unwrap().push(document_ids.to_vec());
+            let vectors = document_ids
+                .iter()
+                .flat_map(|&document_id| self.documents[document_id as usize].iter().copied())
+                .collect();
+            PackedDocuments::new(vectors, self.document_lengths(document_ids)?, 2)
+        }
     }
-    Ok(scores)
+
+    fn candidate(document_id: u64, gather_rank: usize) -> Candidate {
+        Candidate {
+            document_id,
+            gather_score: 0.0,
+            gather_rank,
+            provenance: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn scores_a_borrowed_source_in_candidate_order_within_the_token_budget() {
+        let representation = Representation::new("encoder", "1", 2, true).unwrap();
+        let source = Arc::new(InMemorySource {
+            representation: representation.clone(),
+            documents: vec![vec![1.0, 0.0, 0.0, 1.0], vec![0.6, 0.8], vec![-1.0, 0.0]],
+            fetched: Mutex::new(Vec::new()),
+        });
+        let reranker = MaxSimReranker::new(
+            source.clone(),
+            CorpusManifest::new("corpus", "1", 3, "abc").unwrap(),
+            DEFAULT_FEATURE,
+        )
+        .unwrap();
+        let query = Query::new("query").with_feature(
+            DEFAULT_FEATURE,
+            Feature::new(
+                representation,
+                TokenMatrix::new(vec![1.0, 0.0, 0.0, 1.0], 2).unwrap(),
+            ),
+        );
+
+        let scores = reranker
+            .rerank(
+                &query,
+                &[candidate(1, 0), candidate(0, 1), candidate(2, 2)],
+                &ResourceBudget::new(2, 256, Some(1)).unwrap(),
+            )
+            .unwrap();
+
+        let ids = scores
+            .iter()
+            .map(|score| score.document_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 0, 2]);
+        for (score, expected) in scores.iter().zip([1.4, 2.0, -1.0]) {
+            assert!((score.value - expected).abs() < 1e-6);
+        }
+        let mut sizes = source
+            .fetched
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2]);
+        assert_eq!(reranker.name(), "MaxSimReranker");
+    }
 }

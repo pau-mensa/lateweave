@@ -1,37 +1,42 @@
-//! INT8 encode/decode used internally by `Int8VectorStore`.
-//!
-//! Persistent layout, metadata, and mutation are owned by the Python store.
+//! Row-wise symmetric INT8 codes with one float32 scale per token.
 
 use rayon::{prelude::*, ThreadPoolBuilder};
 
-fn validate(values: &[f32], rows: usize, dimension: usize, name: &str) -> Result<(), String> {
+use crate::error::{Error, Result};
+
+fn validate(values: &[f32], rows: usize, dimension: usize, name: &str) -> Result<()> {
     if rows == 0 || dimension == 0 {
-        return Err(format!("{name} must have non-zero axes"));
+        return Err(Error::invalid(format!("{name} must have non-zero axes")));
     }
     if values.len() != rows * dimension {
-        return Err(format!("{name} shape does not match its value count"));
+        return Err(Error::invalid(format!(
+            "{name} shape does not match its value count"
+        )));
     }
-    if !crate::core::all_finite(values) {
-        return Err(format!("{name} contains a non-finite value"));
+    if !crate::ranking::all_finite(values) {
+        return Err(Error::invalid(format!(
+            "{name} contains a non-finite value"
+        )));
     }
     Ok(())
 }
 
-fn install<T: Send>(
+pub(crate) fn install<T: Send>(
     threads: Option<usize>,
     execute: impl FnOnce() -> T + Send,
-) -> Result<T, String> {
-    if threads == Some(0) {
-        return Err("threads must be positive".to_string());
-    }
-    if let Some(threads) = threads {
-        ThreadPoolBuilder::new()
+) -> Result<T> {
+    match threads {
+        Some(0) => Err(Error::invalid("threads must be positive")),
+        Some(threads) => ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
-            .map_err(|error| format!("could not create vector-store worker pool: {error}"))
-            .map(|pool| pool.install(execute))
-    } else {
-        Ok(execute())
+            .map_err(|error| {
+                Error::invalid(format!(
+                    "could not create vector-store worker pool: {error}"
+                ))
+            })
+            .map(|pool| pool.install(execute)),
+        None => Ok(execute()),
     }
 }
 
@@ -134,12 +139,12 @@ fn simd_normalize(values: &mut [f32]) {
     }
 }
 
-pub fn int8_encode(
+pub(crate) fn int8_encode(
     embeddings: &[f32],
     rows: usize,
     dimension: usize,
     threads: Option<usize>,
-) -> Result<(Vec<i8>, Vec<f32>), String> {
+) -> Result<(Vec<i8>, Vec<f32>)> {
     validate(embeddings, rows, dimension, "embeddings")?;
     let mut codes = vec![0i8; embeddings.len()];
     let mut scales = vec![0.0f32; rows];
@@ -160,22 +165,24 @@ pub fn int8_encode(
     Ok((codes, scales))
 }
 
-pub fn int8_decode(
+pub(crate) fn int8_decode(
     codes: &[i8],
     scales: &[f32],
     rows: usize,
     dimension: usize,
     normalize: bool,
     threads: Option<usize>,
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<f32>> {
     if codes.len() != rows * dimension || scales.len() != rows {
-        return Err("int8 rows, scales, and dimension are inconsistent".to_string());
+        return Err(Error::storage(
+            "int8 rows, scales, and dimension are inconsistent",
+        ));
     }
     if scales
         .iter()
         .any(|scale| !scale.is_finite() || *scale <= 0.0)
     {
-        return Err("int8 scales must be finite and positive".to_string());
+        return Err(Error::storage("int8 scales must be finite and positive"));
     }
     let mut output = vec![0.0f32; codes.len()];
     install(threads, || {
