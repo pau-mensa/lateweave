@@ -7,7 +7,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::convert::{from_py, representation, representation_to_py, to_py};
+use crate::convert::{from_py, representation, representation_to_py, row_major, to_py};
 
 /// A feature value produced in Python. Python stages get the object back
 /// unchanged; Rust stages that need a token matrix get it converted once.
@@ -40,7 +40,7 @@ impl FeatureValue for PythonValue {
 fn token_matrix(object: &Bound<'_, PyAny>) -> PyResult<TokenMatrix> {
     let array = object.extract::<PyArrayLike2<'_, f32, AllowTypeChange>>()?;
     let view = array.as_array();
-    TokenMatrix::new(view.iter().copied().collect(), view.ncols()).map_err(to_py)
+    TokenMatrix::new(row_major(view), view.ncols()).map_err(to_py)
 }
 
 pub(crate) fn value_to_py(py: Python<'_>, value: &dyn FeatureValue) -> PyResult<Py<PyAny>> {

@@ -1,6 +1,7 @@
 //! Errors and identity values crossing the Python boundary.
 
 use lateweave::{CorpusManifest, Error, Representation, Requirements};
+use numpy::ndarray::ArrayView2;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -179,4 +180,10 @@ pub(crate) fn assert_representations_compatible(
 #[pyfunction]
 pub(crate) fn document_ids_digest(document_ids: Vec<String>) -> String {
     lateweave::document_ids_digest(document_ids)
+}
+
+/// Row-major values of a matrix: one `memcpy` when it is contiguous.
+pub(crate) fn row_major(view: ArrayView2<'_, f32>) -> Vec<f32> {
+    view.as_slice()
+        .map_or_else(|| view.iter().copied().collect(), <[f32]>::to_vec)
 }

@@ -12,7 +12,7 @@ use pyo3::types::{PyDict, PyTuple};
 
 use crate::convert::{
     corpus_manifest, corpus_manifest_to_py, from_py, representation, requirements,
-    requirements_to_py, to_py,
+    requirements_to_py, row_major, to_py,
 };
 use crate::query::PyQuery;
 use crate::storage::PyVectorStore;
@@ -344,11 +344,7 @@ impl MultiVectorSource for PythonSource {
                 .extract()?;
             let vectors = vectors.extract::<PyArrayLike2<'_, f32, AllowTypeChange>>()?;
             let view = vectors.as_array();
-            Ok::<_, PyErr>((
-                view.iter().copied().collect(),
-                lengths(&document_lengths)?,
-                view.ncols(),
-            ))
+            Ok::<_, PyErr>((row_major(view), lengths(&document_lengths)?, view.ncols()))
         })
         .map_err(from_py)?;
         PackedDocuments::new(vectors, lengths, dimension)
