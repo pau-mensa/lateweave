@@ -8,10 +8,11 @@
 
 #[cfg(any(target_os = "macos", feature = "openblas"))]
 use blas::sgemm;
-use rayon::{prelude::*, ThreadPoolBuilder};
+use rayon::prelude::*;
 use std::cell::RefCell;
 
 use crate::error::{Error, Result};
+use crate::threads::install;
 
 thread_local! {
     static SIMILARITY_BUFFER: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
@@ -349,16 +350,7 @@ pub fn maxsim_scores(
             .map(|item| score_work(query, documents, &offsets, query_tokens, dimension, item))
             .collect::<Vec<_>>()
     };
-    let results = match threads {
-        Some(threads) => ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|error| {
-                Error::invalid(format!("could not create MaxSim worker pool: {error}"))
-            })?
-            .install(execute),
-        None => execute(),
-    };
+    let results = install(threads, execute)?;
     let mut scores = vec![0.0; lengths.len()];
     for (first_document, values) in results {
         scores[first_document..first_document + values.len()].copy_from_slice(&values);

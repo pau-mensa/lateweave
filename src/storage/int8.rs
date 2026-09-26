@@ -1,8 +1,9 @@
 //! Row-wise symmetric INT8 codes with one float32 scale per token.
 
-use rayon::{prelude::*, ThreadPoolBuilder};
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
+use crate::threads::install;
 
 fn validate(values: &[f32], rows: usize, dimension: usize, name: &str) -> Result<()> {
     if rows == 0 || dimension == 0 {
@@ -19,25 +20,6 @@ fn validate(values: &[f32], rows: usize, dimension: usize, name: &str) -> Result
         )));
     }
     Ok(())
-}
-
-pub(crate) fn install<T: Send>(
-    threads: Option<usize>,
-    execute: impl FnOnce() -> T + Send,
-) -> Result<T> {
-    match threads {
-        Some(0) => Err(Error::invalid("threads must be positive")),
-        Some(threads) => ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .map_err(|error| {
-                Error::invalid(format!(
-                    "could not create vector-store worker pool: {error}"
-                ))
-            })
-            .map(|pool| pool.install(execute)),
-        None => Ok(execute()),
-    }
 }
 
 #[inline]

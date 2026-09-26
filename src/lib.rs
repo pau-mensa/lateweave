@@ -24,6 +24,7 @@ mod ranking;
 mod source;
 mod stage;
 mod storage;
+mod threads;
 
 pub use error::{Error, Result};
 pub use kernel::maxsim_scores;
