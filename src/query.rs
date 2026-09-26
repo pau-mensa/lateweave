@@ -195,6 +195,12 @@ impl Query {
         name: &str,
         representation: &Representation,
     ) -> Result<&dyn FeatureValue> {
+        self.require_feature(name, representation)?.value()
+    }
+
+    /// Feature `name`, which must come from `representation`, without
+    /// materializing it.
+    pub fn require_feature(&self, name: &str, representation: &Representation) -> Result<&Feature> {
         let feature = self.features.get(name).ok_or_else(|| {
             let available = self
                 .features
@@ -207,7 +213,7 @@ impl Query {
             ))
         })?;
         representation.assert_compatible(&feature.representation)?;
-        feature.value()
+        Ok(feature)
     }
 
     pub fn feature_as<T: Any>(&self, name: &str, representation: &Representation) -> Result<&T> {

@@ -1,5 +1,6 @@
 //! Gather, optionally rerank, then deterministic top-k.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,8 @@ use crate::stage::{Candidate, CandidateGenerator, Requirements, Reranker, Resour
 pub struct SearchRequest<'a> {
     pub gather_limit: usize,
     pub limit: usize,
-    /// Strictly ascending internal IDs the search is restricted to.
+    /// Ascending internal IDs the search is restricted to; a repeated ID
+    /// counts once, and the gatherer receives each ID once.
     pub subset: Option<&'a [u64]>,
     pub budget: ResourceBudget,
 }
@@ -114,27 +116,24 @@ impl SearchPipeline {
             return Err(Error::invalid("limit cannot exceed gather_limit"));
         }
         let document_count = self.gatherer.corpus().document_count();
-        if let Some(subset) = request.subset {
-            if subset.windows(2).any(|pair| pair[0] >= pair[1]) {
-                return Err(Error::invalid("subset must be strictly ascending"));
-            }
+        let subset = request.subset.map(unique_subset).transpose()?;
+        if let Some(subset) = &subset {
             if subset.last().is_some_and(|&last| last >= document_count) {
                 return Err(Error::invalid(format!(
                     "subset reaches outside the corpus of {document_count} documents"
                 )));
             }
         }
+        let subset = subset.as_deref();
         require(query, self.gatherer.requires())?;
         if let Some(reranker) = &self.reranker {
             require(query, reranker.requires())?;
         }
 
         let started = Instant::now();
-        let candidates = self
-            .gatherer
-            .gather(query, request.gather_limit, request.subset)?;
+        let candidates = self.gatherer.gather(query, request.gather_limit, subset)?;
         let gathered = Instant::now();
-        validate_candidates(&candidates, request, document_count)?;
+        validate_candidates(&candidates, request.gather_limit, subset, document_count)?;
         let (scores, score_semantics) = match &self.reranker {
             Some(reranker) => (
                 reranker.rerank(query, &candidates, &request.budget)?,
@@ -185,19 +184,35 @@ impl SearchPipeline {
     }
 }
 
+/// Checks presence and representation only, so a lazy feature is still
+/// materialized by the first stage that reads it, or never.
 fn require(query: &Query, requirements: &Requirements) -> Result<()> {
     for (name, representation) in requirements {
-        query.feature(name, representation)?;
+        query.require_feature(name, representation)?;
     }
     Ok(())
 }
 
+/// `subset` with repeats removed, borrowed when it has none.
+fn unique_subset(subset: &[u64]) -> Result<Cow<'_, [u64]>> {
+    if subset.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(Error::invalid("subset must be ascending"));
+    }
+    if subset.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Ok(Cow::Borrowed(subset));
+    }
+    let mut unique = subset.to_vec();
+    unique.dedup();
+    Ok(Cow::Owned(unique))
+}
+
 fn validate_candidates(
     candidates: &[Candidate],
-    request: &SearchRequest<'_>,
+    gather_limit: usize,
+    subset: Option<&[u64]>,
     document_count: u64,
 ) -> Result<()> {
-    if candidates.len() > request.gather_limit {
+    if candidates.len() > gather_limit {
         return Err(Error::invalid(
             "gatherer returned more candidates than requested",
         ));
@@ -214,7 +229,7 @@ fn validate_candidates(
                 candidate.document_id
             )));
         }
-        if let Some(subset) = request.subset {
+        if let Some(subset) = subset {
             if subset.binary_search(&candidate.document_id).is_err() {
                 return Err(Error::invalid(format!(
                     "gatherer returned document ID {}, which is outside the subset",
@@ -419,6 +434,24 @@ mod tests {
     }
 
     #[test]
+    fn checking_requirements_leaves_lazy_features_unmaterialized() {
+        let encodings = Arc::new(AtomicUsize::new(0));
+        let counter = encodings.clone();
+        let query = Query::new("query").with_feature(
+            "multi_vector",
+            Feature::lazy(representation(), move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                TokenMatrix::new(vec![1.0, 0.0], 2)
+            }),
+        );
+        let mut gatherer = TextGatherer::new();
+        gatherer.requires = BTreeMap::from([("multi_vector".to_string(), representation())]);
+        let pipeline = SearchPipeline::new(Arc::new(gatherer), None).unwrap();
+        pipeline.search(&query, &SearchRequest::new(3, 3)).unwrap();
+        assert_eq!(encodings.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn subsets_must_be_ascending_and_inside_the_corpus() {
         let pipeline = SearchPipeline::new(Arc::new(TextGatherer::new()), None).unwrap();
         let query = Query::new("query");
@@ -426,6 +459,10 @@ mod tests {
             .search(&query, &SearchRequest::new(3, 3).with_subset(&[0, 2]))
             .unwrap();
         assert_eq!(result.candidates.len(), 2);
+        let repeated = pipeline
+            .search(&query, &SearchRequest::new(3, 3).with_subset(&[0, 0, 2]))
+            .unwrap();
+        assert_eq!(repeated.candidates, result.candidates);
         for subset in [&[2, 0][..], &[0, 3][..]] {
             assert!(pipeline
                 .search(&query, &SearchRequest::new(3, 3).with_subset(subset))
