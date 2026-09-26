@@ -1,7 +1,7 @@
 # lateweave
 
-`lateweave` is a Rust/PyO3 package for composing retrieval pipelines out of
-engines it does not implement:
+`lateweave` is a Rust library, with Python bindings, for composing retrieval
+pipelines out of engines it does not implement:
 
 ```text
 Query -> CandidateGenerator -> [Reranker] -> deterministic top-k
@@ -17,31 +17,81 @@ reranker is optional: without one, gather scores rank.
 The package supplies:
 
 - `Query`, `Feature`, `Candidate`, `Score`, `CorpusManifest`, `Representation`;
-- the `CandidateGenerator`, `Reranker`, and `MultiVectorSource` protocols;
-- `SearchPipeline`: compatibility checks, optional rerank, subset filtering,
-  deterministic ranking, timings;
+- the `CandidateGenerator`, `Reranker`, and `MultiVectorSource` contracts;
+- `SearchPipeline`: compatibility checks, optional rerank, subset enforcement,
+  deterministic ranking, provenance, timings;
 - `MaxSimReranker` over any `MultiVectorSource`, backed by a packed CPU
-  `maxsim_scores_packed` kernel (SGEMM, SIMD maximum reduction, bounded token
-  batches, worker pools);
-- `Float32VectorStore` and `Int8VectorStore`: memory-mapped multi-vector
-  sources for gatherers, such as BM25, that keep no document vectors.
+  MaxSim kernel (SGEMM, SIMD maximum reduction, bounded token batches, worker
+  pools);
+- `Float32VectorStore` and `Int8VectorStore` (one `VectorStore` in Rust):
+  memory-mapped multi-vector sources for gatherers, such as BM25, that keep no
+  document vectors.
+
+All of it is implemented once, in the `lateweave` crate, which builds without
+PyO3 or NumPy. The Python package is a binding over that crate: a Python
+gatherer, reranker, or source is adapted to the Rust contracts, and the
+pipeline, MaxSim, and stores run natively.
 
 Nothing in the package names an engine. bm25s, FastPLAID, NextPlaid and others
 appear only in cookbooks.
 
+## Layout
+
+```text
+Cargo.toml          the `lateweave` crate (workspace root)
+src/                pipeline, stages, MaxSim kernel and reranker, stores
+examples/           Rust usage
+bindings/python/    `lateweave-python`: the PyO3 module `lateweave._native`
+python/lateweave/   manifest dataclasses, protocols, type stubs
+```
+
+## Using it from Rust
+
+```toml
+[dependencies]
+lateweave = { git = "https://github.com/pau-mensa/lateweave" }
+```
+
+```rust
+use std::sync::Arc;
+use lateweave::{
+    Feature, MaxSimReranker, Query, SearchPipeline, SearchRequest, TokenMatrix, VectorStore,
+    DEFAULT_FEATURE,
+};
+
+let store = Arc::new(VectorStore::open("index/vectors")?);
+let reranker = MaxSimReranker::new(store.clone(), corpus.clone(), DEFAULT_FEATURE)?;
+let pipeline = SearchPipeline::new(Arc::new(my_gatherer), Some(Arc::new(reranker)))?;
+
+let query = Query::new("prescripción de una deuda tributaria").with_feature(
+    DEFAULT_FEATURE,
+    Feature::lazy(store.representation().clone(), move || {
+        TokenMatrix::new(encode(&text), dimension)
+    }),
+);
+let result = pipeline.search(&query, &SearchRequest::new(500, 100))?;
+```
+
+A gatherer implements `CandidateGenerator`; any reranker implements
+`Reranker`. Stage and source errors from outside lateweave travel as
+`Error::External`. [examples/stored_maxsim.rs](examples/stored_maxsim.rs) is a
+complete program: `cargo run --example stored_maxsim`.
+
 ## Building
 
 ```bash
+cargo test                 # the Rust library and its example
 pip install maturin
-maturin build --release
+maturin build --release    # the Python wheel
 ```
 
 That default build has no external library dependency: the MaxSim kernel's
-SGEMM comes from the bundled pure-Rust `matrixmultiply`, so the extension
-imports on any host.
+SGEMM comes from the bundled pure-Rust `matrixmultiply`, so the library links
+and the extension imports on any host.
 
 For a deployment, take the OpenBLAS kernel instead — about 1.75x faster on the
-shapes this kernel sees, bit-identical results:
+shapes this kernel sees, bit-identical results. Rust dependents enable the
+crate's `openblas` feature; the wheel forwards the same feature:
 
 ```bash
 maturin build --release --features pyo3/extension-module,openblas
@@ -107,9 +157,11 @@ class MyGatherer:
         )
 ```
 
-`subset` is a sorted int64 array of internal IDs, or `None`. A gatherer that
-cannot honour it must raise. A gatherer that consumes a vector feature declares
-it: `requires = {"multi_vector": representation}`.
+`subset` is an ascending int64 array of internal IDs, or `None`. A gatherer
+that cannot honour it must raise; the pipeline refuses a candidate outside the
+subset. A gatherer that consumes a vector feature declares it:
+`requires = {"multi_vector": representation}`. `corpus`, `requires`, and
+`score_semantics` are read once, when the `SearchPipeline` is built.
 
 ## Implementing a reranker or a source
 
@@ -141,6 +193,9 @@ class EngineVectors:
 
 reranker = MaxSimReranker(EngineVectors(engine), corpus)
 ```
+
+A lateweave store passed as the source is read natively, without calling back
+into Python.
 
 Or write a reranker directly:
 
@@ -179,6 +234,8 @@ result = pipeline.search(query, gather_limit=500, limit=100)
 | `Int8VectorStore` | `D + 4` | `int8-reconstructed-approximate-full-maxsim` |
 
 Both append and delete in place; a delete compacts internal IDs to `0..n-1`.
+The on-disk format is plain `.npy` files and `storage.json`, the same from
+Rust and Python.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the ownership rules and
 [cookbook/README.md](cookbook/README.md) for the BM25 recipe.
