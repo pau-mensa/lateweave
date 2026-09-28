@@ -3,7 +3,7 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from .interfaces import CandidateGenerator, MultiVectorSource, Reranker
+from .interfaces import CandidateGenerator, Live, MultiVectorSource, Reranker
 from .manifest import CorpusManifest, Representation
 
 class IncompatibleIndexError(ValueError): ...
@@ -132,12 +132,11 @@ class SearchResult:
 
 class SearchPipeline:
     def __init__(
-        self, gatherer: CandidateGenerator, reranker: Reranker | MaxSimReranker | None = None
+        self,
+        gatherer: CandidateGenerator | Live[CandidateGenerator],
+        reranker: Reranker | Live[Reranker] | MaxSimReranker | None = None,
     ) -> None: ...
-    @property
-    def gatherer(self) -> CandidateGenerator: ...
-    @property
-    def reranker(self) -> Reranker | MaxSimReranker | None: ...
+    def freeze(self) -> SearchPipeline: ...
     def search(
         self,
         query: Query | str,
@@ -151,12 +150,14 @@ class SearchPipeline:
 class MaxSimReranker:
     def __init__(
         self,
-        sources: Iterable[StoreSnapshot | MultiVectorSource],
+        sources: Iterable[VectorStore | StoreSnapshot | MultiVectorSource | Live[MultiVectorSource]],
         *,
         feature: str = "multi_vector",
     ) -> None: ...
     @property
-    def sources(self) -> tuple[StoreSnapshot | MultiVectorSource, ...]: ...
+    def sources(
+        self,
+    ) -> tuple[VectorStore | StoreSnapshot | MultiVectorSource | Live[MultiVectorSource], ...]: ...
     @property
     def segments(self) -> tuple[Segment, ...]: ...
     @property

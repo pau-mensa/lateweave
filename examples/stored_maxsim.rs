@@ -108,9 +108,9 @@ fn main() -> Result<()> {
         requires: BTreeMap::new(),
         documents,
     };
-    let snapshot: Arc<dyn MultiVectorSource> = store.snapshot();
+    let snapshot: Arc<dyn MultiVectorSource> = store.snapshot()?;
     let reranker = MaxSimReranker::new([snapshot], DEFAULT_FEATURE)?;
-    let pipeline = SearchPipeline::new(Arc::new(gatherer), Some(Arc::new(reranker)))?;
+    let pipeline = SearchPipeline::fixed(Arc::new(gatherer), Some(Arc::new(reranker)))?;
 
     let query = Query::new("apple").with_feature(
         DEFAULT_FEATURE,

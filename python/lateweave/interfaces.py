@@ -2,16 +2,36 @@
 
 The pipeline itself is native; these protocols describe what it calls on a
 Python object passed as a gatherer, a reranker, or a ``MaxSimReranker`` source.
+
+Any of them may instead be ``Live``: an object over state that writers, in
+this process or another, move to new generations, whose ``current()`` returns
+the snapshot object implementing the protocol. The pipeline calls it at the
+start of every search.
 """
 
 from __future__ import annotations
 
-from typing import Mapping, Protocol, Sequence, runtime_checkable
+from typing import Mapping, Protocol, Sequence, TypeVar, runtime_checkable
 
 import numpy as np
 
 from ._native import Candidate, Query, ResourceBudget, Segment
 from .manifest import Representation
+
+
+Snapshot = TypeVar("Snapshot", covariant=True)
+
+
+@runtime_checkable
+class Live(Protocol[Snapshot]):
+    """Hands out the current snapshot of a gatherer, reranker, or source.
+
+    ``current()`` must return a snapshot whose segment and engine state were
+    read together, and should return the same object while nothing moved, so
+    the pipeline reads its declaration once per generation.
+    """
+
+    def current(self) -> Snapshot: ...
 
 
 @runtime_checkable

@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use lateweave::{
-    Candidate, CandidateGenerator, MaxSimReranker, MultiVectorSource, PackedDocuments, Query,
-    RankedDocument, Representation, Requirements, Reranker, ResourceBudget, SearchPipeline,
-    SearchRequest, SearchResult, SearchTimings, Segment, Subset,
+    Candidate, CandidateGenerator, Fixed, Live, LiveMaxSimReranker, MultiVectorSource,
+    PackedDocuments, Query, RankedDocument, Representation, Requirements, Reranker, ResourceBudget,
+    SearchPipeline, SearchRequest, SearchResult, SearchTimings, Segment, Subset,
 };
 use numpy::{AllowTypeChange, PyArray1, PyArrayLike1, PyArrayLike2};
 use pyo3::exceptions::PyValueError;
@@ -13,7 +13,7 @@ use pyo3::types::{PyDict, PyMapping, PyTuple};
 use crate::convert::{from_py, representation, requirements, requirements_to_py, row_major, to_py};
 use crate::query::PyQuery;
 use crate::segment::PySegment;
-use crate::storage::PyStoreSnapshot;
+use crate::storage::{PyStoreSnapshot, PyVectorStore};
 
 /// One gathered document: an internal ID of ``segment``.
 #[pyclass(name = "Candidate", frozen, module = "lateweave._native")]
@@ -397,14 +397,91 @@ impl MultiVectorSource for PythonSource {
     }
 }
 
+/// A Python object whose ``current()`` returns its current snapshot, wrapped
+/// once per distinct snapshot object.
+struct PythonLive<S: ?Sized> {
+    object: Py<PyAny>,
+    wrap: fn(&Bound<'_, PyAny>) -> PyResult<Arc<S>>,
+    last: Mutex<Option<(Py<PyAny>, Arc<S>)>>,
+}
+
+impl<S: ?Sized + Send + Sync> Live<S> for PythonLive<S> {
+    fn current(&self) -> lateweave::Result<Arc<S>> {
+        Python::attach(|py| {
+            let snapshot = self.object.bind(py).call_method0("current")?;
+            // No Python runs while the lock is held, so a thread switch
+            // inside `wrap` cannot leave another thread waiting on it.
+            if let Some((object, wrapped)) =
+                &*self.last.lock().unwrap_or_else(PoisonError::into_inner)
+            {
+                if object.bind(py).is(&snapshot) {
+                    return Ok(wrapped.clone());
+                }
+            }
+            let wrapped = (self.wrap)(&snapshot)?;
+            *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some((snapshot.unbind(), wrapped.clone()));
+            Ok(wrapped)
+        })
+        .map_err(from_py)
+    }
+}
+
+/// A Python stage or source: live when it defines ``current()``, otherwise
+/// the snapshot itself.
+fn python_stage<S: ?Sized + Send + Sync + 'static>(
+    object: &Bound<'_, PyAny>,
+    wrap: fn(&Bound<'_, PyAny>) -> PyResult<Arc<S>>,
+) -> PyResult<Arc<dyn Live<S>>> {
+    Ok(if object.hasattr("current")? {
+        Arc::new(PythonLive {
+            object: object.clone().unbind(),
+            wrap,
+            last: Mutex::new(None),
+        })
+    } else {
+        Arc::new(Fixed(wrap(object)?))
+    })
+}
+
+fn wrap_gatherer(object: &Bound<'_, PyAny>) -> PyResult<Arc<dyn CandidateGenerator>> {
+    Ok(Arc::new(PythonGatherer {
+        object: object.clone().unbind(),
+        declaration: Declaration::read(object)?,
+    }))
+}
+
+fn wrap_reranker(object: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Reranker>> {
+    Ok(Arc::new(PythonReranker {
+        object: object.clone().unbind(),
+        declaration: Declaration::read(object)?,
+    }))
+}
+
+fn wrap_source(object: &Bound<'_, PyAny>) -> PyResult<Arc<dyn MultiVectorSource>> {
+    Ok(Arc::new(PythonSource::new(object)?))
+}
+
+fn source_stage(source: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Live<dyn MultiVectorSource>>> {
+    if let Ok(snapshot) = source.downcast::<PyStoreSnapshot>() {
+        let snapshot: Arc<dyn MultiVectorSource> = snapshot.get().inner.clone();
+        return Ok(Arc::new(Fixed(snapshot)));
+    }
+    if let Ok(store) = source.downcast::<PyVectorStore>() {
+        return Ok(store.get().inner.clone());
+    }
+    python_stage(source, wrap_source)
+}
+
 /// MaxSim between the query's token matrix and each candidate's document,
 /// read from the source of the candidate's segment.
 ///
-/// Each source is a vector-store snapshot, read natively, or any object
-/// implementing the ``MultiVectorSource`` protocol, one per segment.
+/// Each source, one per segment, is a vector store, followed as it publishes;
+/// a store snapshot; or any object implementing the ``MultiVectorSource``
+/// protocol, followed through its ``current()`` when it defines one.
 #[pyclass(name = "MaxSimReranker", frozen, module = "lateweave._native")]
 pub(crate) struct PyMaxSimReranker {
-    inner: Arc<MaxSimReranker>,
+    inner: Arc<LiveMaxSimReranker>,
     sources: Py<PyTuple>,
 }
 
@@ -419,15 +496,10 @@ impl PyMaxSimReranker {
         )?;
         let native = sources
             .iter()
-            .map(|source| -> PyResult<Arc<dyn MultiVectorSource>> {
-                Ok(match source.downcast::<PyStoreSnapshot>() {
-                    Ok(snapshot) => snapshot.get().inner.clone(),
-                    Err(_) => Arc::new(PythonSource::new(&source)?),
-                })
-            })
+            .map(|source| source_stage(&source))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(Self {
-            inner: Arc::new(MaxSimReranker::new(native, feature).map_err(to_py)?),
+            inner: Arc::new(LiveMaxSimReranker::new(native, feature).map_err(to_py)?),
             sources: sources.unbind(),
         })
     }
@@ -437,19 +509,23 @@ impl PyMaxSimReranker {
         self.sources.clone_ref(py)
     }
 
+    /// The segments of the sources' current snapshots.
     #[getter]
     fn segments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        segments_to_py(py, self.inner.segments())
+        let pinned = py.detach(|| self.inner.pinned()).map_err(to_py)?;
+        segments_to_py(py, pinned.segments())
     }
 
     #[getter]
     fn requires<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        requirements_to_py(py, self.inner.requires())
+        let pinned = py.detach(|| self.inner.pinned()).map_err(to_py)?;
+        requirements_to_py(py, pinned.requires())
     }
 
     #[getter]
-    fn score_semantics(&self) -> &str {
-        self.inner.score_semantics()
+    fn score_semantics(&self, py: Python<'_>) -> PyResult<String> {
+        let pinned = py.detach(|| self.inner.pinned()).map_err(to_py)?;
+        Ok(pinned.score_semantics().to_string())
     }
 
     #[getter]
@@ -470,7 +546,7 @@ impl PyMaxSimReranker {
         let candidates = candidates_from_py(candidates)?;
         let budget = budget.get().inner;
         let scores = py
-            .detach(|| self.inner.rerank(&query, &candidates, &budget))
+            .detach(|| self.inner.pinned()?.rerank(&query, &candidates, &budget))
             .map_err(to_py)?;
         Ok(PyArray1::from_vec(py, scores))
     }
@@ -588,6 +664,7 @@ impl PySearchResult {
         output.set_item("gatherer", &diagnostics.gatherer)?;
         output.set_item("reranker", &diagnostics.reranker)?;
         output.set_item("score_semantics", &diagnostics.score_semantics)?;
+        output.set_item("stale", diagnostics.stale)?;
         Ok(output)
     }
 }
@@ -599,47 +676,38 @@ impl PySearchResult {
 #[pyclass(name = "SearchPipeline", frozen, module = "lateweave._native")]
 pub(crate) struct PySearchPipeline {
     inner: SearchPipeline,
-    gatherer: Py<PyAny>,
-    reranker: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PySearchPipeline {
+    /// A stage that defines ``current()`` is followed: the pipeline asks it
+    /// for its current snapshot at the start of every search.
     #[new]
     #[pyo3(signature = (gatherer, reranker=None))]
-    fn new(gatherer: &Bound<'_, PyAny>, reranker: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
-        let native_gatherer = Arc::new(PythonGatherer {
-            object: gatherer.clone().unbind(),
-            declaration: Declaration::read(gatherer)?,
-        });
-        let native_reranker = reranker
-            .map(|reranker| -> PyResult<Arc<dyn Reranker>> {
-                Ok(match reranker.downcast::<PyMaxSimReranker>() {
-                    Ok(native) => native.get().inner.clone(),
-                    Err(_) => Arc::new(PythonReranker {
-                        object: reranker.clone().unbind(),
-                        declaration: Declaration::read(reranker)?,
-                    }),
-                })
+    fn new(
+        py: Python<'_>,
+        gatherer: &Bound<'_, PyAny>,
+        reranker: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let gatherer = python_stage(gatherer, wrap_gatherer)?;
+        let reranker = reranker
+            .map(|reranker| -> PyResult<Arc<dyn Live<dyn Reranker>>> {
+                match reranker.downcast::<PyMaxSimReranker>() {
+                    Ok(native) => Ok(native.get().inner.clone()),
+                    Err(_) => python_stage(reranker, wrap_reranker),
+                }
             })
             .transpose()?;
-        Ok(Self {
-            inner: SearchPipeline::new(native_gatherer, native_reranker).map_err(to_py)?,
-            gatherer: gatherer.clone().unbind(),
-            reranker: reranker.map(|reranker| reranker.clone().unbind()),
-        })
+        let inner = py
+            .detach(|| SearchPipeline::new(gatherer, reranker))
+            .map_err(to_py)?;
+        Ok(Self { inner })
     }
 
-    #[getter]
-    fn gatherer(&self, py: Python<'_>) -> Py<PyAny> {
-        self.gatherer.clone_ref(py)
-    }
-
-    #[getter]
-    fn reranker(&self, py: Python<'_>) -> Option<Py<PyAny>> {
-        self.reranker
-            .as_ref()
-            .map(|reranker| reranker.clone_ref(py))
+    /// A pipeline fixed on the snapshots the next search would run on.
+    fn freeze(&self, py: Python<'_>) -> PyResult<Self> {
+        let inner = py.detach(|| self.inner.freeze()).map_err(to_py)?;
+        Ok(Self { inner })
     }
 
     /// ``query`` is a ``Query`` or plain text; ``subset`` maps corpus IDs to

@@ -13,15 +13,17 @@ once. A document is an internal ID of a `Segment`: an immutable snapshot of one
 corpus, its `CorpusManifest` plus the external IDs its internal IDs name. A
 gatherer searches one or more segments, and a reranker must hold the same
 snapshot of each; each stage must agree with the query on the representation of
-every feature it uses. The reranker is optional: without one, gather scores
-rank.
+every feature it uses. Stages can be live: the pipeline asks each for its
+current snapshot at the start of every search, so what any process publishes
+is served on the next search. The reranker is optional: without one, gather
+scores rank.
 
 The package supplies:
 
 - `Query`, `Feature`, `Segment`, `Candidate`, `CorpusManifest`, `Representation`;
 - the `CandidateGenerator`, `Reranker`, and `MultiVectorSource` contracts;
-- `SearchPipeline`: compatibility checks, optional rerank, subset enforcement,
-  deterministic ranking, provenance, timings;
+- `SearchPipeline`: live stages, compatibility checks, optional rerank, subset
+  enforcement, deterministic ranking, provenance, timings;
 - `MaxSimReranker` over one `MultiVectorSource` per segment, backed by a packed
   CPU MaxSim kernel (SGEMM, SIMD maximum reduction, bounded token batches,
   worker pools);
@@ -57,19 +59,19 @@ lateweave = { git = "https://github.com/pau-mensa/lateweave" }
 ```rust
 use std::sync::Arc;
 use lateweave::{
-    Feature, MaxSimReranker, MultiVectorSource, Query, SearchPipeline, SearchRequest,
+    Feature, Live, LiveMaxSimReranker, MultiVectorSource, Query, SearchPipeline, SearchRequest,
     TokenMatrix, VectorStore, DEFAULT_FEATURE,
 };
 
-let snapshot = VectorStore::open("index/vectors")?.snapshot();
-let gatherer = MyGatherer::open("index/lexical", snapshot.segment().clone())?;
-let source: Arc<dyn MultiVectorSource> = snapshot.clone();
-let reranker = MaxSimReranker::new([source], DEFAULT_FEATURE)?;
-let pipeline = SearchPipeline::new(Arc::new(gatherer), Some(Arc::new(reranker)))?;
+let store = Arc::new(VectorStore::open("index/vectors")?);
+let representation = store.representation().clone();
+let gatherer = Arc::new(MyLexicalIndex::open("index/lexical")?);  // impl Live<dyn CandidateGenerator>
+let reranker = LiveMaxSimReranker::new([store as Arc<dyn Live<dyn MultiVectorSource>>], DEFAULT_FEATURE)?;
+let pipeline = SearchPipeline::new(gatherer, Some(Arc::new(reranker)))?;
 
 let query = Query::new("prescripción de una deuda tributaria").with_feature(
     DEFAULT_FEATURE,
-    Feature::lazy(snapshot.representation().clone(), move || {
+    Feature::lazy(representation, move || {
         TokenMatrix::new(encode(&text), dimension)
     }),
 );
@@ -79,9 +81,10 @@ for document in &result.documents {
 }
 ```
 
-A gatherer implements `CandidateGenerator`; any reranker implements
-`Reranker`. Stage and source errors from outside lateweave travel as
-`Error::External`. [examples/stored_maxsim.rs](examples/stored_maxsim.rs) is a
+A gatherer snapshot implements `CandidateGenerator` and a reranker snapshot
+`Reranker`; what hands them out as its state moves implements `Live`, and
+`SearchPipeline::fixed` takes stages that never move. Stage and source errors
+from outside lateweave travel as `Error::External`. [examples/stored_maxsim.rs](examples/stored_maxsim.rs) is a
 complete program: `cargo run --example stored_maxsim`.
 
 ## Building
@@ -194,6 +197,49 @@ corpora whose hits it fuses; each candidate names its own segment, and nothing
 needs a shared ID space. Search results carry `segment`, `document_id`, and
 `external_id`.
 
+## Live stages
+
+Other processes may update an index or a store while a service searches it. A
+stage over such state is live: an object whose `current()` returns its current
+snapshot, the gatherer, reranker, or source described above. The pipeline calls
+it at the start of every search, so the next search serves what was published,
+and a running search finishes on what it started with.
+
+```python
+class LexicalIndex:
+    """An index a writer republishes as immutable generations behind a pointer."""
+
+    def __init__(self, path):
+        self.path, self.pinned = path, None
+
+    def current(self):
+        manifest = CorpusManifest.read(self.path / "current" / "corpus-manifest.json")
+        if self.pinned is None or self.pinned.segment.manifest != manifest:
+            self.pinned = MyGatherer.load(self.path / "current")   # engine + Segment, read together
+        return self.pinned
+
+
+pipeline = SearchPipeline(
+    FusedGatherer(LexicalIndex("idx/laws"), LexicalIndex("idx/cases")),   # live: current() pins both
+    MaxSimReranker([open_vector_store("idx/laws/vectors"), open_vector_store("idx/cases/vectors")]),
+)
+pipeline.search(query, gather_limit=500, limit=100)
+```
+
+A vector store passed to `MaxSimReranker` is followed the same way: each
+search reads which generation `storage.json` names and loads it only when it
+moved. `current()` must read a segment and the engine state it describes
+together, which is why a writer should publish each generation immutably
+behind one atomic pointer, as the stores do.
+
+Snapshots must agree: the reranker must hold the same snapshot of every segment
+the gatherer searches. While a writer is between publishing one resource and
+the next they do not, and searches run on the last snapshots that agreed,
+reporting `diagnostics["stale"]`. `pipeline.freeze()` returns a pipeline fixed
+on the current snapshots, for evaluation runs, pagination, or anything else
+that must see one generation throughout. A stage without `current()` is a
+snapshot that never moves.
+
 ## Implementing a reranker or a source
 
 A reranker owns whatever it needs to score. When what it needs is the token
@@ -226,7 +272,7 @@ reranker = MaxSimReranker([EngineVectors(laws_engine, laws), EngineVectors(cases
 ```
 
 A source is a snapshot: the vectors an internal ID names must not change for
-its lifetime. The reranker routes each candidate to its segment's source and
+its lifetime; a source over moving state is live, like any stage. The reranker routes each candidate to its segment's source and
 refuses a candidate from any other snapshot. A lateweave store snapshot passed
 as a source is read natively, without calling back into Python.
 
@@ -258,7 +304,7 @@ gatherers without document vectors. A store is created with the segment and the
 from lateweave import Float32VectorStore, MaxSimReranker, SearchPipeline
 
 store = Float32VectorStore.create("index/vectors", segment, packed_embeddings, lengths, representation)
-pipeline = SearchPipeline(gatherer, MaxSimReranker([store.snapshot()]))
+pipeline = SearchPipeline(gatherer, MaxSimReranker([store]))
 result = pipeline.search(query, gather_limit=500, limit=100)
 ```
 
@@ -270,9 +316,9 @@ result = pipeline.search(query, gather_limit=500, limit=100)
 `append(external_ids, embeddings, lengths)` and `delete(external_ids)` publish
 the next generation and return its snapshot, whose segment is exactly
 `segment.appended(...)` or `segment.deleted(...)`; a delete compacts internal
-IDs to `0..n-1`. Snapshots taken earlier keep reading their own generation, so
-a pipeline built over them keeps working until it is replaced by one built over
-the new snapshot. The on-disk format is plain `.npy` files, the segment's
+IDs to `0..n-1`. `snapshot()` returns the generation `storage.json` names,
+whichever process published it; snapshots taken earlier keep reading their own
+generation. The on-disk format is plain `.npy` files, the segment's
 external IDs as JSON, and `storage.json`, the same from Rust and Python.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the ownership rules and

@@ -1,10 +1,11 @@
 //! Gather, optionally rerank, then deterministic top-k.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+use crate::live::{Fixed, Live};
 use crate::query::Query;
 use crate::ranking::validate_and_rank;
 use crate::segment::Segment;
@@ -72,6 +73,10 @@ pub struct SearchDiagnostics {
     pub reranker: Option<String>,
     /// Qualifies the scores in [`SearchResult::documents`].
     pub score_semantics: String,
+    /// The stages' current snapshots disagreed, as while a writer is between
+    /// publishing one resource and the next, so the search ran on the last
+    /// snapshots that agreed.
+    pub stale: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,24 +93,105 @@ pub struct SearchResult {
 /// A gatherer over one or more segments, optionally followed by a reranker
 /// that covers each of them.
 ///
-/// Segment agreement is checked once, at construction: the reranker must
-/// hold the same snapshot of every segment the gatherer searches. Each stage
-/// must be able to consume the query; that is checked per search, before any
-/// stage runs, so a query that cannot be served fails without gathering.
-/// Without a reranker the gather scores rank the results.
+/// Stages are [`Live`]: at the start of every search the pipeline asks each
+/// for its current snapshot, so a generation any process publishes is served
+/// on the next search, and a running search finishes on the snapshots it
+/// started with. The snapshots must agree: the reranker must hold the same
+/// snapshot of every segment the gatherer searches. While they disagree, as
+/// between a writer publishing one resource and the next, searches run on
+/// the last snapshots that agreed and report
+/// [`stale`](SearchDiagnostics::stale). [`freeze`](SearchPipeline::freeze)
+/// pins one set for good.
 ///
-/// A pipeline is bound to the snapshots its stages hold. After a mutation,
-/// build a new pipeline over the new snapshots and swap it in; searches
-/// already running finish on the old ones.
-#[derive(Clone)]
+/// Each stage must be able to consume the query; that is checked per search,
+/// before any stage runs, so a query that cannot be served fails without
+/// gathering. Without a reranker the gather scores rank the results.
 pub struct SearchPipeline {
-    gatherer: Arc<dyn CandidateGenerator>,
-    reranker: Option<Arc<dyn Reranker>>,
-    segments: BTreeMap<String, Segment>,
+    gatherer: Arc<dyn Live<dyn CandidateGenerator>>,
+    reranker: Option<Arc<dyn Live<dyn Reranker>>>,
+    agreed: RwLock<Stages>,
 }
 
 impl SearchPipeline {
+    /// Fails unless the stages' current snapshots agree.
     pub fn new(
+        gatherer: Arc<dyn Live<dyn CandidateGenerator>>,
+        reranker: Option<Arc<dyn Live<dyn Reranker>>>,
+    ) -> Result<Self> {
+        let stages = Stages::new(
+            gatherer.current()?,
+            reranker
+                .as_ref()
+                .map(|reranker| reranker.current())
+                .transpose()?,
+        )?;
+        Ok(Self {
+            gatherer,
+            reranker,
+            agreed: RwLock::new(stages),
+        })
+    }
+
+    /// A pipeline over stages that never move.
+    pub fn fixed(
+        gatherer: Arc<dyn CandidateGenerator>,
+        reranker: Option<Arc<dyn Reranker>>,
+    ) -> Result<Self> {
+        Self::new(
+            Arc::new(Fixed(gatherer)),
+            reranker.map(|reranker| Arc::new(Fixed(reranker)) as Arc<dyn Live<dyn Reranker>>),
+        )
+    }
+
+    /// A pipeline fixed on the snapshots the next search would run on, for
+    /// searches that must all see the same generations.
+    pub fn freeze(&self) -> Result<Self> {
+        let (stages, _) = self.stages()?;
+        Self::fixed(stages.gatherer, stages.reranker)
+    }
+
+    pub fn search(&self, query: &Query, request: &SearchRequest<'_>) -> Result<SearchResult> {
+        let (stages, stale) = self.stages()?;
+        stages.search(query, request, stale)
+    }
+
+    /// The current snapshots when they agree, otherwise the last that did.
+    fn stages(&self) -> Result<(Stages, bool)> {
+        let gatherer = self.gatherer.current()?;
+        let reranker = self
+            .reranker
+            .as_ref()
+            .map(|reranker| reranker.current())
+            .transpose()?;
+        let agreed = self
+            .agreed
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if agreed.holds(&gatherer, reranker.as_ref()) {
+            return Ok((agreed, false));
+        }
+        match Stages::new(gatherer, reranker) {
+            Ok(stages) => {
+                *self.agreed.write().unwrap_or_else(PoisonError::into_inner) = stages.clone();
+                Ok((stages, false))
+            }
+            Err(Error::IncompatibleIndex(_)) => Ok((agreed, true)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Stage snapshots checked to agree.
+#[derive(Clone)]
+struct Stages {
+    gatherer: Arc<dyn CandidateGenerator>,
+    reranker: Option<Arc<dyn Reranker>>,
+    segments: Arc<BTreeMap<String, Segment>>,
+}
+
+impl Stages {
+    fn new(
         gatherer: Arc<dyn CandidateGenerator>,
         reranker: Option<Arc<dyn Reranker>>,
     ) -> Result<Self> {
@@ -124,19 +210,29 @@ impl SearchPipeline {
         Ok(Self {
             gatherer,
             reranker,
-            segments,
+            segments: Arc::new(segments),
         })
     }
 
-    pub fn gatherer(&self) -> &Arc<dyn CandidateGenerator> {
-        &self.gatherer
+    fn holds(
+        &self,
+        gatherer: &Arc<dyn CandidateGenerator>,
+        reranker: Option<&Arc<dyn Reranker>>,
+    ) -> bool {
+        Arc::ptr_eq(&self.gatherer, gatherer)
+            && match (&self.reranker, reranker) {
+                (Some(held), Some(current)) => Arc::ptr_eq(held, current),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
-    pub fn reranker(&self) -> Option<&Arc<dyn Reranker>> {
-        self.reranker.as_ref()
-    }
-
-    pub fn search(&self, query: &Query, request: &SearchRequest<'_>) -> Result<SearchResult> {
+    fn search(
+        &self,
+        query: &Query,
+        request: &SearchRequest<'_>,
+        stale: bool,
+    ) -> Result<SearchResult> {
         if request.gather_limit == 0 {
             return Err(Error::invalid("gather_limit must be positive"));
         }
@@ -197,6 +293,7 @@ impl SearchPipeline {
                     .as_ref()
                     .map(|reranker| reranker.name().to_string()),
                 score_semantics: score_semantics.to_string(),
+                stale,
             },
             candidates,
             scores,
@@ -219,7 +316,7 @@ impl SearchPipeline {
             }
         }
         let mut normalized = Subset::new();
-        for (corpus_id, segment) in &self.segments {
+        for (corpus_id, segment) in self.segments.iter() {
             let ids = subset.ids(corpus_id);
             if ids.windows(2).any(|pair| pair[0] > pair[1]) {
                 return Err(Error::invalid(format!(
@@ -453,10 +550,11 @@ mod tests {
             Ok(candidates
                 .iter()
                 .map(|candidate| {
-                    self.scores[&(
+                    let key = (
                         candidate.segment.corpus_id().to_string(),
                         candidate.document_id,
-                    )]
+                    );
+                    self.scores.get(&key).copied().unwrap_or(1.0)
                 })
                 .collect())
         }
@@ -482,7 +580,7 @@ mod tests {
 
     #[test]
     fn a_reranked_result_ignores_gather_scores() {
-        let pipeline = SearchPipeline::new(
+        let pipeline = SearchPipeline::fixed(
             Arc::new(FixedGatherer::new()),
             Some(Arc::new(TableReranker::new(vec![segment("docs")]))),
         )
@@ -500,13 +598,14 @@ mod tests {
                 gatherer: "FixedGatherer".to_string(),
                 reranker: Some("TableReranker".to_string()),
                 score_semantics: "external-rerank".to_string(),
+                stale: false,
             }
         );
     }
 
     #[test]
     fn without_a_reranker_gather_scores_rank() {
-        let pipeline = SearchPipeline::new(Arc::new(FixedGatherer::new()), None).unwrap();
+        let pipeline = SearchPipeline::fixed(Arc::new(FixedGatherer::new()), None).unwrap();
         let result = pipeline
             .search(&Query::new("query"), &SearchRequest::new(3, 3))
             .unwrap();
@@ -521,7 +620,7 @@ mod tests {
             segments.clone(),
             vec![(0, 0, 1.0), (1, 0, 1.0), (1, 1, 1.0), (0, 2, 1.0)],
         );
-        let pipeline = SearchPipeline::new(
+        let pipeline = SearchPipeline::fixed(
             Arc::new(gatherer),
             Some(Arc::new(TableReranker::new(segments))),
         )
@@ -540,7 +639,7 @@ mod tests {
                 vec![],
             ))
         };
-        let missing = SearchPipeline::new(
+        let missing = SearchPipeline::fixed(
             gatherer(),
             Some(Arc::new(TableReranker::new(vec![segment("a")]))),
         )
@@ -549,7 +648,7 @@ mod tests {
         assert!(matches!(missing, Error::IncompatibleIndex(message) if message.contains("\"b\"")));
 
         let stale = segment("b").appended(["w"]).unwrap();
-        let error = SearchPipeline::new(
+        let error = SearchPipeline::fixed(
             gatherer(),
             Some(Arc::new(TableReranker::new(vec![segment("a"), stale]))),
         )
@@ -557,7 +656,7 @@ mod tests {
         .unwrap();
         assert!(matches!(error, Error::IncompatibleIndex(_)));
 
-        let wider = SearchPipeline::new(
+        let wider = SearchPipeline::fixed(
             Arc::new(FixedGatherer::over(vec![segment("a")], vec![])),
             Some(Arc::new(TableReranker::new(vec![
                 segment("a"),
@@ -570,7 +669,7 @@ mod tests {
     #[test]
     fn a_segment_is_declared_once() {
         let gatherer = FixedGatherer::over(vec![segment("a"), segment("a")], vec![]);
-        assert!(SearchPipeline::new(Arc::new(gatherer), None).is_err());
+        assert!(SearchPipeline::fixed(Arc::new(gatherer), None).is_err());
     }
 
     #[test]
@@ -601,7 +700,7 @@ mod tests {
                 self.0.gather(query, limit, subset)
             }
         }
-        let pipeline = SearchPipeline::new(Arc::new(Declares(foreign, declared)), None).unwrap();
+        let pipeline = SearchPipeline::fixed(Arc::new(Declares(foreign, declared)), None).unwrap();
         let error = pipeline
             .search(&Query::new("query"), &SearchRequest::new(1, 1))
             .unwrap_err();
@@ -612,7 +711,7 @@ mod tests {
             vec![(0, 3, 1.0)],
         );
         let pipeline =
-            SearchPipeline::new(Arc::new(Declares(stale, vec![segment("a")])), None).unwrap();
+            SearchPipeline::fixed(Arc::new(Declares(stale, vec![segment("a")])), None).unwrap();
         let error = pipeline
             .search(&Query::new("query"), &SearchRequest::new(1, 1))
             .unwrap_err();
@@ -622,7 +721,7 @@ mod tests {
     #[test]
     fn duplicate_candidates_are_refused() {
         let gatherer = FixedGatherer::over(vec![segment("a")], vec![(0, 1, 1.0), (0, 1, 1.0)]);
-        let pipeline = SearchPipeline::new(Arc::new(gatherer), None).unwrap();
+        let pipeline = SearchPipeline::fixed(Arc::new(gatherer), None).unwrap();
         let error = pipeline
             .search(&Query::new("query"), &SearchRequest::new(2, 2))
             .unwrap_err();
@@ -632,7 +731,7 @@ mod tests {
     #[test]
     fn an_unservable_query_fails_before_gathering() {
         let gatherer = Arc::new(FixedGatherer::new());
-        let pipeline = SearchPipeline::new(
+        let pipeline = SearchPipeline::fixed(
             gatherer.clone(),
             Some(Arc::new(TableReranker::new(vec![segment("docs")]))),
         )
@@ -657,7 +756,7 @@ mod tests {
         );
         let mut gatherer = FixedGatherer::new();
         gatherer.requires = BTreeMap::from([("multi_vector".to_string(), representation())]);
-        let pipeline = SearchPipeline::new(Arc::new(gatherer), None).unwrap();
+        let pipeline = SearchPipeline::fixed(Arc::new(gatherer), None).unwrap();
         pipeline.search(&query, &SearchRequest::new(3, 3)).unwrap();
         assert_eq!(encodings.load(Ordering::SeqCst), 0);
     }
@@ -666,7 +765,7 @@ mod tests {
     fn subsets_are_per_segment_ascending_and_inside_it() {
         let segments = vec![segment("a"), segment("b")];
         let gatherer = FixedGatherer::over(segments, vec![(0, 0, 3.0), (1, 0, 2.0), (1, 2, 1.0)]);
-        let pipeline = SearchPipeline::new(Arc::new(gatherer), None).unwrap();
+        let pipeline = SearchPipeline::fixed(Arc::new(gatherer), None).unwrap();
         let query = Query::new("query");
 
         let subset = Subset::new().with("b", vec![0, 0, 2]);
@@ -708,7 +807,8 @@ mod tests {
                 self.0.gather(query, limit, None)
             }
         }
-        let pipeline = SearchPipeline::new(Arc::new(Ignores(FixedGatherer::new())), None).unwrap();
+        let pipeline =
+            SearchPipeline::fixed(Arc::new(Ignores(FixedGatherer::new())), None).unwrap();
         let subset = Subset::new().with("docs", vec![0]);
         let error = pipeline
             .search(
@@ -717,5 +817,87 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("outside the subset"));
+    }
+
+    /// A stage another writer moves by replacing what it holds.
+    struct Moving<S: ?Sized>(std::sync::RwLock<Arc<S>>);
+
+    impl<S: ?Sized + Send + Sync> Moving<S> {
+        fn new(stage: Arc<S>) -> Arc<Self> {
+            Arc::new(Self(std::sync::RwLock::new(stage)))
+        }
+
+        fn publish(&self, stage: Arc<S>) {
+            *self.0.write().unwrap() = stage;
+        }
+    }
+
+    impl<S: ?Sized + Send + Sync> Live<S> for Moving<S> {
+        fn current(&self) -> Result<Arc<S>> {
+            Ok(self.0.read().unwrap().clone())
+        }
+    }
+
+    fn external_ids(result: &SearchResult) -> Vec<&str> {
+        result
+            .documents
+            .iter()
+            .map(|row| row.external_id().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_live_pipeline_serves_each_publish_once_its_stages_agree() {
+        let first = segment("docs");
+        let second = first.appended(["w"]).unwrap();
+        let gatherer = |segment: &Segment, id: u64| -> Arc<dyn CandidateGenerator> {
+            Arc::new(FixedGatherer::over(
+                vec![segment.clone()],
+                vec![(0, id, 1.0)],
+            ))
+        };
+        let reranker = |segment: &Segment| -> Arc<dyn Reranker> {
+            Arc::new(TableReranker::new(vec![segment.clone()]))
+        };
+        let live_gatherer = Moving::new(gatherer(&first, 0));
+        let live_reranker = Moving::new(reranker(&first));
+        let pipeline = SearchPipeline::new(
+            live_gatherer.clone(),
+            Some(live_reranker.clone() as Arc<dyn Live<dyn Reranker>>),
+        )
+        .unwrap();
+        let frozen = pipeline.freeze().unwrap();
+        let search = |pipeline: &SearchPipeline| {
+            pipeline
+                .search(&vector_query(), &SearchRequest::new(1, 1))
+                .unwrap()
+        };
+        assert_eq!(external_ids(&search(&pipeline)), ["x"]);
+
+        // The gatherer moved first: the last agreeing snapshots still serve.
+        live_gatherer.publish(gatherer(&second, 3));
+        let result = search(&pipeline);
+        assert!(result.diagnostics.stale);
+        assert_eq!(external_ids(&result), ["x"]);
+
+        live_reranker.publish(reranker(&second));
+        let result = search(&pipeline);
+        assert!(!result.diagnostics.stale);
+        assert_eq!(external_ids(&result), ["w"]);
+        assert_eq!(result.documents[0].segment.generation(), 1);
+
+        let result = search(&frozen);
+        assert_eq!(external_ids(&result), ["x"]);
+        assert_eq!(result.documents[0].segment.generation(), 0);
+    }
+
+    #[test]
+    fn a_live_pipeline_must_agree_when_built() {
+        let gatherer: Arc<dyn CandidateGenerator> = Arc::new(FixedGatherer::new());
+        let reranker: Arc<dyn Reranker> = Arc::new(TableReranker::new(vec![segment("other")]));
+        assert!(matches!(
+            SearchPipeline::new(Moving::new(gatherer), Some(Moving::new(reranker))),
+            Err(Error::IncompatibleIndex(_))
+        ));
     }
 }

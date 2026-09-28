@@ -81,6 +81,7 @@ def test_gatherer_and_reranker_compose_without_backend_dependencies() -> None:
         "gatherer": "TextGatherer",
         "reranker": "VectorReranker",
         "score_semantics": "external-rerank",
+        "stale": False,
     }
 
 

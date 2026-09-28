@@ -8,16 +8,18 @@
 //! [`Representation`] that produced it. A document is an internal ID of a
 //! [`Segment`], an immutable snapshot of one corpus; a gatherer searches one
 //! or more segments and a reranker must hold the same snapshot of each.
-//! [`SearchPipeline`] checks both identities before any stage runs, enforces
-//! the stage contracts, and ranks deterministically. [`MaxSimReranker`]
-//! scores [`MultiVectorSource`]s, one per segment, including snapshots of the
-//! memory-mapped [`VectorStore`].
+//! Stages are [`Live`]: [`SearchPipeline`] asks each for its current snapshot
+//! at the start of every search, checks both identities before any stage
+//! runs, enforces the stage contracts, and ranks deterministically.
+//! [`MaxSimReranker`] scores [`MultiVectorSource`]s, one per segment, and
+//! [`LiveMaxSimReranker`] follows [`VectorStore`]s as they publish.
 
 #[cfg(target_os = "macos")]
 extern crate blas_src;
 
 mod error;
 mod kernel;
+mod live;
 mod manifest;
 mod maxsim;
 mod pipeline;
@@ -31,8 +33,9 @@ mod threads;
 
 pub use error::{Error, Result};
 pub use kernel::maxsim_scores;
+pub use live::{Fixed, Live};
 pub use manifest::{document_ids_digest, CorpusManifest, Representation};
-pub use maxsim::{MaxSimReranker, DEFAULT_FEATURE};
+pub use maxsim::{LiveMaxSimReranker, MaxSimReranker, DEFAULT_FEATURE};
 pub use pipeline::{
     RankedDocument, SearchDiagnostics, SearchPipeline, SearchRequest, SearchResult, SearchTimings,
 };

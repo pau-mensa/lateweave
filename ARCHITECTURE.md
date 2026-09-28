@@ -114,10 +114,30 @@ candidate order. Gather scores never influence a reranked result.
 `ResourceBudget` crosses the boundary because bounded execution is caller
 policy; each reranker maps it onto its own representation.
 
-A pipeline is bound to the snapshots its stages hold. After a mutation, build a
-new pipeline over the new snapshots and swap it in: searches already running
-finish on the old ones, and nothing can pair a gatherer's ID with another
-generation's vectors.
+## Live stages
+
+Indexes and stores move while a service searches them, often through writers in
+other processes. A stage is therefore `Live`: something whose `current()` hands
+out an immutable snapshot, the gatherer or reranker described above. At the
+start of every search the pipeline asks each stage for its current snapshot
+and checks that they agree, so a publish is served on the next search and a
+running search finishes on the snapshots it started with. When the snapshots
+are the ones the last search used, nothing is checked again.
+
+While they disagree, as between a writer publishing an index and publishing the
+store beside it, the pipeline serves the last snapshots that agreed and reports
+the search as stale, rather than failing or pairing a gatherer's ID with
+another generation's vectors. `freeze` returns a pipeline fixed on the current
+snapshots, for work that must see one generation throughout; `fixed` builds one
+over stages that never move.
+
+`current()` must read a segment together with the engine state it describes.
+That is only possible when a writer publishes each generation immutably behind
+one atomic pointer, as the stores do with `storage.json`; an engine updated in
+place cannot be snapshotted, and no check downstream can detect it. A store is
+its own live source: `snapshot()` reads which generation `storage.json` names
+and loads it only when it moved, and `MaxSimReranker` over live sources re-pins
+them per search and rebuilds only when one moved.
 
 ## Multi-vector sources
 

@@ -1,10 +1,11 @@
 //! MaxSim reranking over multi-vector sources, one per segment.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::error::{Error, Result};
 use crate::kernel::maxsim_scores;
+use crate::live::Live;
 use crate::manifest::Representation;
 use crate::query::{Query, TokenMatrix};
 use crate::segment::Segment;
@@ -102,6 +103,69 @@ impl MaxSimReranker {
         segment.assert_compatible(source.segment())?;
         Ok(source)
     }
+}
+
+/// A [`MaxSimReranker`] over [`Live`] sources, such as
+/// [`VectorStore`](crate::VectorStore)s: each call to `current` pins every
+/// source's current snapshot and returns the reranker over them, rebuilt only
+/// when one has moved.
+pub struct LiveMaxSimReranker {
+    sources: Vec<Arc<dyn Live<dyn MultiVectorSource>>>,
+    feature: String,
+    current: RwLock<Arc<MaxSimReranker>>,
+}
+
+impl LiveMaxSimReranker {
+    /// Sources must be for distinct segments.
+    pub fn new(
+        sources: impl IntoIterator<Item = Arc<dyn Live<dyn MultiVectorSource>>>,
+        feature: impl Into<String>,
+    ) -> Result<Self> {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let feature = feature.into();
+        let current = MaxSimReranker::new(pin(&sources)?, feature.clone())?;
+        Ok(Self {
+            sources,
+            feature,
+            current: RwLock::new(Arc::new(current)),
+        })
+    }
+
+    pub fn feature(&self) -> &str {
+        &self.feature
+    }
+
+    /// The reranker over every source's current snapshot.
+    pub fn pinned(&self) -> Result<Arc<MaxSimReranker>> {
+        let pinned = pin(&self.sources)?;
+        let cached = self
+            .current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if pinned
+            .iter()
+            .zip(cached.sources())
+            .all(|(pinned, cached)| Arc::ptr_eq(pinned, cached))
+        {
+            return Ok(cached);
+        }
+        let next = Arc::new(MaxSimReranker::new(pinned, self.feature.clone())?);
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = next.clone();
+        Ok(next)
+    }
+}
+
+impl Live<dyn Reranker> for LiveMaxSimReranker {
+    fn current(&self) -> Result<Arc<dyn Reranker>> {
+        Ok(self.pinned()?)
+    }
+}
+
+fn pin(
+    sources: &[Arc<dyn Live<dyn MultiVectorSource>>],
+) -> Result<Vec<Arc<dyn MultiVectorSource>>> {
+    sources.iter().map(|source| source.current()).collect()
 }
 
 /// Groups documents, shortest first, into batches of at most `maximum_tokens`
@@ -454,5 +518,38 @@ mod tests {
         assert!(
             MaxSimReranker::new(Vec::<Arc<dyn MultiVectorSource>>::new(), DEFAULT_FEATURE).is_err()
         );
+    }
+
+    #[test]
+    fn a_live_reranker_rebuilds_only_when_a_source_moves() {
+        struct Swappable(RwLock<Arc<dyn MultiVectorSource>>);
+        impl Live<dyn MultiVectorSource> for Swappable {
+            fn current(&self) -> Result<Arc<dyn MultiVectorSource>> {
+                Ok(self.0.read().unwrap().clone())
+            }
+        }
+        let first: Arc<dyn MultiVectorSource> = InMemorySource::new("docs", vec![vec![1.0, 0.0]]);
+        let live = Arc::new(Swappable(RwLock::new(first)));
+        let reranker = LiveMaxSimReranker::new(
+            [live.clone() as Arc<dyn Live<dyn MultiVectorSource>>],
+            DEFAULT_FEATURE,
+        )
+        .unwrap();
+        let pinned = reranker.pinned().unwrap();
+        assert!(Arc::ptr_eq(&pinned, &reranker.pinned().unwrap()));
+
+        let moved = InMemorySource::new("docs", vec![vec![0.0, 1.0], vec![1.0, 0.0]]);
+        *live.0.write().unwrap() = moved.clone() as Arc<dyn MultiVectorSource>;
+        let repinned = reranker.pinned().unwrap();
+        assert_eq!(repinned.segments(), std::slice::from_ref(&moved.segment));
+        let scores = repinned
+            .rerank(
+                &query(vec![1.0, 0.0]),
+                &[candidate(&moved.segment, 1, 0)],
+                &ResourceBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(scores, [1.0]);
+        assert_eq!(pinned.segments().len(), 1);
     }
 }

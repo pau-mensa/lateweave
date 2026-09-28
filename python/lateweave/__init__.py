@@ -16,7 +16,7 @@ from ._native import (
     maxsim_scores_packed,
     open_vector_store,
 )
-from .interfaces import CandidateGenerator, MultiVectorSource, Reranker
+from .interfaces import CandidateGenerator, Live, MultiVectorSource, Reranker
 from .manifest import (
     CorpusManifest,
     IncompatibleIndexError,
@@ -34,6 +34,7 @@ __all__ = [
     "IncompatibleIndexError",
     "IncompatibleQueryError",
     "Int8VectorStore",
+    "Live",
     "MaxSimReranker",
     "MultiVectorSource",
     "Query",

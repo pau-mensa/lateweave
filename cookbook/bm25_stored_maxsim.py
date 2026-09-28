@@ -431,12 +431,12 @@ def search_index(args: argparse.Namespace) -> None:
         reranker = None
         features: dict[str, Feature] = {}
         if args.query_embeddings is not None:
-            # The pipeline refuses a snapshot of any other segment than the
-            # lexical index's.
-            snapshot = open_vector_store(source / VECTOR_DIRECTORY).snapshot()
-            reranker = MaxSimReranker([snapshot])
+            # The pipeline refuses the store while it holds another segment
+            # than the lexical index's.
+            store = open_vector_store(source / VECTOR_DIRECTORY)
+            reranker = MaxSimReranker([store])
             features["multi_vector"] = Feature(
-                snapshot.representation,
+                store.representation,
                 provider=lambda: np.ascontiguousarray(
                     np.load(args.query_embeddings), dtype=np.float32
                 ),

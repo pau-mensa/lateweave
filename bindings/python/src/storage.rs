@@ -87,9 +87,10 @@ fn create(
 
 /// Memory-mapped fixed-width token records for one segment.
 ///
-/// Reads go through ``snapshot()``; each mutation takes external IDs and
-/// returns the snapshot it publishes. Earlier snapshots keep reading their
-/// own generation.
+/// Reads go through ``snapshot()``, which follows the generation any process
+/// publishes; passed to ``MaxSimReranker`` a store is followed on every
+/// search. Each mutation takes external IDs and returns the snapshot it
+/// publishes. Earlier snapshots keep reading their own generation.
 #[pyclass(name = "VectorStore", subclass, frozen, module = "lateweave._native")]
 pub(crate) struct PyVectorStore {
     pub(crate) inner: Arc<VectorStore>,
@@ -112,17 +113,17 @@ impl PyVectorStore {
         self.inner.dimension()
     }
 
-    /// The live generation's segment.
+    /// The segment of ``snapshot()``.
     #[getter]
-    fn segment(&self) -> PySegment {
-        self.inner.segment().into()
+    fn segment(&self, py: Python<'_>) -> PyResult<PySegment> {
+        Ok(py.detach(|| self.inner.segment()).map_err(to_py)?.into())
     }
 
-    /// The live generation, a ``MultiVectorSource``.
-    fn snapshot(&self) -> PyStoreSnapshot {
-        PyStoreSnapshot {
-            inner: self.inner.snapshot(),
-        }
+    /// The generation ``storage.json`` names now, whichever process
+    /// published it; a ``MultiVectorSource``.
+    fn snapshot(&self, py: Python<'_>) -> PyResult<PyStoreSnapshot> {
+        let inner = py.detach(|| self.inner.snapshot()).map_err(to_py)?;
+        Ok(PyStoreSnapshot { inner })
     }
 
     /// Appends documents after the existing ones, in the order of

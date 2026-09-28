@@ -27,6 +27,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::live::Live;
 use crate::manifest::{CorpusManifest, Representation};
 use crate::ranking::all_finite;
 use crate::segment::Segment;
@@ -339,11 +340,13 @@ impl MultiVectorSource for StoreSnapshot {
 
 /// A memory-mapped multi-vector store for one segment.
 ///
-/// Reads go through [`snapshot`](VectorStore::snapshot)s. Mutations run one at
-/// a time, take external IDs, and return the snapshot they publish, whose
-/// segment is exactly [`Segment::appended`] or [`Segment::deleted`] of the one
-/// before. Snapshots taken earlier are unaffected. One process writes a store;
-/// any number read it.
+/// Reads go through [`snapshot`](VectorStore::snapshot)s, which follow the
+/// generation `storage.json` names, whichever process published it; as a
+/// [`Live`] source the store hands the pipeline its latest snapshot on every
+/// search. Mutations run one at a time, take external IDs, and return the
+/// snapshot they publish, whose segment is exactly [`Segment::appended`] or
+/// [`Segment::deleted`] of the one before. Snapshots taken earlier are
+/// unaffected. One process writes a store; any number read it.
 pub struct VectorStore {
     path: PathBuf,
     format: StoreFormat,
@@ -414,21 +417,7 @@ impl VectorStore {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut attempts = 0;
-        let (metadata, snapshot) = loop {
-            let metadata = read_metadata(&path)?;
-            match load_snapshot(&path, &metadata) {
-                Ok(snapshot) => break (metadata, snapshot),
-                Err(Error::Io(error))
-                    if error.kind() == io::ErrorKind::NotFound
-                        && attempts + 1 < OPEN_ATTEMPTS
-                        && read_metadata(&path)?.corpus != metadata.corpus =>
-                {
-                    attempts += 1;
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let (metadata, snapshot) = load_published(&path)?;
         Ok(Self {
             path,
             format: snapshot.format,
@@ -454,17 +443,37 @@ impl VectorStore {
         self.representation.dimension()
     }
 
-    /// The live generation.
-    pub fn snapshot(&self) -> Arc<StoreSnapshot> {
+    /// The generation `storage.json` names now. Costs one read of that file,
+    /// and a load only when another process has published since.
+    pub fn snapshot(&self) -> Result<Arc<StoreSnapshot>> {
+        let cached = self.cached();
+        if read_metadata(&self.path)?.corpus == *cached.segment.manifest() {
+            return Ok(cached);
+        }
+        let (metadata, snapshot) = load_published(&self.path)?;
+        if metadata.representation != self.representation || snapshot.format != self.format {
+            return Err(Error::storage(format!(
+                "vector store {} was replaced by one of another format or representation",
+                self.path.display()
+            )));
+        }
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        if snapshot.segment.generation() > current.segment.generation() {
+            *current = Arc::new(snapshot);
+        }
+        Ok(current.clone())
+    }
+
+    /// The segment of [`snapshot`](VectorStore::snapshot).
+    pub fn segment(&self) -> Result<Segment> {
+        Ok(self.snapshot()?.segment.clone())
+    }
+
+    fn cached(&self) -> Arc<StoreSnapshot> {
         self.current
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-
-    /// The live generation's segment.
-    pub fn segment(&self) -> Segment {
-        self.snapshot().segment.clone()
     }
 
     /// Appends documents after the existing ones; their internal IDs continue
@@ -483,7 +492,7 @@ impl VectorStore {
     {
         validate_embeddings(embeddings, dimension, lengths, &self.representation)?;
         let _mutation = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let current = self.snapshot();
+        let current = self.snapshot()?;
         let segment = current.segment.appended(document_ids)?;
         require_lengths_for(&segment, current.document_count() as usize + lengths.len())?;
         let generation = segment.generation();
@@ -528,7 +537,7 @@ impl VectorStore {
             .map(|document_id| document_id.as_ref().to_string())
             .collect::<Vec<_>>();
         let _mutation = self.mutation.lock().unwrap_or_else(PoisonError::into_inner);
-        let current = self.snapshot();
+        let current = self.snapshot()?;
         let deleted = current.segment.deletion(&document_ids)?;
         if deleted.is_empty() {
             return Ok(current);
@@ -616,6 +625,32 @@ impl VectorStore {
                 }
                 Err(error)
             }
+        }
+    }
+}
+
+impl Live<dyn MultiVectorSource> for VectorStore {
+    fn current(&self) -> Result<Arc<dyn MultiVectorSource>> {
+        Ok(self.snapshot()?)
+    }
+}
+
+/// The published generation, rereading `storage.json` when a writer in
+/// another process publishes and removes the generation about to be mapped.
+fn load_published(path: &Path) -> Result<(Metadata, StoreSnapshot)> {
+    let mut attempts = 0;
+    loop {
+        let metadata = read_metadata(path)?;
+        match load_snapshot(path, &metadata) {
+            Ok(snapshot) => return Ok((metadata, snapshot)),
+            Err(Error::Io(error))
+                if error.kind() == io::ErrorKind::NotFound
+                    && attempts + 1 < OPEN_ATTEMPTS
+                    && read_metadata(path)?.corpus != metadata.corpus =>
+            {
+                attempts += 1;
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -902,8 +937,8 @@ mod tests {
             create(&path, format, &["a", "b", "c"], &[0, 1, 2, 3], &[2, 1, 1]);
             let store = VectorStore::open(&path).unwrap();
             assert_eq!(store.format(), format);
-            assert_eq!(store.segment(), segment(&["a", "b", "c"]));
-            let snapshot = store.snapshot();
+            assert_eq!(store.segment().unwrap(), segment(&["a", "b", "c"]));
+            let snapshot = store.snapshot().unwrap();
             assert_eq!(snapshot.document_lengths(&[2, 0]).unwrap(), vec![1, 2]);
             let packed = snapshot.fetch(&[2, 0], Some(1)).unwrap();
             assert_eq!(packed.lengths(), &[1, 2]);
@@ -919,7 +954,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("vectors");
             let store = create(&path, format, &["a", "b", "c"], &[0, 1, 2, 3], &[1, 2, 1]);
-            let initial = store.segment();
+            let initial = store.segment().unwrap();
 
             let appended = store
                 .append(["d"], &rows(&[0]), DIMENSION, &[1], None)
@@ -942,11 +977,11 @@ mod tests {
             assert!(store.delete(["zzz"]).is_err());
             assert!(Arc::ptr_eq(
                 &store.delete(Vec::<String>::new()).unwrap(),
-                &store.snapshot()
+                &store.snapshot().unwrap()
             ));
 
             let reopened = VectorStore::open(&path).unwrap();
-            assert_eq!(reopened.segment(), *deleted.segment());
+            assert_eq!(reopened.segment().unwrap(), *deleted.segment());
             assert_eq!(
                 files(&path),
                 [
@@ -969,7 +1004,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vectors");
         let store = create(&path, StoreFormat::Float32, &["a", "b"], &[0, 1], &[1, 1]);
-        let before = store.snapshot();
+        let before = store.snapshot().unwrap();
 
         store.delete(["a"]).unwrap();
         store
@@ -977,7 +1012,7 @@ mod tests {
             .unwrap();
 
         // Same count as before, but internal ID 1 now names "c".
-        let after = store.snapshot();
+        let after = store.snapshot().unwrap();
         assert_eq!(
             after.fetch(&[1], None).unwrap().vectors(),
             rows(&[2]).as_slice()
@@ -991,19 +1026,52 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_follows_generations_another_handle_publishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vectors");
+        let reader = create(&path, StoreFormat::Float32, &["a", "b"], &[0, 1], &[1, 1]);
+        let first = reader.snapshot().unwrap();
+        assert!(Arc::ptr_eq(&reader.snapshot().unwrap(), &first));
+
+        // Another process would hold its own handle; so does this writer.
+        let writer = VectorStore::open(&path).unwrap();
+        writer
+            .append(["c"], &rows(&[2]), DIMENSION, &[1], None)
+            .unwrap();
+        writer.delete(["a"]).unwrap();
+
+        let latest = reader.snapshot().unwrap();
+        assert_eq!(latest.segment().generation(), 2);
+        assert_eq!(
+            latest.segment().document_ids().collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+        assert_eq!(
+            latest.fetch(&[1], None).unwrap().vectors(),
+            rows(&[2]).as_slice()
+        );
+        assert_eq!(
+            first.fetch(&[0], None).unwrap().vectors(),
+            rows(&[0]).as_slice()
+        );
+        let source = Live::<dyn MultiVectorSource>::current(&reader).unwrap();
+        assert_eq!(*source.segment(), *latest.segment());
+    }
+
+    #[test]
     fn a_rejected_mutation_changes_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vectors");
         let store = create(&path, StoreFormat::Float32, &["a", "b"], &[0, 1], &[1, 1]);
         let before = files(&path);
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().unwrap();
         assert!(store
             .append(["a"], &rows(&[2]), DIMENSION, &[1], None)
             .is_err());
         assert!(store
             .append(["c", "d"], &rows(&[2]), DIMENSION, &[1], None)
             .is_err());
-        assert!(Arc::ptr_eq(&store.snapshot(), &snapshot));
+        assert!(Arc::ptr_eq(&store.snapshot().unwrap(), &snapshot));
         assert_eq!(files(&path), before);
     }
 
@@ -1013,7 +1081,7 @@ mod tests {
         let path = directory.path().join("vectors");
         let store = create(&path, StoreFormat::Float32, &["a", "b"], &[0, 1], &[1, 1]);
         let before = files(&path);
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().unwrap();
         let next = snapshot.segment().appended(["c"]).unwrap();
         // The stage writes one array and then fails.
         let error = store
@@ -1028,10 +1096,10 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("less data"));
-        assert!(Arc::ptr_eq(&store.snapshot(), &snapshot));
+        assert!(Arc::ptr_eq(&store.snapshot().unwrap(), &snapshot));
         assert_eq!(files(&path), before);
         assert_eq!(
-            VectorStore::open(&path).unwrap().segment(),
+            VectorStore::open(&path).unwrap().segment().unwrap(),
             *snapshot.segment()
         );
     }
@@ -1046,7 +1114,7 @@ mod tests {
             &[0, 1, 2, 3],
             &[1, 1, 1, 1],
         );
-        let snapshot = store.snapshot();
+        let snapshot = store.snapshot().unwrap();
         let reranker = MaxSimReranker::new(
             [snapshot.clone() as Arc<dyn MultiVectorSource>],
             DEFAULT_FEATURE,
