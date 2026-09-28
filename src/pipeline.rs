@@ -18,9 +18,6 @@ pub struct SearchRequest<'a> {
     pub limit: usize,
     pub subset: Option<&'a Subset>,
     pub budget: ResourceBudget,
-    /// Fail with [`Error::Stale`] rather than answer from indexes whose last
-    /// committed write is older than this.
-    pub max_lag: Option<Duration>,
 }
 
 impl<'a> SearchRequest<'a> {
@@ -30,7 +27,6 @@ impl<'a> SearchRequest<'a> {
             limit,
             subset: None,
             budget: ResourceBudget::default(),
-            max_lag: None,
         }
     }
 
@@ -41,11 +37,6 @@ impl<'a> SearchRequest<'a> {
 
     pub fn with_budget(mut self, budget: ResourceBudget) -> Self {
         self.budget = budget;
-        self
-    }
-
-    pub fn with_max_lag(mut self, max_lag: Duration) -> Self {
-        self.max_lag = Some(max_lag);
         self
     }
 }
@@ -133,7 +124,6 @@ impl SearchPipeline {
             .gather(query, request.gather_limit, request.subset)?;
         let gathered_at = Instant::now();
         validate(&gathered.candidates, request.gather_limit, request.subset)?;
-        fresh(gathered.as_of, request.max_lag)?;
         let candidates = gathered.candidates;
         let (scores, as_of, score_semantics) = match &self.reranker {
             Some(reranker) => {
@@ -154,7 +144,6 @@ impl SearchPipeline {
             ),
         };
         let reranked = Instant::now();
-        fresh(as_of, request.max_lag)?;
 
         let documents = validate_and_rank(&candidates, &scores, request.limit)?
             .into_iter()
@@ -215,23 +204,6 @@ fn validate(candidates: &[Candidate], gather_limit: usize, subset: Option<&Subse
                 candidate.key
             )));
         }
-    }
-    Ok(())
-}
-
-fn fresh(as_of: SystemTime, max_lag: Option<Duration>) -> Result<()> {
-    let Some(max_lag) = max_lag else {
-        return Ok(());
-    };
-    let lag = SystemTime::now()
-        .duration_since(as_of)
-        .unwrap_or(Duration::ZERO);
-    if lag > max_lag {
-        return Err(Error::Stale {
-            as_of,
-            lag,
-            max_lag,
-        });
     }
     Ok(())
 }
@@ -431,35 +403,6 @@ mod tests {
         assert_eq!(ids(&result), ["z", "x", "y"]);
         assert_eq!(result.as_of, gatherer.as_of);
         assert_eq!(result.diagnostics.score_semantics, "external-gather");
-    }
-
-    #[test]
-    fn a_search_older_than_max_lag_fails() {
-        let mut gatherer = FixedGatherer::new();
-        gatherer.as_of = seconds_ago(120);
-        let pipeline = SearchPipeline::new(Arc::new(gatherer), None);
-        let query = Query::new("query");
-        let request = SearchRequest::new(3, 3);
-        assert!(pipeline
-            .search(&query, &request.with_max_lag(Duration::from_secs(600)))
-            .is_ok());
-        let error = pipeline
-            .search(&query, &request.with_max_lag(Duration::from_secs(60)))
-            .unwrap_err();
-        assert!(matches!(error, Error::Stale { lag, .. } if lag >= Duration::from_secs(120)));
-    }
-
-    #[test]
-    fn the_rerankers_age_counts_toward_max_lag() {
-        let mut reranker = TableReranker::new(&[("x", 1.0)]);
-        reranker.as_of = seconds_ago(120);
-        let pipeline =
-            SearchPipeline::new(Arc::new(FixedGatherer::new()), Some(Arc::new(reranker)));
-        let request = SearchRequest::new(3, 3).with_max_lag(Duration::from_secs(60));
-        assert!(matches!(
-            pipeline.search(&vector_query(), &request),
-            Err(Error::Stale { .. })
-        ));
     }
 
     #[test]

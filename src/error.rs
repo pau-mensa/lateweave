@@ -1,5 +1,3 @@
-use std::time::{Duration, SystemTime};
-
 use thiserror::Error;
 
 use crate::ranking::RankingError;
@@ -20,13 +18,6 @@ pub enum Error {
     /// A stage or source broke the contract the pipeline enforces on its output.
     #[error(transparent)]
     Ranking(#[from] RankingError),
-    /// The indexes a search read reflect writes older than the request allows.
-    #[error("the indexes reflect writes committed {lag:?} ago, more than the {max_lag:?} allowed")]
-    Stale {
-        as_of: SystemTime,
-        lag: Duration,
-        max_lag: Duration,
-    },
     /// A vector store on disk is not one this version can read.
     #[error("{0}")]
     Storage(String),

@@ -14,9 +14,8 @@ gives them, never by an engine's internal position, so each stage reads its own
 indexes and whoever maintains them, in any process and with any library, never
 coordinates with lateweave or with the other stages. Every stage result says
 when the index it read last committed; a search ranks only the documents every
-stage holds and reports the oldest of those commits as `as_of`, optionally
-refusing to answer from anything older than `max_lag`. The reranker is
-optional: without one, gather scores rank.
+stage holds and reports the oldest of those commits as `as_of`. The reranker
+is optional: without one, gather scores rank.
 
 The package supplies:
 
@@ -59,7 +58,6 @@ lateweave = { git = "https://github.com/pau-mensa/lateweave" }
 
 ```rust
 use std::sync::Arc;
-use std::time::Duration;
 use lateweave::{
     Feature, MaxSimReranker, MultiVectorSource, Query, SearchPipeline, SearchRequest,
     TokenMatrix, VectorStore, DEFAULT_FEATURE,
@@ -77,8 +75,8 @@ let query = Query::new("prescripción de una deuda tributaria").with_feature(
         TokenMatrix::new(encode(&text), dimension)
     }),
 );
-let request = SearchRequest::new(500, 100).with_max_lag(Duration::from_secs(60));
-let result = pipeline.search(&query, &request)?;
+let result = pipeline.search(&query, &SearchRequest::new(500, 100))?;
+println!("reflects every write committed before {:?}", result.as_of);
 for document in &result.documents {
     println!("{} {:?} {}", document.rank, document.key, document.score);
 }
@@ -196,19 +194,20 @@ needs nothing from whoever moves them beyond what every stage reports:
   `diagnostics["dropped"]`. So a delete is served as soon as *any* index
   applies it, and an insert once *all* of them have.
 - `result.as_of` is the oldest commit among the indexes the search read: every
-  write committed to all of them before it is reflected in the result.
-- `max_lag` turns that into a guarantee: the search raises `StaleError` rather
-  than answer from indexes older than it.
+  write committed to all of them before it is reflected in the result. What
+  to do with an answer older than a service tolerates, whether to fail, warn,
+  or serve it anyway, is the service's policy:
 
 ```python
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
-result = pipeline.search(query, gather_limit=500, limit=100, max_lag=timedelta(minutes=1))
-result.as_of, result.diagnostics["dropped"]
+result = pipeline.search(query, gather_limit=500, limit=100)
+if datetime.now(timezone.utc) - result.as_of > timedelta(minutes=1):
+    ...
 ```
 
-An index that is idle still has to say it is current, or it ages past any
-`max_lag`: a writer commits periodically even with nothing to write, as
+An index that is idle still has to say it is current, or it looks older than
+it is: a writer commits periodically even with nothing to write, as
 `VectorStoreWriter.commit()` does.
 
 ## Implementing a reranker or a source

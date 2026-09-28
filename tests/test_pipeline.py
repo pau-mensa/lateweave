@@ -15,7 +15,6 @@ from lateweave import (
     ResourceBudget,
     Scored,
     SearchPipeline,
-    StaleError,
     maxsim_scores_packed,
 )
 
@@ -108,14 +107,6 @@ def test_the_result_is_as_fresh_as_its_oldest_stage() -> None:
         vector_query(), gather_limit=3, limit=1
     )
     assert result.as_of == older
-
-
-def test_max_lag_refuses_indexes_older_than_it() -> None:
-    gatherer = TextGatherer(as_of=datetime.now(timezone.utc) - timedelta(minutes=2))
-    pipeline = SearchPipeline(gatherer)
-    assert ids(pipeline.search("query", gather_limit=3, limit=1, max_lag=timedelta(minutes=5))) == ["z"]
-    with pytest.raises(StaleError, match="allowed"):
-        pipeline.search("query", gather_limit=3, limit=1, max_lag=timedelta(minutes=1))
 
 
 def test_without_a_reranker_gather_scores_rank_with_gather_rank_tie_break() -> None:

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
@@ -9,7 +9,6 @@ from .representation import Representation
 
 class IncompatibleIndexError(ValueError): ...
 class IncompatibleQueryError(ValueError): ...
-class StaleError(RuntimeError): ...
 
 class Feature:
     def __init__(
@@ -127,7 +126,6 @@ class SearchPipeline:
         limit: int,
         subset: Mapping[str, Iterable[str]] | None = None,
         budget: ResourceBudget | None = None,
-        max_lag: timedelta | None = None,
     ) -> SearchResult: ...
 
 class MaxSimReranker:

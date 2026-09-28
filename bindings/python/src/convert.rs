@@ -22,18 +22,11 @@ create_exception!(
     PyValueError,
     "A query lacks a feature a stage needs, or supplies it from another encoder."
 );
-create_exception!(
-    lateweave,
-    StaleError,
-    PyRuntimeError,
-    "The indexes a search read reflect writes older than the request allows."
-);
 
 pub(crate) fn to_py(error: Error) -> PyErr {
     match error {
         Error::IncompatibleIndex(message) => IncompatibleIndexError::new_err(message),
         Error::IncompatibleQuery(message) => IncompatibleQueryError::new_err(message),
-        error @ Error::Stale { .. } => StaleError::new_err(error.to_string()),
         Error::Io(error) => error.into(),
         Error::External(error) => match error.downcast::<PyErr>() {
             Ok(error) => *error,

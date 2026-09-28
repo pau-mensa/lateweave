@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use lateweave::{
     Candidate, CandidateGenerator, DocumentKey, Encoding, Feature, Gathered, MaxSimReranker,
@@ -102,9 +102,7 @@ fn main() -> Result<()> {
             TokenMatrix::new(unit(1).to_vec(), DIMENSION)
         }),
     );
-    let request = SearchRequest::new(10, 2)
-        .with_budget(ResourceBudget::new(4096, 64, Some(1))?)
-        .with_max_lag(Duration::from_secs(60));
+    let request = SearchRequest::new(10, 2).with_budget(ResourceBudget::new(4096, 64, Some(1))?);
 
     let print = |label: &str| -> Result<()> {
         let result = pipeline.search(&query, &request)?;

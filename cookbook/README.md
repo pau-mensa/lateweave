@@ -105,8 +105,7 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py search \
   --query "prescripción de una deuda tributaria" \
   --query-embeddings var/query.npy \
   --gather-limit 500 \
-  --limit 100 \
-  --max-lag-seconds 60
+  --limit 100
 ```
 
 Without `--query-embeddings` the search is gather-only and BM25 scores rank.
@@ -114,7 +113,6 @@ With them, only BM25 candidates are fetched from the store and scored by the
 CPU MaxSim kernel; a candidate the store does not hold yet, or no longer, is
 dropped and counted in `diagnostics.dropped`. `--subset-id ID` (repeatable)
 restricts the search to those documents; the gatherer honours it through
-bm25s's weight mask. `--max-lag-seconds` fails the search rather than answer
-from an index whose last commit is older. A long-running server built the same
-way, as `LexicalCandidateGenerator` plus `VectorStore`, serves each commit on
+bm25s's weight mask. The output's `as_of` is the older of the two indexes'
+commits. A long-running server built the same way, as `LexicalCandidateGenerator` plus `VectorStore`, serves each commit on
 its next search.

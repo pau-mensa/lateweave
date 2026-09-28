@@ -8,7 +8,6 @@ import sys
 import numpy as np
 import pytest
 
-from lateweave import StaleError
 
 
 SCRIPT = Path(__file__).parents[1] / "cookbook" / "bm25_stored_maxsim.py"
@@ -264,11 +263,12 @@ def test_search_subset_restricts_by_document_id(tmp_path: Path, capsys) -> None:
     assert [row["document_id"] for row in output["results"]] == ["law-4"]
 
 
-def test_search_refuses_indexes_older_than_max_lag(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
+def test_search_reports_the_older_commit_of_the_two_indexes(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
     index = build_corpus(tmp_path)
-    assert result_ids(search(index, capsys, "--query", "concesión", "--max-lag-seconds", "600"))
-    with pytest.raises(StaleError):
-        search(index, capsys, "--query", "concesión", "--max-lag-seconds", "0")
+    output = search(index, capsys, "--query", "concesión", "--query-embeddings", query_embeddings(tmp_path))
+    store = cookbook.VectorStore(index / cookbook.VECTOR_DIRECTORY).view().as_of
+    lexical = open_gatherer(index).current().committed_at
+    assert cookbook.datetime.fromisoformat(output["as_of"]) == min(store, lexical)
 
 
 def test_search_refuses_embeddings_of_the_wrong_dimension(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]

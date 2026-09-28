@@ -20,7 +20,6 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "IncompatibleQueryError",
         py.get_type::<convert::IncompatibleQueryError>(),
     )?;
-    module.add("StaleError", py.get_type::<convert::StaleError>())?;
     module.add_class::<query::PyFeature>()?;
     module.add_class::<query::PyQuery>()?;
     module.add_class::<stages::PyCandidate>()?;

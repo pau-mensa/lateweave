@@ -39,7 +39,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import fcntl
 import json
 from pathlib import Path
@@ -396,7 +396,6 @@ def search_index(args: argparse.Namespace) -> None:
             max_documents_per_batch=args.max_documents_per_batch,
             threads=args.threads,
         ),
-        max_lag=None if args.max_lag_seconds is None else timedelta(seconds=args.max_lag_seconds),
     )
     output = {
         "results": [
@@ -470,7 +469,6 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--limit", type=int, default=100)
     search.add_argument("--max-batch-tokens", type=int, default=131_072)
     search.add_argument("--max-documents-per-batch", type=int, default=256)
-    search.add_argument("--max-lag-seconds", type=float, help="fail rather than answer from older indexes")
     search.add_argument("--threads", type=int)
     search.set_defaults(function=search_index)
     return value

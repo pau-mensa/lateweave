@@ -129,9 +129,9 @@ corpus, and asks nothing of whoever maintains them:
   recalled from whatever text the gatherer indexed and scored on whatever the
   reranker holds, both of that document.
 - `SearchResult.as_of` is the oldest `as_of` among the stages: every write
-  committed to every index before it is reflected in the result.
-- `SearchRequest.max_lag` makes that a guarantee: a search whose `as_of` is
-  older fails with `Error::Stale` instead of answering.
+  committed to every index before it is reflected in the result. What an
+  answer that old means, a failure, a warning, or nothing, is the caller's
+  policy.
 
 There is no snapshot to agree on, so there is nothing to wait for, pin, or
 detect as stale beyond `as_of`: a pipeline is built without looking at any
@@ -142,7 +142,7 @@ dropped count says how many.
 
 The price is that `as_of` must be honest: it is the commit time of the state
 read, not the time a stage reloaded it, and an idle index has to keep
-committing to stay within a `max_lag`.
+committing so that its age stays true.
 
 ## Multi-vector sources
 

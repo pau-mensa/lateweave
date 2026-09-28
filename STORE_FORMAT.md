@@ -99,7 +99,6 @@ garbage, such as one a writer left staged when it stopped before committing;
 the next writer may remove or overwrite it.
 
 A writer should commit periodically even when it has nothing to write:
-`committed_at` is how readers know the store is current, and a search with a
-maximum lag refuses a store that has not committed within it.
+`committed_at` is how readers know the store is current.
 
 One writer writes a store at a time.

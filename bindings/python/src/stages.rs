@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use lateweave::{
     Candidate, CandidateGenerator, DocumentKey, Gathered, MaxSimReranker, MultiVectorSource,
@@ -651,10 +651,8 @@ impl PySearchPipeline {
     }
 
     /// ``query`` is a ``Query`` or plain text; ``subset`` maps corpora to the
-    /// document IDs the search is restricted to; ``max_lag`` refuses results
-    /// from indexes whose last commit is older.
-    #[pyo3(signature = (query, *, gather_limit, limit, subset=None, budget=None, max_lag=None))]
-    #[allow(clippy::too_many_arguments)]
+    /// document IDs the search is restricted to.
+    #[pyo3(signature = (query, *, gather_limit, limit, subset=None, budget=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -663,7 +661,6 @@ impl PySearchPipeline {
         limit: i64,
         subset: Option<&Bound<'_, PyAny>>,
         budget: Option<&Bound<'_, PyResourceBudget>>,
-        max_lag: Option<Duration>,
     ) -> PyResult<PySearchResult> {
         let query = PyQuery::from_python(query)?;
         let subset = subset.map(subset_from_py).transpose()?;
@@ -674,7 +671,6 @@ impl PySearchPipeline {
             limit: usize::try_from(limit).unwrap_or(0),
             subset: subset.as_ref(),
             budget: budget.map_or_else(ResourceBudget::default, |budget| budget.get().inner),
-            max_lag,
         };
         let result = py
             .detach(|| self.inner.search(&query, &request))

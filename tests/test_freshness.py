@@ -3,7 +3,7 @@ own pace, and knows how fresh every answer is."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -11,7 +11,6 @@ import sys
 import time
 
 import numpy as np
-import pytest
 
 from lateweave import (
     Candidate,
@@ -21,7 +20,6 @@ from lateweave import (
     Query,
     Representation,
     SearchPipeline,
-    StaleError,
     VectorStore,
     VectorStoreWriter,
 )
@@ -78,7 +76,7 @@ def test_a_delete_is_served_once_either_index_applies_it(tmp_path: Path) -> None
     query = Query("q", multi_vector=Feature(REPRESENTATION, VECTORS[1:2]))
 
     def search():  # type: ignore[no-untyped-def]
-        return pipeline.search(query, gather_limit=8, limit=2, max_lag=timedelta(minutes=1))
+        return pipeline.search(query, gather_limit=8, limit=2)
 
     assert ids(search())[0] == "d1"
 
@@ -109,18 +107,16 @@ def test_an_insert_is_served_once_every_index_has_it(tmp_path: Path) -> None:
     assert ids(pipeline.search(query, gather_limit=8, limit=2)) == ["d1", "d0"]
 
 
-def test_an_idle_writer_keeps_the_answer_fresh_by_committing(tmp_path: Path) -> None:
+def test_the_answer_is_as_fresh_as_the_older_index_and_an_idle_writer_advances_it(tmp_path: Path) -> None:
     writer = VectorStoreWriter.create(tmp_path / "vectors", "docs", REPRESENTATION)
     writer.append(["d0"], VECTORS[:1], [1])
     first = writer.commit()
-    time.sleep(0.5)
+    time.sleep(0.01)
     publish_index(tmp_path / "lexical.json", ["d0"])
     pipeline = SearchPipeline(LexicalIndex(tmp_path / "lexical.json"), MaxSimReranker([VectorStore(tmp_path / "vectors")]))
     query = Query("q", multi_vector=Feature(REPRESENTATION, VECTORS[:1]))
-    max_lag = timedelta(seconds=0.3)
 
-    with pytest.raises(StaleError):
-        pipeline.search(query, gather_limit=1, limit=1, max_lag=max_lag)
-    writer.commit()
-    result = pipeline.search(query, gather_limit=1, limit=1, max_lag=max_lag)
-    assert ids(result) == ["d0"] and result.as_of > first
+    assert pipeline.search(query, gather_limit=1, limit=1).as_of == first
+    heartbeat = writer.commit()
+    result = pipeline.search(query, gather_limit=1, limit=1)
+    assert ids(result) == ["d0"] and first < result.as_of < heartbeat
