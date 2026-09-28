@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import pytest
 
-from lateweave import CorpusManifest
+from lateweave import CorpusManifest, IncompatibleIndexError, Segment
 
 
 SCRIPT = Path(__file__).parents[1] / "cookbook" / "bm25_stored_maxsim.py"
@@ -111,14 +111,17 @@ def build_corpus(tmp_path: Path, documents=DOCUMENTS, stemmer: str | None = None
 def open_gatherer(index: Path) -> "cookbook.LexicalCandidateGenerator":
     return cookbook.LexicalCandidateGenerator.open(
         index / cookbook.LEXICAL_DIRECTORY,
-        CorpusManifest.read(index / cookbook.CORPUS_MANIFEST),
+        cookbook.read_segment(index),
         cookbook.Analyzer.read(index / cookbook.ANALYZER_FILE),
     )
 
 
 def gathered_ids(index: Path, query: str, limit: int = 10, subset=None) -> list[int]:
     """Internal IDs a query reaches, sorted; gather itself ranks by score."""
-    candidates = open_gatherer(index).gather(cookbook.Query(query), limit, subset=subset)
+    gatherer = open_gatherer(index)
+    if subset is not None:
+        subset = {gatherer.segment.corpus_id: np.asarray(subset, dtype=np.int64)}
+    candidates = gatherer.gather(cookbook.Query(query), limit, subset=subset)
     return sorted(candidate.document_id for candidate in candidates)
 
 
@@ -139,6 +142,7 @@ def test_build_writes_a_lexical_index_that_gathers_only_matching_documents(tmp_p
 def test_gather_labels_candidates_with_dense_score_ordered_ranks(tmp_path: Path) -> None:
     candidates = open_gatherer(build_corpus(tmp_path)).gather(cookbook.Query("concesión"), 10)
     assert {candidate.provenance for candidate in candidates} == {"bm25s"}
+    assert {candidate.external_id for candidate in candidates} == {"law-1", "law-4"}
     assert [candidate.gather_rank for candidate in candidates] == list(range(len(candidates)))
     scores = [candidate.gather_score for candidate in candidates]
     assert scores == sorted(scores, reverse=True)
@@ -146,8 +150,8 @@ def test_gather_labels_candidates_with_dense_score_ordered_ranks(tmp_path: Path)
 
 def test_gather_honours_a_subset(tmp_path: Path) -> None:
     index = build_corpus(tmp_path)
-    assert gathered_ids(index, "concesión", subset=np.asarray([3], dtype=np.int64)) == [3]
-    assert gathered_ids(index, "concesión", subset=np.asarray([1], dtype=np.int64)) == []
+    assert gathered_ids(index, "concesión", subset=[3]) == [3]
+    assert gathered_ids(index, "concesión", subset=[1]) == []
 
 
 def test_a_stemmed_index_matches_inflected_queries(tmp_path: Path) -> None:
@@ -169,6 +173,7 @@ def test_update_appends_and_carries_the_analyzer_forward(tmp_path: Path) -> None
     )
     manifest = CorpusManifest.read(index / cookbook.CORPUS_MANIFEST)
     assert (manifest.document_count, manifest.generation) == (5, 1)
+    assert cookbook.open_vector_store(index / cookbook.VECTOR_DIRECTORY).segment == cookbook.read_segment(index)
     assert gathered_ids(index, "concesion") == [0, 3, 4]
     assert gathered_ids(index, "aguas") == [4]
 
@@ -182,17 +187,29 @@ def test_delete_compacts_internal_ids_in_document_order(tmp_path: Path) -> None:
     assert gathered_ids(index, "concesión") == [0, 2]
     assert gathered_ids(index, "inscripción") == []
     assert CorpusManifest.read(index / cookbook.CORPUS_MANIFEST).generation == 1
+    store = cookbook.open_vector_store(index / cookbook.VECTOR_DIRECTORY)
+    assert store.segment.document_ids == ["law-1", "law-3", "law-4"]
+    assert store.segment == cookbook.read_segment(index)
 
 
 def test_gatherer_refuses_an_index_whose_size_disagrees(tmp_path: Path) -> None:
     index = build_corpus(tmp_path)
-    manifest = CorpusManifest.read(index / cookbook.CORPUS_MANIFEST)
-    with pytest.raises(RuntimeError, match="documents but the manifest"):
+    with pytest.raises(RuntimeError, match="documents but the segment"):
         cookbook.LexicalCandidateGenerator.open(
             index / cookbook.LEXICAL_DIRECTORY,
-            CorpusManifest("laws", "1", 99, manifest.document_ids_sha256),
+            Segment("laws", "1", [str(item) for item in range(99)]),
             cookbook.Analyzer(),
         )
+
+
+def test_search_refuses_a_store_at_another_generation(tmp_path: Path, capsys) -> None:
+    index = build_corpus(tmp_path)
+    query_path = tmp_path / "query.npy"
+    np.save(query_path, unit_vectors(2, seed=7))
+    # Mutate the store alone, as a crash between the two stages' updates would.
+    cookbook.open_vector_store(index / cookbook.VECTOR_DIRECTORY).delete(["law-2"])
+    with pytest.raises(IncompatibleIndexError, match="generation"):
+        search(index, capsys, "--query", "concesión", "--query-embeddings", str(query_path))
 
 
 @pytest.mark.parametrize("storage", ["float32", "int8"])

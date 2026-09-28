@@ -58,16 +58,16 @@ DEADLOCK_PROBE = """
 import threading, time
 import numpy as np
 from lateweave import (
-    Candidate, CorpusManifest, Feature, MaxSimReranker, Query, Representation, SearchPipeline,
+    Candidate, Feature, MaxSimReranker, Query, Representation, SearchPipeline, Segment,
 )
 
 representation = Representation("encoder", "1", 2, True)
-corpus = CorpusManifest("corpus", "1", 2, "abc")
+segment = Segment("corpus", "1", ["a", "b"])
 
 class Source:
     representation = representation
     score_semantics = "in-memory"
-    document_count = 2
+    segment = segment
     def document_lengths(self, document_ids):
         return {item: 1 for item in document_ids}
     def fetch(self, document_ids, *, threads=None):
@@ -75,18 +75,18 @@ class Source:
         return rows, np.ones(len(document_ids), dtype=np.int64)
 
 class Gatherer:
-    corpus = corpus
+    segments = (segment,)
     requires = {}
     score_semantics = "gather"
     def gather(self, query, limit, *, subset=None):
-        return (Candidate(0, 1.0, 0, "t"), Candidate(1, 1.0, 1, "t"))
+        return (Candidate(segment, 0, 1.0, 0, "t"), Candidate(segment, 1, 1.0, 1, "t"))
 
 def encode():
     time.sleep(0.3)
     return np.asarray([[0.0, 1.0]], dtype=np.float32)
 
 query = Query("query", multi_vector=Feature(representation, provider=encode))
-pipeline = SearchPipeline(Gatherer(), MaxSimReranker(Source(), corpus))
+pipeline = SearchPipeline(Gatherer(), MaxSimReranker([Source()]))
 search = threading.Thread(target=lambda: pipeline.search(query, gather_limit=2, limit=2))
 search.start()
 time.sleep(0.05)

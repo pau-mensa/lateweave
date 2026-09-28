@@ -4,6 +4,7 @@
 
 mod convert;
 mod query;
+mod segment;
 mod stages;
 mod storage;
 
@@ -20,10 +21,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "IncompatibleQueryError",
         py.get_type::<convert::IncompatibleQueryError>(),
     )?;
+    module.add_class::<segment::PySegment>()?;
     module.add_class::<query::PyFeature>()?;
     module.add_class::<query::PyQuery>()?;
     module.add_class::<stages::PyCandidate>()?;
-    module.add_class::<stages::PyScore>()?;
     module.add_class::<stages::PyResourceBudget>()?;
     module.add_class::<stages::PyMaxSimReranker>()?;
     module.add_class::<stages::PyRankedDocument>()?;
@@ -33,6 +34,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<storage::PyVectorStore>()?;
     module.add_class::<storage::PyFloat32VectorStore>()?;
     module.add_class::<storage::PyInt8VectorStore>()?;
+    module.add_class::<storage::PyStoreSnapshot>()?;
     module.add_function(wrap_pyfunction!(storage::open_vector_store, module)?)?;
     module.add_function(wrap_pyfunction!(storage::maxsim_scores_packed, module)?)?;
     module.add_function(wrap_pyfunction!(convert::document_ids_digest, module)?)?;

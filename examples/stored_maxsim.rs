@@ -9,23 +9,23 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use lateweave::{
-    document_ids_digest, Candidate, CandidateGenerator, CorpusManifest, Feature, MaxSimReranker,
-    Query, Representation, Requirements, ResourceBudget, Result, SearchPipeline, SearchRequest,
-    StoreFormat, TokenMatrix, VectorStore, DEFAULT_FEATURE,
+    Candidate, CandidateGenerator, Feature, MaxSimReranker, MultiVectorSource, Query,
+    Representation, Requirements, ResourceBudget, Result, SearchPipeline, SearchRequest, Segment,
+    StoreFormat, Subset, TokenMatrix, VectorStore, DEFAULT_FEATURE,
 };
 
 const DIMENSION: usize = 4;
 
 /// Gathers every document containing a query term, scored by match count.
 struct TermGatherer {
-    corpus: CorpusManifest,
+    segments: [Segment; 1],
     requires: Requirements,
     documents: Vec<&'static str>,
 }
 
 impl CandidateGenerator for TermGatherer {
-    fn corpus(&self) -> &CorpusManifest {
-        &self.corpus
+    fn segments(&self) -> &[Segment] {
+        &self.segments
     }
 
     fn requires(&self) -> &Requirements {
@@ -40,8 +40,10 @@ impl CandidateGenerator for TermGatherer {
         &self,
         query: &Query,
         limit: usize,
-        subset: Option<&[u64]>,
+        subset: Option<&Subset>,
     ) -> Result<Vec<Candidate>> {
+        let [segment] = &self.segments;
+        let allowed = subset.map(|subset| subset.ids(segment.corpus_id()));
         let terms = query.text().split_whitespace().collect::<Vec<_>>();
         let mut matches = self
             .documents
@@ -49,7 +51,7 @@ impl CandidateGenerator for TermGatherer {
             .enumerate()
             .map(|(document_id, text)| (document_id as u64, text))
             .filter(|(document_id, _)| {
-                subset.map_or(true, |subset| subset.binary_search(document_id).is_ok())
+                allowed.map_or(true, |allowed| allowed.binary_search(document_id).is_ok())
             })
             .map(|(document_id, text)| {
                 let count = text
@@ -66,6 +68,7 @@ impl CandidateGenerator for TermGatherer {
             .take(limit)
             .enumerate()
             .map(|(rank, (document_id, gather_score))| Candidate {
+                segment: segment.clone(),
                 document_id,
                 gather_score,
                 gather_rank: rank,
@@ -83,33 +86,30 @@ fn unit(axis: usize) -> [f32; DIMENSION] {
 
 fn main() -> Result<()> {
     let documents = vec!["red apple", "green apple", "red car"];
-    let corpus = CorpusManifest::new(
-        "fruit",
-        "1",
-        documents.len() as u64,
-        document_ids_digest(["a", "b", "c"]),
-    )?;
+    let segment = Segment::new("fruit", "1", 0, ["a", "b", "c"])?;
     let representation = Representation::new("toy-encoder", "1", DIMENSION, true)?;
 
     // One token per word; the axis stands in for what a real encoder produces.
     let embeddings = [unit(0), unit(2), unit(1), unit(2), unit(0), unit(3)].concat();
     let directory = std::env::temp_dir().join(format!("lateweave-example-{}", std::process::id()));
-    let store = Arc::new(VectorStore::create(
+    let store = VectorStore::create(
         directory.join("vectors"),
         StoreFormat::Float32,
+        &segment,
         &embeddings,
         DIMENSION,
         &[2, 2, 2],
         representation.clone(),
         None,
-    )?);
+    )?;
 
     let gatherer = TermGatherer {
-        corpus: corpus.clone(),
+        segments: [segment],
         requires: BTreeMap::new(),
         documents,
     };
-    let reranker = MaxSimReranker::new(store, corpus, DEFAULT_FEATURE)?;
+    let snapshot: Arc<dyn MultiVectorSource> = store.snapshot();
+    let reranker = MaxSimReranker::new([snapshot], DEFAULT_FEATURE)?;
     let pipeline = SearchPipeline::new(Arc::new(gatherer), Some(Arc::new(reranker)))?;
 
     let query = Query::new("apple").with_feature(
@@ -125,8 +125,11 @@ fn main() -> Result<()> {
 
     for document in &result.documents {
         println!(
-            "#{} document {} score {}",
-            document.rank, document.document_id, document.score
+            "#{} document {} ({}) score {}",
+            document.rank,
+            document.document_id,
+            document.external_id().unwrap_or("?"),
+            document.score
         );
     }
     println!("{:?}", result.diagnostics);

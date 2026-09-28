@@ -1,10 +1,8 @@
-//! Deterministic ranking and the reranker-output contract it enforces.
-
-use std::collections::{HashMap, HashSet};
+//! Deterministic ranking and the score contract it enforces.
 
 use thiserror::Error;
 
-use crate::stage::{Candidate, Score};
+use crate::stage::Candidate;
 
 /// Reject non-finite inputs without the per-element branch that stops the
 /// autovectorizer.  A float is non-finite exactly when its exponent bits are
@@ -23,64 +21,39 @@ pub fn all_finite(values: &[f32]) -> bool {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RankingError {
-    #[error("candidate document ID {0} occurs more than once")]
-    DuplicateCandidate(u64),
-    #[error("score document ID {0} occurs more than once")]
-    DuplicateScore(u64),
-    #[error("reranker omitted candidate document ID {0}")]
-    MissingScore(u64),
-    #[error("reranker returned document ID {0}, which was not a candidate")]
-    UnexpectedScore(u64),
-    #[error("score for document ID {0} is NaN")]
-    NanScore(u64),
+    #[error("{scores} scores were returned for {candidates} candidates")]
+    ScoreCount { candidates: usize, scores: usize },
+    #[error("the score of candidate {0} is NaN")]
+    NanScore(usize),
 }
 
-/// Validate the reranker contract and return score positions in final rank order.
+/// Validate one score per candidate and return candidate positions in final
+/// rank order.
 ///
-/// Ties are stable by the original gather rank and then document ID. Gather
-/// scores never participate in final ranking.
+/// `scores[i]` scores `candidates[i]`. Ties keep gather order, which is total
+/// because gather ranks are the candidates' positions. Gather scores never
+/// participate unless they are the scores.
 pub fn validate_and_rank(
     candidates: &[Candidate],
-    scores: &[Score],
+    scores: &[f32],
     limit: usize,
 ) -> Result<Vec<usize>, RankingError> {
-    let mut rank_by_id = HashMap::with_capacity(candidates.len());
-    for candidate in candidates {
-        if rank_by_id
-            .insert(candidate.document_id, candidate.gather_rank)
-            .is_some()
-        {
-            return Err(RankingError::DuplicateCandidate(candidate.document_id));
-        }
+    if scores.len() != candidates.len() {
+        return Err(RankingError::ScoreCount {
+            candidates: candidates.len(),
+            scores: scores.len(),
+        });
     }
-
-    let mut score_set = HashSet::with_capacity(scores.len());
-    for score in scores {
-        if !score_set.insert(score.document_id) {
-            return Err(RankingError::DuplicateScore(score.document_id));
-        }
-        if !rank_by_id.contains_key(&score.document_id) {
-            return Err(RankingError::UnexpectedScore(score.document_id));
-        }
-        if score.value.is_nan() {
-            return Err(RankingError::NanScore(score.document_id));
-        }
+    if let Some(position) = scores.iter().position(|score| score.is_nan()) {
+        return Err(RankingError::NanScore(position));
     }
-
-    for candidate in candidates {
-        if !score_set.contains(&candidate.document_id) {
-            return Err(RankingError::MissingScore(candidate.document_id));
-        }
-    }
-
     let mut positions = (0..scores.len()).collect::<Vec<_>>();
     positions.sort_unstable_by(|&left, &right| {
-        let (left, right) = (&scores[left], &scores[right]);
-        right
-            .value
-            .total_cmp(&left.value)
-            .then_with(|| rank_by_id[&left.document_id].cmp(&rank_by_id[&right.document_id]))
-            .then_with(|| left.document_id.cmp(&right.document_id))
+        scores[right].total_cmp(&scores[left]).then_with(|| {
+            candidates[left]
+                .gather_rank
+                .cmp(&candidates[right].gather_rank)
+        })
     });
     positions.truncate(limit.min(positions.len()));
     Ok(positions)
@@ -89,12 +62,14 @@ pub fn validate_and_rank(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::Segment;
 
-    fn candidates(ids: &[u64]) -> Vec<Candidate> {
-        ids.iter()
-            .enumerate()
-            .map(|(rank, &document_id)| Candidate {
-                document_id,
+    fn candidates(count: usize) -> Vec<Candidate> {
+        let segment = Segment::new("docs", "1", 0, (0..count).map(|id| id.to_string())).unwrap();
+        (0..count)
+            .map(|rank| Candidate {
+                segment: segment.clone(),
+                document_id: rank as u64,
                 gather_score: 0.0,
                 gather_rank: rank,
                 provenance: "test".to_string(),
@@ -102,26 +77,28 @@ mod tests {
             .collect()
     }
 
-    fn scores(rows: &[(u64, f32)]) -> Vec<Score> {
-        rows.iter()
-            .map(|&(document_id, value)| Score { document_id, value })
-            .collect()
-    }
-
     #[test]
     fn ranking_uses_gather_order_only_as_a_tie_breaker() {
-        let order = validate_and_rank(
-            &candidates(&[9, 5, 7]),
-            &scores(&[(5, 2.0), (7, 3.0), (9, 2.0)]),
-            3,
-        )
-        .unwrap();
-        assert_eq!(order, vec![1, 2, 0]);
+        let order = validate_and_rank(&candidates(3), &[2.0, 3.0, 2.0], 3).unwrap();
+        assert_eq!(order, vec![1, 0, 2]);
+        assert_eq!(
+            validate_and_rank(&candidates(3), &[2.0, 3.0, 2.0], 1).unwrap(),
+            vec![1]
+        );
     }
 
     #[test]
-    fn ranking_rejects_a_reranker_that_changes_the_candidate_set() {
-        let error = validate_and_rank(&candidates(&[1]), &scores(&[(2, 1.0)]), 1).unwrap_err();
-        assert_eq!(error, RankingError::UnexpectedScore(2));
+    fn ranking_requires_one_score_per_candidate() {
+        assert_eq!(
+            validate_and_rank(&candidates(2), &[1.0], 2).unwrap_err(),
+            RankingError::ScoreCount {
+                candidates: 2,
+                scores: 1
+            }
+        );
+        assert_eq!(
+            validate_and_rank(&candidates(2), &[1.0, f32::NAN], 2).unwrap_err(),
+            RankingError::NanScore(1)
+        );
     }
 }

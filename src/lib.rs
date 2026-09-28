@@ -5,11 +5,13 @@
 //! ```
 //!
 //! A [`Query`] is raw text plus named [`Feature`]s, each stamped with the
-//! [`Representation`] that produced it. Stages declare the features they
-//! consume and the [`CorpusManifest`] they index; [`SearchPipeline`] checks
-//! both identities before any stage runs, enforces the stage contracts, and
-//! ranks deterministically. [`MaxSimReranker`] scores any
-//! [`MultiVectorSource`], including the memory-mapped [`VectorStore`].
+//! [`Representation`] that produced it. A document is an internal ID of a
+//! [`Segment`], an immutable snapshot of one corpus; a gatherer searches one
+//! or more segments and a reranker must hold the same snapshot of each.
+//! [`SearchPipeline`] checks both identities before any stage runs, enforces
+//! the stage contracts, and ranks deterministically. [`MaxSimReranker`]
+//! scores [`MultiVectorSource`]s, one per segment, including snapshots of the
+//! memory-mapped [`VectorStore`].
 
 #[cfg(target_os = "macos")]
 extern crate blas_src;
@@ -21,6 +23,7 @@ mod maxsim;
 mod pipeline;
 mod query;
 mod ranking;
+mod segment;
 mod source;
 mod stage;
 mod storage;
@@ -35,6 +38,7 @@ pub use pipeline::{
 };
 pub use query::{Feature, FeatureValue, Query, TokenMatrix};
 pub use ranking::RankingError;
+pub use segment::Segment;
 pub use source::{MultiVectorSource, PackedDocuments};
-pub use stage::{Candidate, CandidateGenerator, Requirements, Reranker, ResourceBudget, Score};
-pub use storage::{StoreFormat, VectorStore, METADATA_FILE, OFFSETS_FILE};
+pub use stage::{Candidate, CandidateGenerator, Requirements, Reranker, ResourceBudget, Subset};
+pub use storage::{StoreFormat, StoreSnapshot, VectorStore, METADATA_FILE};

@@ -16,14 +16,17 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py --help
 
 ```text
 index/
-  corpus-manifest.json   CorpusManifest: which documents, which generation
+  corpus-manifest.json   CorpusManifest of the segment: which documents, which generation
   analyzer.json          lexical analysis chain, read back on every command
   documents.jsonl        external ID and text, in internal-ID order
   bm25/                  bm25s index
-  vectors/               lateweave store; carries its Representation
+  vectors/               lateweave store; carries its Representation and segment
 ```
 
-The corpus manifest is the one identity both stages share. The store's
+Both stages index one segment: the external IDs of `documents.jsonl` at the
+generation `corpus-manifest.json` records, checked against each other on every
+command. The store keeps its own copy of the segment, so a search pairing the
+lexical index with a store at another generation is refused. The store's
 representation is what a query's embeddings are checked against.
 
 ## The lexical stage
@@ -90,7 +93,9 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py delete \
 Existing external IDs are rejected on append. After a delete, remaining
 documents are renumbered 0..n-1 in document order. The lexical index has no
 incremental path, so both commands rebuild it from `documents.jsonl`; the store
-appends or compacts in place. Each mutation advances the corpus generation.
+publishes its next generation from external IDs, and the command checks that
+the store's new segment is the one the documents file now describes. Each
+mutation advances the segment's generation.
 
 Build, append, and delete publish copy-on-write directory replacements while a
 file lock excludes readers, so a failure cannot expose a BM25 generation paired
@@ -111,3 +116,4 @@ Without `--query-embeddings` the search is gather-only and BM25 scores rank.
 With them, only BM25 candidates are fetched from the store and scored by the
 CPU MaxSim kernel. `--subset-id EXTERNAL_ID` (repeatable) restricts the search
 to those documents; the gatherer honours it through bm25s's weight mask.
+Results carry each document's external ID from the segment.

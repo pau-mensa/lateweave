@@ -2,13 +2,14 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use lateweave::{StoreFormat, VectorStore};
+use lateweave::{StoreFormat, StoreSnapshot, VectorStore};
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
 use crate::convert::{representation, representation_to_py, row_major_borrowed, to_py};
+use crate::segment::{document_ids, PySegment};
 use crate::stages::lengths;
 
 /// Any float32 matrix, copied only when it is not already C-contiguous.
@@ -57,6 +58,7 @@ fn create(
     py: Python<'_>,
     format: StoreFormat,
     path: PathBuf,
+    segment: &Bound<'_, PySegment>,
     embeddings: PyReadonlyArray2<'_, f32>,
     document_lengths: &Bound<'_, PyAny>,
     representation: &Bound<'_, PyAny>,
@@ -65,11 +67,13 @@ fn create(
     let (values, dimension) = self::embeddings(&embeddings);
     let lengths = lengths(document_lengths)?;
     let representation = self::representation(representation)?;
+    let segment = &segment.get().inner;
     let store = py
         .detach(|| {
             VectorStore::create(
                 &path,
                 format,
+                segment,
                 &values,
                 dimension,
                 &lengths,
@@ -81,7 +85,11 @@ fn create(
     wrap(py, store)
 }
 
-/// Memory-mapped fixed-width token records; a ``MultiVectorSource``.
+/// Memory-mapped fixed-width token records for one segment.
+///
+/// Reads go through ``snapshot()``; each mutation takes external IDs and
+/// returns the snapshot it publishes. Earlier snapshots keep reading their
+/// own generation.
 #[pyclass(name = "VectorStore", subclass, frozen, module = "lateweave._native")]
 pub(crate) struct PyVectorStore {
     pub(crate) inner: Arc<VectorStore>,
@@ -92,6 +100,86 @@ impl PyVectorStore {
     #[getter]
     fn path(&self) -> PathBuf {
         self.inner.path().to_path_buf()
+    }
+
+    #[getter]
+    fn representation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        representation_to_py(py, self.inner.representation())
+    }
+
+    #[getter]
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    /// The live generation's segment.
+    #[getter]
+    fn segment(&self) -> PySegment {
+        self.inner.segment().into()
+    }
+
+    /// The live generation, a ``MultiVectorSource``.
+    fn snapshot(&self) -> PyStoreSnapshot {
+        PyStoreSnapshot {
+            inner: self.inner.snapshot(),
+        }
+    }
+
+    /// Appends documents after the existing ones, in the order of
+    /// ``document_ids``.
+    #[pyo3(signature = (document_ids, embeddings, document_lengths, *, threads=None))]
+    fn append(
+        &self,
+        py: Python<'_>,
+        document_ids: &Bound<'_, PyAny>,
+        embeddings: PyReadonlyArray2<'_, f32>,
+        document_lengths: &Bound<'_, PyAny>,
+        threads: Option<usize>,
+    ) -> PyResult<PyStoreSnapshot> {
+        let document_ids = self::document_ids(document_ids)?;
+        let (values, dimension) = self::embeddings(&embeddings);
+        let lengths = lengths(document_lengths)?;
+        let inner = py
+            .detach(|| {
+                self.inner
+                    .append(document_ids, &values, dimension, &lengths, threads)
+            })
+            .map_err(to_py)?;
+        Ok(PyStoreSnapshot { inner })
+    }
+
+    /// Removes documents by external ID and compacts internal IDs to
+    /// ``0..n-1``, preserving order.
+    fn delete(&self, py: Python<'_>, document_ids: &Bound<'_, PyAny>) -> PyResult<PyStoreSnapshot> {
+        let document_ids = self::document_ids(document_ids)?;
+        let inner = py
+            .detach(|| self.inner.delete(&document_ids))
+            .map_err(to_py)?;
+        Ok(PyStoreSnapshot { inner })
+    }
+}
+
+/// One immutable generation of a vector store; a ``MultiVectorSource``.
+#[pyclass(name = "StoreSnapshot", frozen, module = "lateweave._native")]
+pub(crate) struct PyStoreSnapshot {
+    pub(crate) inner: Arc<StoreSnapshot>,
+}
+
+#[pymethods]
+impl PyStoreSnapshot {
+    #[getter]
+    fn segment(&self) -> PySegment {
+        self.inner.segment().clone().into()
+    }
+
+    #[getter]
+    fn format(&self) -> &'static str {
+        self.inner.format().name()
+    }
+
+    #[getter]
+    fn score_semantics(&self) -> &'static str {
+        self.inner.format().score_semantics()
     }
 
     #[getter]
@@ -146,24 +234,14 @@ impl PyVectorStore {
         PyTuple::new(py, [vectors.into_any(), lengths.into_any()])
     }
 
-    #[pyo3(signature = (embeddings, document_lengths, *, threads=None))]
-    fn append(
-        &self,
-        py: Python<'_>,
-        embeddings: PyReadonlyArray2<'_, f32>,
-        document_lengths: &Bound<'_, PyAny>,
-        threads: Option<usize>,
-    ) -> PyResult<()> {
-        let (values, dimension) = self::embeddings(&embeddings);
-        let lengths = lengths(document_lengths)?;
-        py.detach(|| self.inner.append(&values, dimension, &lengths, threads))
-            .map_err(to_py)
-    }
-
-    /// Removes documents and compacts internal IDs to ``0..n-1``.
-    fn delete(&self, py: Python<'_>, document_ids: Vec<u64>) -> PyResult<()> {
-        py.detach(|| self.inner.delete(&document_ids))
-            .map_err(to_py)
+    fn __repr__(&self) -> String {
+        format!(
+            "StoreSnapshot(segment={:?}, generation={}, documents={}, format={:?})",
+            self.inner.segment().corpus_id(),
+            self.inner.segment().generation(),
+            self.inner.document_count(),
+            self.inner.format().name()
+        )
     }
 }
 
@@ -189,11 +267,13 @@ impl PyFloat32VectorStore {
     }
 
     #[classmethod]
-    #[pyo3(signature = (path, embeddings, document_lengths, representation, *, threads=None))]
+    #[pyo3(signature = (path, segment, embeddings, document_lengths, representation, *, threads=None))]
+    #[allow(clippy::too_many_arguments)]
     fn create(
         _class: &Bound<'_, PyType>,
         py: Python<'_>,
         path: PathBuf,
+        segment: &Bound<'_, PySegment>,
         embeddings: PyReadonlyArray2<'_, f32>,
         document_lengths: &Bound<'_, PyAny>,
         representation: &Bound<'_, PyAny>,
@@ -203,6 +283,7 @@ impl PyFloat32VectorStore {
             py,
             StoreFormat::Float32,
             path,
+            segment,
             embeddings,
             document_lengths,
             representation,
@@ -233,11 +314,13 @@ impl PyInt8VectorStore {
     }
 
     #[classmethod]
-    #[pyo3(signature = (path, embeddings, document_lengths, representation, *, threads=None))]
+    #[pyo3(signature = (path, segment, embeddings, document_lengths, representation, *, threads=None))]
+    #[allow(clippy::too_many_arguments)]
     fn create(
         _class: &Bound<'_, PyType>,
         py: Python<'_>,
         path: PathBuf,
+        segment: &Bound<'_, PySegment>,
         embeddings: PyReadonlyArray2<'_, f32>,
         document_lengths: &Bound<'_, PyAny>,
         representation: &Bound<'_, PyAny>,
@@ -247,6 +330,7 @@ impl PyInt8VectorStore {
             py,
             StoreFormat::Int8,
             path,
+            segment,
             embeddings,
             document_lengths,
             representation,

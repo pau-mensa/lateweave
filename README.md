@@ -9,23 +9,25 @@ Query -> CandidateGenerator -> [Reranker] -> deterministic top-k
 
 A `Query` is raw text plus named features, each stamped with the
 `Representation` (encoder identity) that produced it and materialized at most
-once. A stage declares the features it consumes and the `CorpusManifest`
-(document-set identity) it indexes. Stages must agree on the corpus; each stage
-must agree with the query on the representation of every feature it uses. The
-reranker is optional: without one, gather scores rank.
+once. A document is an internal ID of a `Segment`: an immutable snapshot of one
+corpus, its `CorpusManifest` plus the external IDs its internal IDs name. A
+gatherer searches one or more segments, and a reranker must hold the same
+snapshot of each; each stage must agree with the query on the representation of
+every feature it uses. The reranker is optional: without one, gather scores
+rank.
 
 The package supplies:
 
-- `Query`, `Feature`, `Candidate`, `Score`, `CorpusManifest`, `Representation`;
+- `Query`, `Feature`, `Segment`, `Candidate`, `CorpusManifest`, `Representation`;
 - the `CandidateGenerator`, `Reranker`, and `MultiVectorSource` contracts;
 - `SearchPipeline`: compatibility checks, optional rerank, subset enforcement,
   deterministic ranking, provenance, timings;
-- `MaxSimReranker` over any `MultiVectorSource`, backed by a packed CPU
-  MaxSim kernel (SGEMM, SIMD maximum reduction, bounded token batches, worker
-  pools);
+- `MaxSimReranker` over one `MultiVectorSource` per segment, backed by a packed
+  CPU MaxSim kernel (SGEMM, SIMD maximum reduction, bounded token batches,
+  worker pools);
 - `Float32VectorStore` and `Int8VectorStore` (one `VectorStore` in Rust):
-  memory-mapped multi-vector sources for gatherers, such as BM25, that keep no
-  document vectors.
+  memory-mapped multi-vector stores whose snapshots are sources for gatherers,
+  such as BM25, that keep no document vectors.
 
 All of it is implemented once, in the `lateweave` crate, which builds without
 PyO3 or NumPy. The Python package is a binding over that crate: a Python
@@ -55,21 +57,26 @@ lateweave = { git = "https://github.com/pau-mensa/lateweave" }
 ```rust
 use std::sync::Arc;
 use lateweave::{
-    Feature, MaxSimReranker, Query, SearchPipeline, SearchRequest, TokenMatrix, VectorStore,
-    DEFAULT_FEATURE,
+    Feature, MaxSimReranker, MultiVectorSource, Query, SearchPipeline, SearchRequest,
+    TokenMatrix, VectorStore, DEFAULT_FEATURE,
 };
 
-let store = Arc::new(VectorStore::open("index/vectors")?);
-let reranker = MaxSimReranker::new(store.clone(), corpus.clone(), DEFAULT_FEATURE)?;
-let pipeline = SearchPipeline::new(Arc::new(my_gatherer), Some(Arc::new(reranker)))?;
+let snapshot = VectorStore::open("index/vectors")?.snapshot();
+let gatherer = MyGatherer::open("index/lexical", snapshot.segment().clone())?;
+let source: Arc<dyn MultiVectorSource> = snapshot.clone();
+let reranker = MaxSimReranker::new([source], DEFAULT_FEATURE)?;
+let pipeline = SearchPipeline::new(Arc::new(gatherer), Some(Arc::new(reranker)))?;
 
 let query = Query::new("prescripción de una deuda tributaria").with_feature(
     DEFAULT_FEATURE,
-    Feature::lazy(store.representation().clone(), move || {
+    Feature::lazy(snapshot.representation().clone(), move || {
         TokenMatrix::new(encode(&text), dimension)
     }),
 );
 let result = pipeline.search(&query, &SearchRequest::new(500, 100))?;
+for document in &result.documents {
+    println!("{} {:?} {}", document.rank, document.external_id(), document.score);
+}
 ```
 
 A gatherer implements `CandidateGenerator`; any reranker implements
@@ -135,39 +142,63 @@ gatherer never pays for encoding, and a gatherer and reranker share one matrix.
 A stage that needs the feature from another encoder is refused before anything
 runs.
 
+## Segments
+
+```python
+from lateweave import Segment
+
+segment = Segment("laws", "2026-09-01", external_ids)   # internal ID i names external_ids[i]
+segment.internal("law-17"), segment.external(16)
+next_segment = segment.deleted(["law-17"])              # generation + 1, compacted to 0..n-1
+```
+
+A segment never changes. `appended` and `deleted` return the next generation,
+compacted exactly as a store mutation leaves it, and `segment.manifest` is the
+`CorpusManifest` to persist. `Segment.from_manifest(manifest, external_ids)`
+rebuilds it and refuses IDs the manifest was not computed over.
+
 ## Implementing a gatherer
 
 ```python
-from lateweave import Candidate, CorpusManifest
+from lateweave import Candidate, Segment
 
 
 class MyGatherer:
     requires = {}                      # consumes query.text only
     score_semantics = "my-gather-score"
 
-    def __init__(self, index, corpus: CorpusManifest):
+    def __init__(self, index, segment: Segment):
         self.index = index
-        self.corpus = corpus
+        self.segment = segment
+        self.segments = (segment,)
 
     def gather(self, query, limit, *, subset=None):
-        rows = self.index.retrieve(query.text, limit=limit, allowed=subset)
+        allowed = None if subset is None else subset[self.segment.corpus_id]
+        rows = self.index.retrieve(query.text, limit=limit, allowed=allowed)
         return tuple(
-            Candidate(document_id, score, rank, "my-engine")
+            Candidate(self.segment, document_id, score, rank, "my-engine")
             for rank, (document_id, score) in enumerate(rows)
         )
 ```
 
-`subset` is an ascending int64 array of internal IDs, or `None`. A gatherer
-that cannot honour it must raise; the pipeline refuses a candidate outside the
-subset. A gatherer that consumes a vector feature declares it:
-`requires = {"multi_vector": representation}`. `corpus`, `requires`, and
-`score_semantics` are read once, when the `SearchPipeline` is built.
+`subset` is `None`, or maps every corpus ID in `segments` to an ascending int64
+array of internal IDs, empty for a segment the search excludes. A gatherer that
+cannot honour it must raise; the pipeline refuses a candidate outside the
+subset or from a snapshot the gatherer did not declare. A gatherer that
+consumes a vector feature declares it: `requires = {"multi_vector":
+representation}`. `segments`, `requires`, and `score_semantics` are read once,
+when the `SearchPipeline` is built.
+
+One gatherer may search several segments, such as two indexes of unrelated
+corpora whose hits it fuses; each candidate names its own segment, and nothing
+needs a shared ID space. Search results carry `segment`, `document_id`, and
+`external_id`.
 
 ## Implementing a reranker or a source
 
 A reranker owns whatever it needs to score. When what it needs is the token
-vectors of candidate documents, implement `MultiVectorSource` and let
-`MaxSimReranker` do the scoring:
+vectors of candidate documents, implement `MultiVectorSource` for each segment
+and let `MaxSimReranker` do the scoring:
 
 ```python
 from lateweave import MaxSimReranker
@@ -179,9 +210,9 @@ class EngineVectors:
     representation = representation
     score_semantics = "engine-reconstructed-full-maxsim"
 
-    def __init__(self, engine):
+    def __init__(self, engine, segment):
         self.engine = engine
-        self.document_count = engine.document_count
+        self.segment = segment         # the snapshot these vectors belong to
 
     def document_lengths(self, document_ids):
         return {item: self.engine.length(item) for item in document_ids}
@@ -191,11 +222,13 @@ class EngineVectors:
         return np.concatenate(rows), np.asarray([len(r) for r in rows], dtype=np.int64)
 
 
-reranker = MaxSimReranker(EngineVectors(engine), corpus)
+reranker = MaxSimReranker([EngineVectors(laws_engine, laws), EngineVectors(cases_engine, cases)])
 ```
 
-A lateweave store passed as the source is read natively, without calling back
-into Python.
+A source is a snapshot: the vectors an internal ID names must not change for
+its lifetime. The reranker routes each candidate to its segment's source and
+refuses a candidate from any other snapshot. A lateweave store snapshot passed
+as a source is read natively, without calling back into Python.
 
 Or write a reranker directly:
 
@@ -204,27 +237,28 @@ class MyReranker:
     requires = {"multi_vector": representation}
     score_semantics = "my-qualified-score-semantics"
 
-    def __init__(self, corpus):
-        self.corpus = corpus
+    def __init__(self, *segments):
+        self.segments = segments
 
     def rerank(self, query, candidates, *, budget):
         vectors = query.feature("multi_vector", representation)
-        return tuple(Score(c.document_id, self.score_one(vectors, c.document_id)) for c in candidates)
+        return [self.score_one(vectors, c.segment, c.document_id) for c in candidates]
 ```
 
-The pipeline requires exactly one score per candidate, never NaN.
+The pipeline requires exactly one score per candidate, in candidate order,
+never NaN.
 
 ## Stores
 
-`Float32VectorStore` and `Int8VectorStore` are `MultiVectorSource`
-implementations for gatherers without document vectors. A store is created with
-the `Representation` of its vectors and refuses queries from any other encoder.
+`Float32VectorStore` and `Int8VectorStore` hold the vectors of one segment for
+gatherers without document vectors. A store is created with the segment and the
+`Representation` of its vectors, and refuses queries from any other encoder.
 
 ```python
 from lateweave import Float32VectorStore, MaxSimReranker, SearchPipeline
 
-store = Float32VectorStore.create("index/vectors", packed_embeddings, lengths, representation)
-pipeline = SearchPipeline(gatherer, MaxSimReranker(store, corpus))
+store = Float32VectorStore.create("index/vectors", segment, packed_embeddings, lengths, representation)
+pipeline = SearchPipeline(gatherer, MaxSimReranker([store.snapshot()]))
 result = pipeline.search(query, gather_limit=500, limit=100)
 ```
 
@@ -233,11 +267,13 @@ result = pipeline.search(query, gather_limit=500, limit=100)
 | `Float32VectorStore` | `4D` | `float32-exact-full-maxsim` |
 | `Int8VectorStore` | `D + 4` | `int8-reconstructed-approximate-full-maxsim` |
 
-Both append and delete in place; a delete compacts internal IDs to `0..n-1`.
-A `MaxSimReranker` built over a store refuses to score once the store has been
-mutated, so rebuild it with the new corpus manifest.
-The on-disk format is plain `.npy` files and `storage.json`, the same from
-Rust and Python.
+`append(external_ids, embeddings, lengths)` and `delete(external_ids)` publish
+the next generation and return its snapshot, whose segment is exactly
+`segment.appended(...)` or `segment.deleted(...)`; a delete compacts internal
+IDs to `0..n-1`. Snapshots taken earlier keep reading their own generation, so
+a pipeline built over them keeps working until it is replaced by one built over
+the new snapshot. The on-disk format is plain `.npy` files, the segment's
+external IDs as JSON, and `storage.json`, the same from Rust and Python.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the ownership rules and
 [cookbook/README.md](cookbook/README.md) for the BM25 recipe.

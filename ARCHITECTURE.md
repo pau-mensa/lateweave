@@ -9,16 +9,16 @@ retrieval algorithms, encoders, or engine index layouts.
 ```text
 External engines                          lateweave
 
-text / features -> candidate IDs  ------>  CandidateGenerator contract
-candidate IDs   -> qualified scores ---->  Reranker contract (optional)
-document vectors                  ------>  MultiVectorSource contract
+text / features -> (segment, ID)s ------>  CandidateGenerator contract
+(segment, ID)s  -> qualified scores ---->  Reranker contract (optional)
+one segment's document vectors   ------>  MultiVectorSource contract
                                             |
-                                            +-- corpus identity between stages
+                                            +-- segment identity between stages
                                             +-- representation identity with the query
                                             +-- exact candidate-set validation
                                             +-- deterministic top-k, timings
 
-Optional lateweave store ---------------->  MultiVectorSource -> MaxSimReranker
+Optional lateweave store snapshot ------->  MultiVectorSource -> MaxSimReranker
 ```
 
 No engine is named in the package. Adapters live with their engine or in
@@ -59,11 +59,18 @@ stage that needs a token matrix gets it converted, once, on first use.
 
 ## Two identities
 
-**Corpus identity** (`CorpusManifest`): which documents, in which internal
-order, at which mutation generation. Every stage carries one, and the pipeline
-requires them to be equal at construction. Internal IDs are dense `0..n-1` and
-change on delete; anything outside the pipeline that must survive re-indexing
-refers to external IDs, never to these.
+**Segment identity** (`Segment`, identified by its `CorpusManifest`): which
+documents, in which internal order, at which mutation generation. A segment is
+an immutable snapshot of one corpus: its manifest plus the external IDs its
+internal IDs name. Internal IDs are dense `0..n-1` and local to the segment, so
+a document is `(segment, internal ID)` and corpora indexed separately never
+share, or have to agree on, an ID space. Anything outside the pipeline that
+must survive re-indexing refers to external IDs, never to internal ones.
+
+A mutation never changes a segment; it yields the next generation.
+`Segment.appended` and `Segment.deleted` compute it, compacted exactly as a
+store mutation leaves it, so an engine that renumbers on delete can check it
+agrees with the store rather than trust that it does.
 
 **Representation identity** (`Representation`): which encoder, revision,
 dimension, normalization, and templates produced a vector feature.
@@ -89,27 +96,43 @@ stages that consume them. The package fixes none; `MaxSimReranker` defaults to
 
 ## Stages
 
-`CandidateGenerator.gather(query, limit, subset=None)` returns ordered, unique
-internal IDs with gather scores, dense zero-based ranks, and provenance.
-`subset` restricts the search to those IDs, strictly ascending and inside the
-corpus; a gatherer that cannot honour it raises rather than ignores it, and the
-pipeline refuses any candidate outside it or outside the corpus. The gatherer's `score_semantics` qualifies its
-gather scores, which rank the results when no reranker follows.
+`CandidateGenerator.segments` are the snapshots a gatherer searches, each under
+a distinct corpus ID; one gatherer may search several, and fusing the hits of
+several engines is a gatherer like any other. `gather(query, limit,
+subset=None)` returns unique `(segment, internal ID)` candidates with gather
+scores, dense zero-based ranks, and provenance. `subset` maps every searched
+corpus ID to the strictly ascending internal IDs the search is restricted to;
+a gatherer that cannot honour it raises rather than ignores it, and the
+pipeline refuses any candidate outside it, outside its segment, or from a
+snapshot the gatherer did not declare. The gatherer's `score_semantics`
+qualifies its gather scores, which rank the results when no reranker follows.
 
-`Reranker.rerank(query, candidates, budget=...)` returns exactly one qualified
-score for every candidate it received. Gather scores never influence a reranked
-result. `ResourceBudget` crosses the boundary because bounded execution is
-caller policy; each reranker maps it onto its own representation.
+`Reranker.segments` must hold the same snapshot of every segment the gatherer
+searches; the pipeline checks that once, at construction. `rerank(query,
+candidates, budget=...)` returns exactly one qualified score per candidate, in
+candidate order. Gather scores never influence a reranked result.
+`ResourceBudget` crosses the boundary because bounded execution is caller
+policy; each reranker maps it onto its own representation.
+
+A pipeline is bound to the snapshots its stages hold. After a mutation, build a
+new pipeline over the new snapshots and swap it in: searches already running
+finish on the old ones, and nothing can pair a gatherer's ID with another
+generation's vectors.
 
 ## Multi-vector sources
 
-`MultiVectorSource.fetch(document_ids)` returns a packed float32 token matrix
-for the requested documents in the requested order, plus their lengths, and
-declares the representation of those vectors and the score semantics MaxSim over
-them has. `MaxSimReranker` is the kernel plus a source.
+A `MultiVectorSource` is a snapshot of one segment's vectors: it names its
+`segment`, and the vectors an internal ID names never change for its lifetime.
+`fetch(document_ids)` returns a packed float32 token matrix for the requested
+documents in the requested order, plus their lengths, and the source declares
+the representation of those vectors and the score semantics MaxSim over them
+has. `MaxSimReranker` is the kernel plus one source per segment: it routes each
+candidate to its segment's source, refuses a candidate from any other snapshot,
+and requires every source to share one representation and one score semantics
+so that scores across segments share a scale.
 
-The two lateweave stores are sources for gatherers that hold no document
-vectors. An engine that already reconstructs its own vectors implements the
+Snapshots of the two lateweave stores are sources for gatherers that hold no
+document vectors. An engine that already reconstructs its own vectors implements the
 protocol over them and stores nothing twice. When a rerank is meant to add
 fidelity over a lossy engine index, a `Float32VectorStore` alongside it is the
 deliberate second copy.
@@ -125,18 +148,23 @@ FixedRecordVectorStore
 └── Int8VectorStore      symmetric INT8 per token, float32 row scale
 ```
 
-Both use memory-mapped fixed-width token records, one `.npy` per array, a
-`document-offsets.npy`, and `storage.json` carrying format, representation,
-and counts. In Rust they are one `VectorStore` parameterized by `StoreFormat`.
-Append streams the existing records and the new ones into a replacement file
-set, then moves the live files aside and renames the new ones into place,
-moving the old ones back if any step fails; delete copies the surviving runs
-of records and compacts IDs. Reads and mutations can run from several threads:
-mutations run one at a time and stage while reads continue, and reads wait
-only for the renames. A mutation moves the store's generation, and a
-`MaxSimReranker` built before it refuses to score afterwards, since a compacted
-ID may name another document; build a new one over the new corpus manifest.
-The files are ordinary little-endian `.npy`, readable by NumPy.
+Both use memory-mapped fixed-width token records. Each generation is its own
+file set: one `.npy` per array, `document-offsets-G.npy`, and
+`document-ids-G.json` holding the segment's external IDs. `storage.json` names
+the live generation and carries the format, representation, corpus manifest,
+and token count. In Rust they are one `VectorStore` parameterized by
+`StoreFormat`.
+
+A store holds one segment. Mutations take external IDs: append streams the
+existing records and the new ones into the next generation's files; delete
+copies the surviving runs of records and compacts IDs. Either loads the new
+files and then publishes them by replacing `storage.json`, the single atomic
+step, and removes the staged files if anything before it fails. Files are
+never modified after they are written, so a `StoreSnapshot` keeps reading its
+generation through its own maps however many mutations follow; the files of
+superseded generations are removed on the next publish once nothing maps them.
+Mutations run one at a time; one process writes a store and any number read
+it. The files are ordinary little-endian `.npy`, readable by NumPy.
 
 ## Native scoring and execution
 
@@ -151,9 +179,8 @@ internally nests inside that and oversubscribes: on a 16-core host, capping the
 inner layer with `OMP_NUM_THREADS=4` is worth about 24% against leaving it to
 spawn a thread per core.
 
-The pipeline's ranking step enforces the reranker contract (every candidate
-scored once, nothing extra, no NaN) and orders by score, then gather rank, then
-ID.
+The pipeline's ranking step enforces the reranker contract (one score per
+candidate, no NaN) and orders by score, then gather rank.
 
 ## The SGEMM dependency
 

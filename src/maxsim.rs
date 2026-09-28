@@ -1,80 +1,107 @@
-//! MaxSim reranking over any multi-vector source.
+//! MaxSim reranking over multi-vector sources, one per segment.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::kernel::maxsim_scores;
-use crate::manifest::CorpusManifest;
+use crate::manifest::Representation;
 use crate::query::{Query, TokenMatrix};
+use crate::segment::Segment;
 use crate::source::MultiVectorSource;
-use crate::stage::{Candidate, Requirements, Reranker, ResourceBudget, Score};
+use crate::stage::{Candidate, Requirements, Reranker, ResourceBudget};
 use crate::threads::install;
 
 /// The feature name a [`MaxSimReranker`] reads unless told otherwise.
 pub const DEFAULT_FEATURE: &str = "multi_vector";
 
-/// MaxSim between the query's token matrix and a source's documents.
+/// MaxSim between the query's token matrix and each candidate's document,
+/// read from the source of the candidate's segment.
 ///
-/// The reranker requires its query feature to carry the source's
-/// representation, so vectors from a different encoder are refused before
-/// anything is fetched. It is bound to the source as it was when built: once
-/// the source is mutated, `rerank` fails rather than score IDs that may now
-/// name other documents, and a new reranker over a new manifest is needed.
+/// Every source must carry the same representation and score semantics, so
+/// scores from different segments share one scale; the reranker requires its
+/// query feature to carry that representation, so vectors from a different
+/// encoder are refused before anything is fetched. A candidate is scored only
+/// against the snapshot of its segment the reranker holds.
 pub struct MaxSimReranker {
-    source: Arc<dyn MultiVectorSource>,
-    source_generation: u64,
-    corpus: CorpusManifest,
+    sources: BTreeMap<String, Arc<dyn MultiVectorSource>>,
+    segments: Vec<Segment>,
+    representation: Representation,
+    score_semantics: String,
     feature: String,
     requires: Requirements,
 }
 
 impl MaxSimReranker {
+    /// Sources must be for distinct segments.
     pub fn new(
-        source: Arc<dyn MultiVectorSource>,
-        corpus: CorpusManifest,
+        sources: impl IntoIterator<Item = Arc<dyn MultiVectorSource>>,
         feature: impl Into<String>,
     ) -> Result<Self> {
-        let source_generation = source.generation();
-        check_document_count(source.as_ref(), &corpus)?;
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let first = sources
+            .first()
+            .ok_or_else(|| Error::invalid("a MaxSim reranker needs at least one source"))?;
+        let representation = first.representation().clone();
+        let score_semantics = first.score_semantics().to_string();
+        let mut by_corpus = BTreeMap::new();
+        for source in &sources {
+            let corpus_id = source.segment().corpus_id();
+            source
+                .representation()
+                .assert_compatible(&representation)
+                .map_err(|error| {
+                    Error::IncompatibleIndex(format!(
+                        "the source of segment {corpus_id:?} carries another representation: {error}"
+                    ))
+                })?;
+            if source.score_semantics() != score_semantics {
+                return Err(Error::IncompatibleIndex(format!(
+                    "the source of segment {corpus_id:?} scores as {:?}, not {score_semantics:?}",
+                    source.score_semantics()
+                )));
+            }
+            if by_corpus
+                .insert(corpus_id.to_string(), source.clone())
+                .is_some()
+            {
+                return Err(Error::invalid(format!(
+                    "more than one source for segment {corpus_id:?}"
+                )));
+            }
+        }
         let feature = feature.into();
-        let requires = BTreeMap::from([(feature.clone(), source.representation().clone())]);
         Ok(Self {
-            source,
-            source_generation,
-            corpus,
+            segments: sources
+                .iter()
+                .map(|source| source.segment().clone())
+                .collect(),
+            sources: by_corpus,
+            requires: BTreeMap::from([(feature.clone(), representation.clone())]),
+            representation,
+            score_semantics,
             feature,
-            requires,
         })
     }
 
-    pub fn source(&self) -> &Arc<dyn MultiVectorSource> {
-        &self.source
+    /// In the order they were given.
+    pub fn sources(&self) -> impl Iterator<Item = &Arc<dyn MultiVectorSource>> {
+        self.segments
+            .iter()
+            .map(|segment| &self.sources[segment.corpus_id()])
     }
 
     pub fn feature(&self) -> &str {
         &self.feature
     }
 
-    fn check_source(&self) -> Result<()> {
-        if self.source.generation() != self.source_generation {
-            return Err(Error::IncompatibleIndex(
-                "the source was mutated after this reranker was built".to_string(),
-            ));
-        }
-        check_document_count(self.source.as_ref(), &self.corpus)
+    fn source(&self, segment: &Segment) -> Result<&Arc<dyn MultiVectorSource>> {
+        let source = self.sources.get(segment.corpus_id()).ok_or_else(|| {
+            Error::IncompatibleIndex(format!("no source for segment {:?}", segment.corpus_id()))
+        })?;
+        segment.assert_compatible(source.segment())?;
+        Ok(source)
     }
-}
-
-fn check_document_count(source: &dyn MultiVectorSource, corpus: &CorpusManifest) -> Result<()> {
-    if source.document_count() != corpus.document_count() {
-        return Err(Error::IncompatibleIndex(format!(
-            "source and corpus manifest document counts differ ({} != {})",
-            source.document_count(),
-            corpus.document_count()
-        )));
-    }
-    Ok(())
 }
 
 /// Groups documents, shortest first, into batches of at most `maximum_tokens`
@@ -104,56 +131,55 @@ fn token_batches(
     batches
 }
 
-impl MaxSimReranker {
-    fn score(
-        &self,
-        vectors: &TokenMatrix,
-        candidate_ids: &[u64],
-        budget: &ResourceBudget,
-    ) -> Result<HashMap<u64, f32>> {
-        let representation = self.source.representation();
-        let lengths = self.source.document_lengths(candidate_ids)?;
-        if lengths.len() != candidate_ids.len() {
-            return Err(Error::invalid(
-                "source returned a different number of document lengths than requested",
-            ));
-        }
-        let lengths = candidate_ids
-            .iter()
-            .copied()
-            .zip(lengths)
-            .collect::<HashMap<_, _>>();
-
-        let mut scores = HashMap::with_capacity(candidate_ids.len());
-        for window in candidate_ids.chunks(budget.max_documents_per_batch()) {
-            for batch in token_batches(window, &lengths, budget.max_batch_tokens()) {
-                let documents = self.source.fetch(&batch, budget.threads())?;
-                let expected = batch.iter().map(|document_id| lengths[document_id]);
-                if documents.dimension() != representation.dimension()
-                    || !documents.lengths().iter().copied().eq(expected)
-                {
-                    return Err(Error::invalid(
-                        "source fetched vectors that disagree with its declared lengths or dimension",
-                    ));
-                }
-                let values = maxsim_scores(
-                    vectors.values(),
-                    documents.vectors(),
-                    documents.lengths(),
-                    vectors.dimension(),
-                    Some(budget.max_batch_tokens()),
-                    budget.threads(),
-                )?;
-                scores.extend(batch.into_iter().zip(values));
-            }
-        }
-        Ok(scores)
+/// MaxSim of `vectors` against `candidate_ids` of one source, by ID.
+fn score(
+    source: &dyn MultiVectorSource,
+    vectors: &TokenMatrix,
+    candidate_ids: &[u64],
+    budget: &ResourceBudget,
+) -> Result<HashMap<u64, f32>> {
+    let dimension = source.representation().dimension();
+    let lengths = source.document_lengths(candidate_ids)?;
+    if lengths.len() != candidate_ids.len() {
+        return Err(Error::invalid(
+            "source returned a different number of document lengths than requested",
+        ));
     }
+    let lengths = candidate_ids
+        .iter()
+        .copied()
+        .zip(lengths)
+        .collect::<HashMap<_, _>>();
+
+    let mut scores = HashMap::with_capacity(candidate_ids.len());
+    for window in candidate_ids.chunks(budget.max_documents_per_batch()) {
+        for batch in token_batches(window, &lengths, budget.max_batch_tokens()) {
+            let documents = source.fetch(&batch, budget.threads())?;
+            let expected = batch.iter().map(|document_id| lengths[document_id]);
+            if documents.dimension() != dimension
+                || !documents.lengths().iter().copied().eq(expected)
+            {
+                return Err(Error::invalid(
+                    "source fetched vectors that disagree with its declared lengths or dimension",
+                ));
+            }
+            let values = maxsim_scores(
+                vectors.values(),
+                documents.vectors(),
+                documents.lengths(),
+                vectors.dimension(),
+                Some(budget.max_batch_tokens()),
+                budget.threads(),
+            )?;
+            scores.extend(batch.into_iter().zip(values));
+        }
+    }
+    Ok(scores)
 }
 
 impl Reranker for MaxSimReranker {
-    fn corpus(&self) -> &CorpusManifest {
-        &self.corpus
+    fn segments(&self) -> &[Segment] {
+        &self.segments
     }
 
     fn requires(&self) -> &Requirements {
@@ -161,7 +187,7 @@ impl Reranker for MaxSimReranker {
     }
 
     fn score_semantics(&self) -> &str {
-        self.source.score_semantics()
+        &self.score_semantics
     }
 
     fn rerank(
@@ -169,13 +195,12 @@ impl Reranker for MaxSimReranker {
         query: &Query,
         candidates: &[Candidate],
         budget: &ResourceBudget,
-    ) -> Result<Vec<Score>> {
+    ) -> Result<Vec<f32>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let representation = self.source.representation();
         let vectors = query
-            .feature(&self.feature, representation)?
+            .feature(&self.feature, &self.representation)?
             .token_matrix()
             .ok_or_else(|| {
                 Error::IncompatibleQuery(format!(
@@ -183,33 +208,49 @@ impl Reranker for MaxSimReranker {
                     self.feature
                 ))
             })?;
-        if vectors.dimension() != representation.dimension() {
+        if vectors.dimension() != self.representation.dimension() {
             return Err(Error::IncompatibleQuery(format!(
                 "query feature '{}' has dimension {}, but the representation declares {}",
                 self.feature,
                 vectors.dimension(),
-                representation.dimension()
+                self.representation.dimension()
             )));
         }
 
-        let candidate_ids = candidates
-            .iter()
-            .map(|candidate| candidate.document_id)
-            .collect::<Vec<_>>();
-        // Checked before the first read and after the last, so every length
-        // and vector comes from the source this reranker was built over.
-        self.check_source()?;
-        let scores = install(budget.threads(), || {
-            self.score(vectors, &candidate_ids, budget)
+        // Candidate positions per segment, each checked against the snapshot
+        // this reranker holds before anything is fetched.
+        let mut groups: BTreeMap<&str, (&Arc<dyn MultiVectorSource>, Vec<usize>)> = BTreeMap::new();
+        for (position, candidate) in candidates.iter().enumerate() {
+            let corpus_id = candidate.segment.corpus_id();
+            let source = self.source(&candidate.segment)?;
+            if !source.segment().contains(candidate.document_id) {
+                return Err(Error::invalid(format!(
+                    "document ID {} is outside segment {corpus_id:?}",
+                    candidate.document_id
+                )));
+            }
+            groups
+                .entry(corpus_id)
+                .or_insert_with(|| (source, Vec::new()))
+                .1
+                .push(position);
+        }
+
+        let mut output = vec![0.0; candidates.len()];
+        install(budget.threads(), || {
+            for (source, positions) in groups.values() {
+                let ids = positions
+                    .iter()
+                    .map(|&position| candidates[position].document_id)
+                    .collect::<Vec<_>>();
+                let scores = score(source.as_ref(), vectors, &ids, budget)?;
+                for (&position, document_id) in positions.iter().zip(ids) {
+                    output[position] = scores[&document_id];
+                }
+            }
+            Ok::<_, Error>(())
         })??;
-        self.check_source()?;
-        Ok(candidate_ids
-            .into_iter()
-            .map(|document_id| Score {
-                document_id,
-                value: scores[&document_id],
-            })
-            .collect())
+        Ok(output)
     }
 }
 
@@ -218,27 +259,46 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::manifest::Representation;
     use crate::query::{Feature, TokenMatrix};
     use crate::source::PackedDocuments;
 
     struct InMemorySource {
+        segment: Segment,
         representation: Representation,
+        score_semantics: &'static str,
         documents: Vec<Vec<f32>>,
         fetched: Mutex<Vec<Vec<u64>>>,
     }
 
+    impl InMemorySource {
+        fn new(corpus_id: &str, documents: Vec<Vec<f32>>) -> Arc<Self> {
+            Arc::new(Self {
+                segment: Segment::new(
+                    corpus_id,
+                    "1",
+                    0,
+                    (0..documents.len()).map(|id| id.to_string()),
+                )
+                .unwrap(),
+                representation: representation(),
+                score_semantics: "in-memory-exact-full-maxsim",
+                documents,
+                fetched: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
     impl MultiVectorSource for InMemorySource {
+        fn segment(&self) -> &Segment {
+            &self.segment
+        }
+
         fn representation(&self) -> &Representation {
             &self.representation
         }
 
         fn score_semantics(&self) -> &str {
-            "in-memory-exact-full-maxsim"
-        }
-
-        fn document_count(&self) -> u64 {
-            self.documents.len() as u64
+            self.score_semantics
         }
 
         fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>> {
@@ -258,8 +318,13 @@ mod tests {
         }
     }
 
-    fn candidate(document_id: u64, gather_rank: usize) -> Candidate {
+    fn representation() -> Representation {
+        Representation::new("encoder", "1", 2, true).unwrap()
+    }
+
+    fn candidate(segment: &Segment, document_id: u64, gather_rank: usize) -> Candidate {
         Candidate {
+            segment: segment.clone(),
             document_id,
             gather_score: 0.0,
             gather_rank,
@@ -267,43 +332,40 @@ mod tests {
         }
     }
 
+    fn query(values: Vec<f32>) -> Query {
+        Query::new("query").with_feature(
+            DEFAULT_FEATURE,
+            Feature::new(representation(), TokenMatrix::new(values, 2).unwrap()),
+        )
+    }
+
     #[test]
     fn scores_a_borrowed_source_in_candidate_order_within_the_token_budget() {
-        let representation = Representation::new("encoder", "1", 2, true).unwrap();
-        let source = Arc::new(InMemorySource {
-            representation: representation.clone(),
-            documents: vec![vec![1.0, 0.0, 0.0, 1.0], vec![0.6, 0.8], vec![-1.0, 0.0]],
-            fetched: Mutex::new(Vec::new()),
-        });
+        let source = InMemorySource::new(
+            "docs",
+            vec![vec![1.0, 0.0, 0.0, 1.0], vec![0.6, 0.8], vec![-1.0, 0.0]],
+        );
         let reranker = MaxSimReranker::new(
-            source.clone(),
-            CorpusManifest::new("corpus", "1", 3, "abc").unwrap(),
+            [source.clone() as Arc<dyn MultiVectorSource>],
             DEFAULT_FEATURE,
         )
         .unwrap();
-        let query = Query::new("query").with_feature(
-            DEFAULT_FEATURE,
-            Feature::new(
-                representation,
-                TokenMatrix::new(vec![1.0, 0.0, 0.0, 1.0], 2).unwrap(),
-            ),
-        );
+        let segment = &source.segment;
 
         let scores = reranker
             .rerank(
-                &query,
-                &[candidate(1, 0), candidate(0, 1), candidate(2, 2)],
+                &query(vec![1.0, 0.0, 0.0, 1.0]),
+                &[
+                    candidate(segment, 1, 0),
+                    candidate(segment, 0, 1),
+                    candidate(segment, 2, 2),
+                ],
                 &ResourceBudget::new(2, 256, Some(1)).unwrap(),
             )
             .unwrap();
 
-        let ids = scores
-            .iter()
-            .map(|score| score.document_id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1, 0, 2]);
         for (score, expected) in scores.iter().zip([1.4, 2.0, -1.0]) {
-            assert!((score.value - expected).abs() < 1e-6);
+            assert!((score - expected).abs() < 1e-6);
         }
         let mut sizes = source
             .fetched
@@ -315,5 +377,82 @@ mod tests {
         sizes.sort_unstable();
         assert_eq!(sizes, vec![1, 2]);
         assert_eq!(reranker.name(), "MaxSimReranker");
+    }
+
+    #[test]
+    fn routes_each_candidate_to_its_segments_source() {
+        let a = InMemorySource::new("a", vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let b = InMemorySource::new("b", vec![vec![0.0, 1.0], vec![1.0, 0.0]]);
+        let reranker = MaxSimReranker::new(
+            [a.clone() as Arc<dyn MultiVectorSource>, b.clone()],
+            DEFAULT_FEATURE,
+        )
+        .unwrap();
+        assert_eq!(reranker.segments(), [a.segment.clone(), b.segment.clone()]);
+
+        let scores = reranker
+            .rerank(
+                &query(vec![1.0, 0.0]),
+                &[
+                    candidate(&b.segment, 0, 0),
+                    candidate(&a.segment, 0, 1),
+                    candidate(&b.segment, 1, 2),
+                ],
+                &ResourceBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(scores, [0.0, 1.0, 1.0]);
+        assert_eq!(*a.fetched.lock().unwrap(), [vec![0]]);
+        assert_eq!(b.fetched.lock().unwrap().concat().len(), 2);
+    }
+
+    #[test]
+    fn refuses_a_candidate_from_another_snapshot() {
+        let source = InMemorySource::new("docs", vec![vec![1.0, 0.0]]);
+        let reranker = MaxSimReranker::new(
+            [source.clone() as Arc<dyn MultiVectorSource>],
+            DEFAULT_FEATURE,
+        )
+        .unwrap();
+        let later = source.segment.appended(["1"]).unwrap();
+        let unknown = Segment::new("other", "1", 0, ["0"]).unwrap();
+        for segment in [later, unknown] {
+            let error = reranker
+                .rerank(
+                    &query(vec![1.0, 0.0]),
+                    &[candidate(&segment, 0, 0)],
+                    &ResourceBudget::default(),
+                )
+                .unwrap_err();
+            assert!(matches!(error, Error::IncompatibleIndex(_)));
+        }
+        assert!(source.fetched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sources_must_share_representation_and_semantics() {
+        let a = InMemorySource::new("a", vec![vec![1.0, 0.0]]);
+        let other_semantics = Arc::new(InMemorySource {
+            score_semantics: "lossy",
+            ..Arc::try_unwrap(InMemorySource::new("b", vec![vec![1.0, 0.0]]))
+                .ok()
+                .unwrap()
+        });
+        assert!(matches!(
+            MaxSimReranker::new(
+                [a.clone() as Arc<dyn MultiVectorSource>, other_semantics],
+                DEFAULT_FEATURE
+            ),
+            Err(Error::IncompatibleIndex(_))
+        ));
+        let duplicate = InMemorySource::new("a", vec![vec![1.0, 0.0]]);
+        assert!(MaxSimReranker::new(
+            [a as Arc<dyn MultiVectorSource>, duplicate],
+            DEFAULT_FEATURE
+        )
+        .is_err());
+        assert!(
+            MaxSimReranker::new(Vec::<Arc<dyn MultiVectorSource>>::new(), DEFAULT_FEATURE).is_err()
+        );
     }
 }

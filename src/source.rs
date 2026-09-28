@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::manifest::Representation;
+use crate::segment::Segment;
 
 /// Token vectors of documents: a row-major float32 `[sum(lengths), dimension]`
 /// matrix holding each document's tokens contiguously, in `lengths` order.
@@ -51,26 +52,27 @@ impl PackedDocuments {
     }
 }
 
-/// Where a MaxSim reranker reads document vectors from.
+/// Where a MaxSim reranker reads one segment's document vectors from.
+///
+/// A source is a snapshot: the vectors an internal ID of [`segment`] names
+/// never change for the life of the source, so a reranker holding it can
+/// never score an ID against another document's vectors. A mutable engine
+/// hands out a new source per snapshot.
 ///
 /// An engine that already holds document vectors implements this over them
-/// and stores nothing twice; the lateweave vector stores implement it for
-/// gatherers that keep no vectors. `score_semantics` qualifies what MaxSim
-/// over the fetched vectors means, since a source may reconstruct from a lossy
-/// code.
+/// and stores nothing twice; a [`VectorStore`](crate::VectorStore) snapshot
+/// implements it for gatherers that keep no vectors. `score_semantics`
+/// qualifies what MaxSim over the fetched vectors means, since a source may
+/// reconstruct from a lossy code.
+///
+/// [`segment`]: MultiVectorSource::segment
 pub trait MultiVectorSource: Send + Sync {
+    /// The snapshot whose internal IDs `fetch` takes.
+    fn segment(&self) -> &Segment;
+
     fn representation(&self) -> &Representation;
 
     fn score_semantics(&self) -> &str;
-
-    fn document_count(&self) -> u64;
-
-    /// Changes whenever a mutation may have changed which vectors an ID
-    /// holds. A reranker built over the source refuses to score once it has
-    /// moved; a source that never mutates keeps the default.
-    fn generation(&self) -> u64 {
-        0
-    }
 
     /// Token counts of `document_ids`, in the same order.
     fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>>;

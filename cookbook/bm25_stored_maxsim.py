@@ -24,10 +24,15 @@ The store carries the encoder representation it was built from, and a search
 that supplies token embeddings must supply them from that encoder. A search
 without embeddings is gather-only: BM25 scores rank.
 
+Both stages index one segment: the external IDs of ``documents.jsonl`` in
+order, at the generation ``corpus-manifest.json`` records. The vector store
+keeps its own copy of the segment, so a pipeline pairing the lexical index with
+a store built over other documents, or left at another generation, is refused.
+
 bm25s has no incremental append or delete, so ``update`` and ``delete`` rebuild
 the lexical index from ``documents.jsonl``, which this recipe maintains anyway.
-The vector store keeps its incremental paths. Rebuilding makes the internal ID
-compaction after a delete exact by construction.
+The vector store keeps its incremental paths, and each mutation checks that the
+store's next segment is the one the documents file now describes.
 """
 
 from __future__ import annotations
@@ -60,7 +65,7 @@ from lateweave import (
     Representation,
     ResourceBudget,
     SearchPipeline,
-    document_ids_digest,
+    Segment,
     open_vector_store,
 )
 
@@ -185,16 +190,19 @@ def publish_replacement(source: Path, replacement: Path) -> None:
         shutil.rmtree(backup)
 
 
-def corpus_manifest(
-    documents: Sequence[dict[str, str]], *, corpus_id: str, corpus_version: str, generation: int
-) -> CorpusManifest:
-    return CorpusManifest(
-        corpus_id=corpus_id,
-        corpus_version=corpus_version,
-        document_count=len(documents),
-        document_ids_sha256=document_ids_digest([row["id"] for row in documents]),
-        generation=generation,
+def read_segment(source: Path) -> Segment:
+    """The segment the manifest records, checked against ``documents.jsonl``."""
+    documents = load_documents(source / DOCUMENTS_FILE)
+    return Segment.from_manifest(
+        CorpusManifest.read(source / CORPUS_MANIFEST), [row["id"] for row in documents]
     )
+
+
+def require_same_segment(store_segment: Segment, expected: Segment) -> None:
+    if store_segment != expected:
+        raise RuntimeError(
+            f"the vector store moved to {store_segment!r}, but the documents describe {expected!r}"
+        )
 
 
 class LexicalCandidateGenerator:
@@ -203,39 +211,41 @@ class LexicalCandidateGenerator:
     requires: dict[str, Representation] = {}
     score_semantics = "bm25s-lucene"
 
-    def __init__(self, index: Any, corpus: CorpusManifest, analyzer: Analyzer) -> None:
+    def __init__(self, index: Any, segment: Segment, analyzer: Analyzer) -> None:
         self.index = index
-        self.corpus = corpus
+        self.segment = segment
+        self.segments = (segment,)
         self.analyzer = analyzer
 
     @classmethod
-    def open(cls, path: Path, corpus: CorpusManifest, analyzer: Analyzer) -> "LexicalCandidateGenerator":
+    def open(cls, path: Path, segment: Segment, analyzer: Analyzer) -> "LexicalCandidateGenerator":
         import bm25s
 
         index = bm25s.BM25.load(str(path), mmap=True, load_corpus=False, show_progress=False)
         stored = int(index.scores["num_docs"])
-        if stored != corpus.document_count:
+        if stored != len(segment):
             raise RuntimeError(
-                f"lexical index holds {stored:,} documents but the manifest "
-                f"declares {corpus.document_count:,}"
+                f"lexical index holds {stored:,} documents but the segment "
+                f"holds {len(segment):,}"
             )
-        return cls(index, corpus, analyzer)
+        return cls(index, segment, analyzer)
 
     def gather(
-        self, query: Query, limit: int, *, subset: np.ndarray | None = None
+        self, query: Query, limit: int, *, subset: dict[str, np.ndarray] | None = None
     ) -> tuple[Candidate, ...]:
         terms = self.analyzer.tokens(query.text)
         if not terms:
             return ()
+        document_count = len(self.segment)
         weight_mask = None
         if subset is not None:
             # bm25s multiplies scores by the mask; masked documents score zero
             # and are dropped below with every other non-matching document.
-            weight_mask = np.zeros(self.corpus.document_count, dtype=np.float32)
-            weight_mask[subset] = 1.0
+            weight_mask = np.zeros(document_count, dtype=np.float32)
+            weight_mask[subset[self.segment.corpus_id]] = 1.0
         documents, scores = self.index.retrieve(
             [terms],
-            k=min(limit, self.corpus.document_count),
+            k=min(limit, document_count),
             show_progress=False,
             weight_mask=weight_mask,
         )
@@ -247,12 +257,14 @@ class LexicalCandidateGenerator:
             if score != score or score <= 0.0:
                 continue
             document_id = int(raw_document_id)
-            if not 0 <= document_id < self.corpus.document_count:
+            if not 0 <= document_id < document_count:
                 raise RuntimeError(f"bm25s returned out-of-range ID {document_id}")
             if document_id in seen:
                 raise RuntimeError(f"bm25s returned duplicate ID {document_id}")
             seen.add(document_id)
-            candidates.append(Candidate(document_id, score, len(candidates), "bm25s"))
+            candidates.append(
+                Candidate(self.segment, document_id, score, len(candidates), "bm25s")
+            )
         return tuple(candidates)
 
 
@@ -308,9 +320,7 @@ def build_index(args: argparse.Namespace) -> None:
         query_template=args.query_template,
         document_template=args.document_template,
     )
-    manifest = corpus_manifest(
-        documents, corpus_id=args.corpus_id, corpus_version=args.corpus_version, generation=0
-    )
+    segment = Segment(args.corpus_id, args.corpus_version, [row["id"] for row in documents])
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with index_lock(destination, exclusive=True):
@@ -325,12 +335,13 @@ def build_index(args: argparse.Namespace) -> None:
             )
             STORES[args.storage].create(
                 temporary / VECTOR_DIRECTORY,
+                segment,
                 packed,
                 lengths,
                 representation,
                 threads=args.threads,
             )
-            manifest.write(temporary / CORPUS_MANIFEST)
+            segment.manifest.write(temporary / CORPUS_MANIFEST)
             temporary.replace(destination)
         finally:
             if temporary.exists():
@@ -349,34 +360,27 @@ def update_index(args: argparse.Namespace) -> None:
         if not source.is_dir():
             raise FileNotFoundError(f"index not found: {source}")
         existing = load_documents(source / DOCUMENTS_FILE)
-        existing_ids = {row["id"] for row in existing}
-        collisions = [row["id"] for row in additions if row["id"] in existing_ids]
-        if collisions:
-            raise ValueError(f"external document ID already exists: {collisions[0]}")
-        manifest = CorpusManifest.read(source / CORPUS_MANIFEST)
+        # Refuses an external ID that already exists before anything is copied.
+        segment = read_segment(source).appended([row["id"] for row in additions])
         analyzer = Analyzer.read(source / ANALYZER_FILE)
         replacement = staged_index_copy(source)
         try:
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
-            store.append(packed, lengths, threads=args.threads)
+            snapshot = store.append([row["id"] for row in additions], packed, lengths, threads=args.threads)
+            require_same_segment(snapshot.segment, segment)
             documents = [*existing, *additions]
             write_lexical_index(
                 replacement / LEXICAL_DIRECTORY, [row["text"] for row in documents], analyzer
             )
             write_documents(replacement / DOCUMENTS_FILE, documents)
-            corpus_manifest(
-                documents,
-                corpus_id=manifest.corpus_id,
-                corpus_version=manifest.corpus_version,
-                generation=manifest.generation + 1,
-            ).write(replacement / CORPUS_MANIFEST)
-            del store
+            segment.manifest.write(replacement / CORPUS_MANIFEST)
+            del store, snapshot
             gc.collect()
             publish_replacement(source, replacement)
         finally:
             if replacement.exists():
                 shutil.rmtree(replacement)
-    print(f"appended {len(additions):,} documents to {source}; generation {manifest.generation + 1}")
+    print(f"appended {len(additions):,} documents to {source}; generation {segment.generation}")
 
 
 def delete_index(args: argparse.Namespace) -> None:
@@ -386,67 +390,60 @@ def delete_index(args: argparse.Namespace) -> None:
         if not source.is_dir():
             raise FileNotFoundError(f"index not found: {source}")
         documents = load_documents(source / DOCUMENTS_FILE)
-        internal_by_external = {row["id"]: internal for internal, row in enumerate(documents)}
-        missing = [item for item in requested if item not in internal_by_external]
+        known = {row["id"] for row in documents}
+        missing = [item for item in requested if item not in known]
         if missing:
             raise ValueError(f"external document ID not found: {missing[0]}")
         if len(requested) == len(documents):
             raise ValueError("delete cannot remove every document from the index")
-        internal_ids = sorted(internal_by_external[item] for item in requested)
-        deleted = set(internal_ids)
-        remaining = [row for internal, row in enumerate(documents) if internal not in deleted]
-        manifest = CorpusManifest.read(source / CORPUS_MANIFEST)
+        segment = read_segment(source).deleted(requested)
+        deleted = set(requested)
+        remaining = [row for row in documents if row["id"] not in deleted]
         analyzer = Analyzer.read(source / ANALYZER_FILE)
         replacement = staged_index_copy(source)
         try:
             store = open_vector_store(replacement / VECTOR_DIRECTORY)
-            store.delete(internal_ids)
+            snapshot = store.delete(requested)
+            require_same_segment(snapshot.segment, segment)
             # Rebuilding over the survivors compacts internal IDs to 0..n-1 in
-            # document order, which is the order the store compacts to as well.
+            # document order, which is the order the segment compacts to.
             write_lexical_index(
                 replacement / LEXICAL_DIRECTORY, [row["text"] for row in remaining], analyzer
             )
             write_documents(replacement / DOCUMENTS_FILE, remaining)
-            corpus_manifest(
-                remaining,
-                corpus_id=manifest.corpus_id,
-                corpus_version=manifest.corpus_version,
-                generation=manifest.generation + 1,
-            ).write(replacement / CORPUS_MANIFEST)
-            del store
+            segment.manifest.write(replacement / CORPUS_MANIFEST)
+            del store, snapshot
             gc.collect()
             publish_replacement(source, replacement)
         finally:
             if replacement.exists():
                 shutil.rmtree(replacement)
-    print(f"deleted {len(internal_ids):,} documents from {source}; generation {manifest.generation + 1}")
+    print(f"deleted {len(requested):,} documents from {source}; generation {segment.generation}")
 
 
 def search_index(args: argparse.Namespace) -> None:
     source = args.index.expanduser().resolve()
     with index_lock(source, exclusive=False):
-        documents = load_documents(source / DOCUMENTS_FILE)
-        manifest = CorpusManifest.read(source / CORPUS_MANIFEST)
+        segment = read_segment(source)
         gatherer = LexicalCandidateGenerator.open(
-            source / LEXICAL_DIRECTORY, manifest, Analyzer.read(source / ANALYZER_FILE)
+            source / LEXICAL_DIRECTORY, segment, Analyzer.read(source / ANALYZER_FILE)
         )
         reranker = None
         features: dict[str, Feature] = {}
         if args.query_embeddings is not None:
-            store = open_vector_store(source / VECTOR_DIRECTORY)
-            reranker = MaxSimReranker(store, manifest)
+            # The pipeline refuses a snapshot of any other segment than the
+            # lexical index's.
+            snapshot = open_vector_store(source / VECTOR_DIRECTORY).snapshot()
+            reranker = MaxSimReranker([snapshot])
             features["multi_vector"] = Feature(
-                store.representation,
+                snapshot.representation,
                 provider=lambda: np.ascontiguousarray(
                     np.load(args.query_embeddings), dtype=np.float32
                 ),
             )
         subset = None
         if args.subset_id:
-            internal_by_external = {row["id"]: internal for internal, row in enumerate(documents)}
-            subset = np.asarray(
-                sorted(internal_by_external[item] for item in args.subset_id), dtype=np.int64
-            )
+            subset = {segment.corpus_id: np.sort(segment.to_internal(args.subset_id))}
         result = SearchPipeline(gatherer, reranker).search(
             Query(args.query, **features),
             gather_limit=args.gather_limit,
@@ -463,7 +460,7 @@ def search_index(args: argparse.Namespace) -> None:
                 {
                     "rank": row.rank,
                     "document_id": row.document_id,
-                    "external_id": documents[row.document_id]["id"],
+                    "external_id": row.external_id,
                     "score": row.score,
                 }
                 for row in result.documents

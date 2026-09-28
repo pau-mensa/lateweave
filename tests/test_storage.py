@@ -7,7 +7,6 @@ import pytest
 
 from lateweave import (
     Candidate,
-    CorpusManifest,
     Feature,
     Float32VectorStore,
     IncompatibleIndexError,
@@ -18,6 +17,9 @@ from lateweave import (
     Query,
     Representation,
     ResourceBudget,
+    SearchPipeline,
+    Segment,
+    StoreSnapshot,
     open_vector_store,
 )
 
@@ -32,8 +34,8 @@ def normalized(values: list[list[float]]) -> np.ndarray:
     return output
 
 
-def corpus(document_count: int) -> CorpusManifest:
-    return CorpusManifest("corpus", "1", document_count, "abc")
+def segment(*ids: str, corpus_id: str = "corpus") -> Segment:
+    return Segment(corpus_id, "1", ids or ("a", "b", "c"))
 
 
 DOCUMENTS = normalized(
@@ -47,16 +49,23 @@ DOCUMENTS = normalized(
 LENGTHS = np.asarray([2, 1, 1], dtype=np.int64)
 
 
+def create(store_type, path, ids=("a", "b", "c"), documents=DOCUMENTS, lengths=LENGTHS):  # type: ignore[no-untyped-def]
+    return store_type.create(path, segment(*ids), documents, lengths, REPRESENTATION)
+
+
 @pytest.mark.parametrize("store_type", STORES)
 def test_stores_reopen_and_fetch_in_requested_order(tmp_path, store_type) -> None:
-    store_type.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION, threads=1)
+    store_type.create(tmp_path / "vectors", segment(), DOCUMENTS, LENGTHS, REPRESENTATION, threads=1)
     store = open_vector_store(tmp_path / "vectors")
 
     assert type(store) is store_type
-    assert isinstance(store, MultiVectorSource)
-    assert store.representation == REPRESENTATION
-    assert store.document_lengths([2, 0]) == {2: 1, 0: 2}
-    packed, lengths = store.fetch([2, 0], threads=1)
+    assert store.segment == segment()
+    snapshot = store.snapshot()
+    assert isinstance(snapshot, StoreSnapshot) and isinstance(snapshot, MultiVectorSource)
+    assert snapshot.representation == REPRESENTATION
+    assert snapshot.score_semantics == store_type.score_semantics
+    assert snapshot.document_lengths([2, 0]) == {2: 1, 0: 2}
+    packed, lengths = snapshot.fetch([2, 0], threads=1)
     assert packed.shape == (3, 8) and packed.dtype == np.float32
     assert lengths.tolist() == [1, 2]
     assert np.linalg.norm(packed, axis=1) == pytest.approx(np.ones(3), abs=1e-6)
@@ -64,36 +73,49 @@ def test_stores_reopen_and_fetch_in_requested_order(tmp_path, store_type) -> Non
 
 
 def test_float32_store_is_bit_exact(tmp_path) -> None:
-    store = Float32VectorStore.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION)
-    packed, _ = store.fetch([0, 1, 2])
+    store = create(Float32VectorStore, tmp_path / "vectors")
+    packed, _ = store.snapshot().fetch([0, 1, 2])
     assert np.array_equal(packed, DOCUMENTS)
 
 
 @pytest.mark.parametrize("store_type", STORES)
-def test_append_and_delete_compact_internal_ids(tmp_path, store_type) -> None:
-    initial = normalized([[1, 0, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0, 0]])
-    store = store_type.create(
-        tmp_path / "vectors", initial, np.asarray([1, 2, 1], dtype=np.int64), REPRESENTATION
+def test_mutations_take_external_ids_and_follow_the_segment(tmp_path, store_type) -> None:
+    initial = normalized(
+        [[1, 0, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0, 0, 0]]
     )
-    store.append(normalized([[0, 0, 0, 0, 1, 0, 0, 0]]), np.asarray([1], dtype=np.int64))
-    assert (store.document_count, store.token_count) == (4, 5)
+    store = create(store_type, tmp_path / "vectors", documents=initial, lengths=[1, 2, 1])
+    appended = store.append(["d"], normalized([[0, 0, 0, 0, 1, 0, 0, 0]]), [1])
+    assert appended.segment == segment().appended(["d"])
+    assert (appended.document_count, appended.token_count) == (4, 5)
 
-    store.delete([1])
-    assert (store.document_count, store.token_count) == (3, 3)
-    packed, lengths = store.fetch([0, 1, 2])
+    deleted = store.delete(["b"])
+    assert deleted.segment == appended.segment.deleted(["b"])
+    assert deleted.segment.document_ids == ["a", "c", "d"]
+    assert (deleted.document_count, deleted.token_count) == (3, 3)
+    packed, lengths = deleted.fetch([0, 1, 2])
     assert lengths.tolist() == [1, 1, 1]
     assert np.argmax(packed, axis=1).tolist() == [0, 3, 4]
-    reopened = open_vector_store(tmp_path / "vectors")
-    assert (reopened.document_count, reopened.token_count) == (3, 3)
+    assert open_vector_store(tmp_path / "vectors").segment == deleted.segment
+
+    with pytest.raises(ValueError, match="not in segment"):
+        store.delete(["b"])
+    with pytest.raises(ValueError, match="appears more than once"):
+        store.append(["a"], DOCUMENTS[:1], [1])
+    with pytest.raises(TypeError, match="single string"):
+        store.delete("a")
 
 
-def test_store_refuses_vectors_that_contradict_the_representation(tmp_path) -> None:
-    with pytest.raises(ValueError, match="dimension"):
-        Float32VectorStore.create(
-            tmp_path / "a", DOCUMENTS, LENGTHS, replace(REPRESENTATION, dimension=4)
-        )
-    with pytest.raises(ValueError, match="normalized"):
-        Float32VectorStore.create(tmp_path / "b", DOCUMENTS * 2, LENGTHS, REPRESENTATION)
+def test_a_snapshot_keeps_reading_its_generation_after_mutations(tmp_path) -> None:
+    store = create(Float32VectorStore, tmp_path / "vectors", ids=("a", "b"), documents=DOCUMENTS[:2], lengths=[1, 1])
+    before = store.snapshot()
+    store.delete(["a"])
+    store.append(["c"], DOCUMENTS[2:3], [1])
+
+    # Same document count, but internal ID 1 now names "c".
+    after = store.snapshot()
+    assert before.segment.external(1) == "b" and after.segment.external(1) == "c"
+    np.testing.assert_array_equal(before.fetch([1])[0], DOCUMENTS[1:2])
+    np.testing.assert_array_equal(after.fetch([1])[0], DOCUMENTS[2:3])
 
 
 class InMemorySource:
@@ -102,9 +124,9 @@ class InMemorySource:
     representation = REPRESENTATION
     score_semantics = "in-memory-exact-full-maxsim"
 
-    def __init__(self, documents: list[np.ndarray]) -> None:
+    def __init__(self, documents: list[np.ndarray], corpus_id: str = "corpus") -> None:
         self.documents = documents
-        self.document_count = len(documents)
+        self.segment = Segment(corpus_id, "1", [str(item) for item in range(len(documents))])
         self.fetched: list[list[int]] = []
 
     def document_lengths(self, document_ids):  # type: ignore[no-untyped-def]
@@ -123,70 +145,120 @@ def query(vectors: np.ndarray, representation: Representation = REPRESENTATION) 
 def test_reranker_scores_a_borrowed_source_without_a_store() -> None:
     source = InMemorySource([DOCUMENTS[:2], DOCUMENTS[2:3], DOCUMENTS[3:]])
     assert isinstance(source, MultiVectorSource)
-    reranker = MaxSimReranker(source, corpus(3))
+    reranker = MaxSimReranker([source])
     assert reranker.requires == {"multi_vector": REPRESENTATION}
     assert reranker.score_semantics == "in-memory-exact-full-maxsim"
+    assert reranker.segments == (source.segment,)
+    assert reranker.sources == (source,)
 
+    segment = source.segment
     scores = reranker.rerank(
         query(normalized([[1, 0, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0]])),
-        (Candidate(1, 2.0, 0, "t"), Candidate(0, 1.0, 1, "t"), Candidate(2, 0.5, 2, "t")),
+        (Candidate(segment, 1, 2.0, 0, "t"), Candidate(segment, 0, 1.0, 1, "t"), Candidate(segment, 2, 0.5, 2, "t")),
         budget=ResourceBudget(max_batch_tokens=2, threads=1),
     )
 
-    assert [score.document_id for score in scores] == [1, 0, 2]
-    assert [score.value for score in scores] == pytest.approx([2**0.5, 2.0, -1.0], abs=1e-6)
+    assert scores.tolist() == pytest.approx([2**0.5, 2.0, -1.0], abs=1e-6)
     assert sorted(map(len, source.fetched)) == [1, 2]
 
 
 @pytest.mark.parametrize(("store_type", "tolerance"), [(Float32VectorStore, 1e-6), (Int8VectorStore, 1e-2)])
-def test_reranker_over_a_store_reports_the_stores_fidelity(tmp_path, store_type, tolerance) -> None:
-    store = store_type.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION)
-    reranker = MaxSimReranker(store, corpus(3))
+def test_reranker_over_a_snapshot_reports_the_stores_fidelity(tmp_path, store_type, tolerance) -> None:
+    snapshot = create(store_type, tmp_path / "vectors").snapshot()
+    reranker = MaxSimReranker([snapshot])
     assert reranker.score_semantics == store_type.score_semantics
 
     scores = reranker.rerank(
         query(normalized([[1, 0, 0, 0, 0, 0, 0, 0]])),
-        (Candidate(1, 2.0, 0, "t"), Candidate(0, 1.0, 1, "t")),
+        (Candidate(snapshot.segment, 1, 2.0, 0, "t"), Candidate(snapshot.segment, 0, 1.0, 1, "t")),
         budget=ResourceBudget(threads=1),
     )
-    assert [score.value for score in scores] == pytest.approx([2**-0.5, 1.0], abs=tolerance)
+    assert scores.tolist() == pytest.approx([2**-0.5, 1.0], abs=tolerance)
+
+
+def test_one_reranker_scores_two_stores_through_a_fused_gatherer(tmp_path) -> None:
+    laws = Float32VectorStore.create(
+        tmp_path / "laws", segment("l0", "l1", corpus_id="laws"), DOCUMENTS[:2], [1, 1], REPRESENTATION
+    ).snapshot()
+    cases = Float32VectorStore.create(
+        tmp_path / "cases", segment("c0", "c1", corpus_id="cases"), DOCUMENTS[2:], [1, 1], REPRESENTATION
+    ).snapshot()
+
+    class Fused:
+        requires: dict[str, Representation] = {}
+        score_semantics = "unranked-union"
+        segments = (laws.segment, cases.segment)
+
+        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
+            rows = [(laws.segment, 0), (cases.segment, 1), (laws.segment, 1), (cases.segment, 0)]
+            return tuple(Candidate(s, i, 0.0, rank, s.corpus_id) for rank, (s, i) in enumerate(rows))
+
+    result = SearchPipeline(Fused(), MaxSimReranker([laws, cases])).search(
+        query(DOCUMENTS[:1]), gather_limit=4, limit=4
+    )
+    # l0 is the query itself; c0 = (1,1)/√2; l1 is orthogonal; c1 is its opposite.
+    assert [row.external_id for row in result.documents] == ["l0", "c0", "l1", "c1"]
 
 
 def test_reranker_refuses_a_query_feature_from_another_encoder(tmp_path) -> None:
-    store = Float32VectorStore.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION)
-    reranker = MaxSimReranker(store, corpus(3))
+    snapshot = create(Float32VectorStore, tmp_path / "vectors").snapshot()
     with pytest.raises(IncompatibleQueryError, match="encoder"):
-        reranker.rerank(
+        MaxSimReranker([snapshot]).rerank(
             query(DOCUMENTS[:1], replace(REPRESENTATION, encoder="other")),
-            (Candidate(0, 1.0, 0, "t"),),
+            (Candidate(snapshot.segment, 0, 1.0, 0, "t"),),
             budget=ResourceBudget(),
         )
 
 
-def test_reranker_refuses_a_source_that_disagrees_with_the_corpus(tmp_path) -> None:
-    store = Float32VectorStore.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION)
-    with pytest.raises(ValueError, match="document counts"):
-        MaxSimReranker(store, corpus(99))
+def test_reranker_sources_must_agree(tmp_path) -> None:
+    exact = create(Float32VectorStore, tmp_path / "a").snapshot()
+    lossy = Int8VectorStore.create(
+        tmp_path / "b", segment(corpus_id="other"), DOCUMENTS, LENGTHS, REPRESENTATION
+    ).snapshot()
+    with pytest.raises(IncompatibleIndexError, match="scores as"):
+        MaxSimReranker([exact, lossy])
+    with pytest.raises(ValueError, match="more than one source"):
+        MaxSimReranker([exact, create(Float32VectorStore, tmp_path / "c").snapshot()])
+    with pytest.raises(ValueError, match="at least one source"):
+        MaxSimReranker([])
 
 
 @pytest.mark.parametrize("store_type", STORES)
 def test_stores_accept_non_contiguous_embeddings(tmp_path, store_type) -> None:
     doubled = np.repeat(DOCUMENTS, 2, axis=0)[::2]
     assert not doubled.flags.c_contiguous
-    store = store_type.create(tmp_path / "vectors", doubled, LENGTHS, REPRESENTATION)
-    store.append(np.asfortranarray(DOCUMENTS[:1]), [1])
-    expected = store_type.create(tmp_path / "expected", DOCUMENTS, LENGTHS, REPRESENTATION)
-    expected.append(DOCUMENTS[:1], [1])
-    np.testing.assert_array_equal(store.fetch([0, 1, 2, 3])[0], expected.fetch([0, 1, 2, 3])[0])
+    store = create(store_type, tmp_path / "vectors", documents=doubled)
+    store.append(["d"], np.asfortranarray(DOCUMENTS[:1]), [1])
+    expected = create(store_type, tmp_path / "expected")
+    expected.append(["d"], DOCUMENTS[:1], [1])
+    np.testing.assert_array_equal(
+        store.snapshot().fetch([0, 1, 2, 3])[0], expected.snapshot().fetch([0, 1, 2, 3])[0]
+    )
 
 
-def test_a_reranker_refuses_a_store_mutated_after_it_was_built(tmp_path) -> None:
-    store = Float32VectorStore.create(tmp_path / "vectors", DOCUMENTS, LENGTHS, REPRESENTATION)
-    reranker = MaxSimReranker(store, corpus(3))
-    query = Query("query", multi_vector=Feature(REPRESENTATION, DOCUMENTS[:1]))
-    candidates = [Candidate(1, 0.0, 0, "test")]
-    reranker.rerank(query, candidates, budget=ResourceBudget())
-    store.delete([0])
-    store.append(DOCUMENTS[:1], [1])
-    with pytest.raises(IncompatibleIndexError, match="mutated"):
-        reranker.rerank(query, candidates, budget=ResourceBudget())
+def test_a_reranker_holds_its_snapshot_across_store_mutations(tmp_path) -> None:
+    store = create(Float32VectorStore, tmp_path / "vectors")
+    snapshot = store.snapshot()
+    reranker = MaxSimReranker([snapshot])
+    vector_query = Query("query", multi_vector=Feature(REPRESENTATION, DOCUMENTS[2:3]))
+    candidates = [Candidate(snapshot.segment, 1, 0.0, 0, "test")]
+    before = reranker.rerank(vector_query, candidates, budget=ResourceBudget())
+
+    store.delete(["a"])
+    after = store.append(["d"], DOCUMENTS[:1], [1])
+    np.testing.assert_array_equal(reranker.rerank(vector_query, candidates, budget=ResourceBudget()), before)
+    with pytest.raises(IncompatibleIndexError, match="generation"):
+        reranker.rerank(
+            vector_query, [Candidate(after.segment, 1, 0.0, 0, "test")], budget=ResourceBudget()
+        )
+
+
+def test_store_refuses_vectors_that_contradict_the_representation_or_segment(tmp_path) -> None:
+    with pytest.raises(ValueError, match="dimension"):
+        Float32VectorStore.create(
+            tmp_path / "a", segment(), DOCUMENTS, LENGTHS, replace(REPRESENTATION, dimension=4)
+        )
+    with pytest.raises(ValueError, match="normalized"):
+        Float32VectorStore.create(tmp_path / "b", segment(), DOCUMENTS * 2, LENGTHS, REPRESENTATION)
+    with pytest.raises(ValueError, match="segment holds 2"):
+        Float32VectorStore.create(tmp_path / "c", segment("a", "b"), DOCUMENTS, LENGTHS, REPRESENTATION)

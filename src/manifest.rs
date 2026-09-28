@@ -25,10 +25,18 @@ where
 {
     let mut digest = Sha256::new();
     for document_id in document_ids {
-        let encoded = document_id.as_ref().as_bytes();
-        digest.update((encoded.len() as u64).to_le_bytes());
-        digest.update(encoded);
+        digest_document_id(&mut digest, document_id.as_ref());
     }
+    digest_hex(digest)
+}
+
+pub(crate) fn digest_document_id(digest: &mut Sha256, document_id: &str) {
+    let encoded = document_id.as_bytes();
+    digest.update((encoded.len() as u64).to_le_bytes());
+    digest.update(encoded);
+}
+
+pub(crate) fn digest_hex(digest: Sha256) -> String {
     digest
         .finalize()
         .iter()
