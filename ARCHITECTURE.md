@@ -66,7 +66,7 @@ change on delete; anything outside the pipeline that must survive re-indexing
 refers to external IDs, never to these.
 
 **Representation identity** (`Representation`): which encoder, revision,
-dimension, normalization, similarity, and templates produced a vector feature.
+dimension, normalization, and templates produced a vector feature.
 A stage declares the representation of each feature it consumes in `requires`;
 a query declares the representation of each feature it carries. The pipeline
 checks them against each other before any stage runs.

@@ -55,7 +55,6 @@ pub(crate) fn representation(object: &Bound<'_, PyAny>) -> PyResult<Representati
     let encoder_revision: String = attribute(object, "encoder_revision")?;
     let dimension: i64 = attribute(object, "dimension")?;
     let normalized: bool = attribute(object, "normalized")?;
-    let similarity: String = attribute(object, "similarity")?;
     let query_template: String = attribute(object, "query_template")?;
     let document_template: String = attribute(object, "document_template")?;
     Representation::new(
@@ -64,7 +63,6 @@ pub(crate) fn representation(object: &Bound<'_, PyAny>) -> PyResult<Representati
         usize::try_from(dimension).unwrap_or(0),
         normalized,
     )
-    .and_then(|representation| representation.with_similarity(similarity))
     .map(|representation| representation.with_templates(query_template, document_template))
     .map_err(to_py)
 }
@@ -115,7 +113,6 @@ pub(crate) fn representation_to_py<'py>(
     arguments.set_item("encoder_revision", representation.encoder_revision())?;
     arguments.set_item("dimension", representation.dimension())?;
     arguments.set_item("normalized", representation.normalized())?;
-    arguments.set_item("similarity", representation.similarity())?;
     arguments.set_item("query_template", representation.query_template())?;
     arguments.set_item("document_template", representation.document_template())?;
     manifest_module(py)?

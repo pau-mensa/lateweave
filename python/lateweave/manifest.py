@@ -70,7 +70,6 @@ class Representation:
     encoder_revision: str
     dimension: int
     normalized: bool
-    similarity: str = "dot"
     query_template: str = ""
     document_template: str = ""
 

@@ -207,7 +207,6 @@ pub struct Representation {
     encoder_revision: String,
     dimension: usize,
     normalized: bool,
-    similarity: String,
     query_template: String,
     document_template: String,
 }
@@ -218,16 +217,10 @@ struct RepresentationFields {
     encoder_revision: String,
     dimension: usize,
     normalized: bool,
-    #[serde(default = "default_similarity")]
-    similarity: String,
     #[serde(default)]
     query_template: String,
     #[serde(default)]
     document_template: String,
-}
-
-fn default_similarity() -> String {
-    "dot".to_string()
 }
 
 impl TryFrom<RepresentationFields> for Representation {
@@ -240,13 +233,12 @@ impl TryFrom<RepresentationFields> for Representation {
             fields.dimension,
             fields.normalized,
         )?
-        .with_similarity(fields.similarity)?
         .with_templates(fields.query_template, fields.document_template))
     }
 }
 
 impl Representation {
-    /// A representation compared by dot product, with empty templates.
+    /// A representation with empty templates.
     pub fn new(
         encoder: impl Into<String>,
         encoder_revision: impl Into<String>,
@@ -258,7 +250,6 @@ impl Representation {
             encoder_revision: encoder_revision.into(),
             dimension,
             normalized,
-            similarity: default_similarity(),
             query_template: String::new(),
             document_template: String::new(),
         };
@@ -274,15 +265,6 @@ impl Representation {
             return Err(Error::invalid("representation dimension must be positive"));
         }
         Ok(representation)
-    }
-
-    pub fn with_similarity(mut self, similarity: impl Into<String>) -> Result<Self> {
-        self.similarity = similarity.into();
-        require_non_empty(
-            &self.similarity,
-            "representation similarity must not be empty",
-        )?;
-        Ok(self)
     }
 
     pub fn with_templates(
@@ -309,10 +291,6 @@ impl Representation {
 
     pub fn normalized(&self) -> bool {
         self.normalized
-    }
-
-    pub fn similarity(&self) -> &str {
-        &self.similarity
     }
 
     pub fn query_template(&self) -> &str {
@@ -344,12 +322,6 @@ impl Representation {
             "normalized",
             &self.normalized,
             &other.normalized,
-        );
-        mismatch(
-            &mut mismatches,
-            "similarity",
-            &self.similarity,
-            &other.similarity,
         );
         mismatch(
             &mut mismatches,
