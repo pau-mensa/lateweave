@@ -1,19 +1,20 @@
 //! Errors and identity values crossing the Python boundary.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
-use lateweave::{CorpusManifest, Error, Representation, Requirements};
+use lateweave::{Error, Representation, Requirements};
 use numpy::ndarray::ArrayView2;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyMapping};
+use pyo3::types::{PyDict, PyMapping, PyString};
 
 create_exception!(
     lateweave,
     IncompatibleIndexError,
     PyValueError,
-    "Two stages do not index the same documents."
+    "Stages or sources that cannot be composed: another representation, another score scale, or a corpus the reranker has no source for."
 );
 create_exception!(
     lateweave,
@@ -21,11 +22,18 @@ create_exception!(
     PyValueError,
     "A query lacks a feature a stage needs, or supplies it from another encoder."
 );
+create_exception!(
+    lateweave,
+    StaleError,
+    PyRuntimeError,
+    "The indexes a search read reflect writes older than the request allows."
+);
 
 pub(crate) fn to_py(error: Error) -> PyErr {
     match error {
         Error::IncompatibleIndex(message) => IncompatibleIndexError::new_err(message),
         Error::IncompatibleQuery(message) => IncompatibleQueryError::new_err(message),
+        error @ Error::Stale { .. } => StaleError::new_err(error.to_string()),
         Error::Io(error) => error.into(),
         Error::External(error) => match error.downcast::<PyErr>() {
             Ok(error) => *error,
@@ -45,11 +53,6 @@ fn attribute<'py, T: FromPyObject<'py>>(object: &Bound<'py, PyAny>, name: &str) 
     object.getattr(name)?.extract()
 }
 
-fn non_negative(object: &Bound<'_, PyAny>, name: &str, message: &str) -> PyResult<u64> {
-    let value: i64 = attribute(object, name)?;
-    u64::try_from(value).map_err(|_| PyValueError::new_err(message.to_string()))
-}
-
 pub(crate) fn representation(object: &Bound<'_, PyAny>) -> PyResult<Representation> {
     let encoder: String = attribute(object, "encoder")?;
     let encoder_revision: String = attribute(object, "encoder_revision")?;
@@ -67,27 +70,6 @@ pub(crate) fn representation(object: &Bound<'_, PyAny>) -> PyResult<Representati
     .map_err(to_py)
 }
 
-pub(crate) fn corpus_manifest(object: &Bound<'_, PyAny>) -> PyResult<CorpusManifest> {
-    let document_count = non_negative(
-        object,
-        "document_count",
-        "corpus manifest document_count must not be negative",
-    )?;
-    let generation = non_negative(
-        object,
-        "generation",
-        "corpus manifest generation must not be negative",
-    )?;
-    CorpusManifest::new(
-        attribute::<String>(object, "corpus_id")?,
-        attribute::<String>(object, "corpus_version")?,
-        document_count,
-        attribute::<String>(object, "document_ids_sha256")?,
-    )
-    .map(|manifest| manifest.with_generation(generation))
-    .map_err(to_py)
-}
-
 pub(crate) fn requirements(object: &Bound<'_, PyAny>) -> PyResult<Requirements> {
     let mapping = object.downcast::<PyMapping>()?;
     mapping
@@ -100,8 +82,8 @@ pub(crate) fn requirements(object: &Bound<'_, PyAny>) -> PyResult<Requirements> 
         .collect()
 }
 
-fn manifest_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
-    py.import("lateweave.manifest")
+fn representation_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
+    py.import("lateweave.representation")
 }
 
 pub(crate) fn representation_to_py<'py>(
@@ -115,23 +97,8 @@ pub(crate) fn representation_to_py<'py>(
     arguments.set_item("normalized", representation.normalized())?;
     arguments.set_item("query_template", representation.query_template())?;
     arguments.set_item("document_template", representation.document_template())?;
-    manifest_module(py)?
+    representation_module(py)?
         .getattr("Representation")?
-        .call((), Some(&arguments))
-}
-
-pub(crate) fn corpus_manifest_to_py<'py>(
-    py: Python<'py>,
-    manifest: &CorpusManifest,
-) -> PyResult<Bound<'py, PyAny>> {
-    let arguments = PyDict::new(py);
-    arguments.set_item("corpus_id", manifest.corpus_id())?;
-    arguments.set_item("corpus_version", manifest.corpus_version())?;
-    arguments.set_item("document_count", manifest.document_count())?;
-    arguments.set_item("document_ids_sha256", manifest.document_ids_sha256())?;
-    arguments.set_item("generation", manifest.generation())?;
-    manifest_module(py)?
-        .getattr("CorpusManifest")?
         .call((), Some(&arguments))
 }
 
@@ -146,24 +113,9 @@ pub(crate) fn requirements_to_py<'py>(
     Ok(output)
 }
 
-#[pyfunction(name = "_check_corpus_manifest")]
-pub(crate) fn check_corpus_manifest(manifest: &Bound<'_, PyAny>) -> PyResult<()> {
-    corpus_manifest(manifest).map(drop)
-}
-
 #[pyfunction(name = "_check_representation")]
 pub(crate) fn check_representation(representation: &Bound<'_, PyAny>) -> PyResult<()> {
     self::representation(representation).map(drop)
-}
-
-#[pyfunction(name = "_assert_corpora_compatible")]
-pub(crate) fn assert_corpora_compatible(
-    left: &Bound<'_, PyAny>,
-    right: &Bound<'_, PyAny>,
-) -> PyResult<()> {
-    corpus_manifest(left)?
-        .assert_compatible(&corpus_manifest(right)?)
-        .map_err(to_py)
 }
 
 #[pyfunction(name = "_assert_representations_compatible")]
@@ -176,14 +128,18 @@ pub(crate) fn assert_representations_compatible(
         .map_err(to_py)
 }
 
-/// Accepts any iterable of strings, as the digest has always done.
-#[pyfunction]
-pub(crate) fn document_ids_digest(document_ids: &Bound<'_, PyAny>) -> PyResult<String> {
-    let document_ids = document_ids
+/// Document IDs from any iterable of strings. A bare string is refused
+/// rather than read as one ID per character.
+pub(crate) fn document_ids(document_ids: &Bound<'_, PyAny>) -> PyResult<Vec<Arc<str>>> {
+    if document_ids.is_instance_of::<PyString>() {
+        return Err(PyTypeError::new_err(
+            "expected an iterable of document IDs, not a single string",
+        ));
+    }
+    document_ids
         .try_iter()?
-        .map(|document_id| document_id?.extract::<String>())
-        .collect::<PyResult<Vec<_>>>()?;
-    Ok(lateweave::document_ids_digest(document_ids))
+        .map(|document_id| Ok(document_id?.extract::<String>()?.into()))
+        .collect()
 }
 
 /// Row-major values of a matrix: one `memcpy` when it is contiguous.

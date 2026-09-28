@@ -87,9 +87,9 @@ impl NpyArray {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         require_little_endian()?;
         let file = File::open(path)?;
-        // SAFETY: a store writes each generation's files once, before
-        // publishing them, and never modifies them afterwards, so a mapping
-        // never observes a concurrent write through lateweave.
+        // SAFETY: the store format writes every file once, before a commit
+        // names it, and never modifies it afterwards, so a mapping never
+        // observes a concurrent write from a writer that follows it.
         let map = unsafe { Mmap::map(&file)? };
         let invalid = |reason: &str| Error::storage(format!("{}: {reason}", path.display()));
         if map.len() < 10 || &map[..6] != MAGIC {

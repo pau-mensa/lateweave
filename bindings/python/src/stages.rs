@@ -1,21 +1,23 @@
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use lateweave::{
-    Candidate, CandidateGenerator, Fixed, Live, LiveMaxSimReranker, MultiVectorSource,
+    Candidate, CandidateGenerator, DocumentKey, Gathered, MaxSimReranker, MultiVectorSource,
     PackedDocuments, Query, RankedDocument, Representation, Requirements, Reranker, ResourceBudget,
-    SearchPipeline, SearchRequest, SearchResult, SearchTimings, Segment, Subset,
+    Scored, SearchPipeline, SearchRequest, SearchResult, SearchTimings, Subset, VectorView,
 };
-use numpy::{AllowTypeChange, PyArray1, PyArrayLike1, PyArrayLike2};
-use pyo3::exceptions::PyValueError;
+use numpy::{AllowTypeChange, PyArrayLike1, PyArrayLike2};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyMapping, PyTuple};
+use pyo3::types::{PyDict, PyFrozenSet, PyList, PyMapping, PyTuple};
 
-use crate::convert::{from_py, representation, requirements, requirements_to_py, row_major, to_py};
+use crate::convert::{
+    document_ids, from_py, representation, requirements, requirements_to_py, row_major, to_py,
+};
 use crate::query::PyQuery;
-use crate::segment::PySegment;
-use crate::storage::{PyStoreSnapshot, PyVectorStore};
+use crate::storage::PyVectorStore;
 
-/// One gathered document: an internal ID of ``segment``.
+/// One gathered document of ``corpus``.
 #[pyclass(name = "Candidate", frozen, module = "lateweave._native")]
 pub(crate) struct PyCandidate {
     inner: Candidate,
@@ -25,16 +27,15 @@ pub(crate) struct PyCandidate {
 impl PyCandidate {
     #[new]
     fn new(
-        segment: &Bound<'_, PySegment>,
-        document_id: u64,
+        corpus: &str,
+        document_id: &str,
         gather_score: f32,
         gather_rank: usize,
         provenance: String,
     ) -> Self {
         Self {
             inner: Candidate {
-                segment: segment.get().inner.clone(),
-                document_id,
+                key: DocumentKey::new(corpus, document_id),
                 gather_score,
                 gather_rank,
                 provenance,
@@ -43,19 +44,13 @@ impl PyCandidate {
     }
 
     #[getter]
-    fn segment(&self) -> PySegment {
-        self.inner.segment.clone().into()
+    fn corpus(&self) -> &str {
+        self.inner.key.corpus()
     }
 
     #[getter]
-    fn document_id(&self) -> u64 {
-        self.inner.document_id
-    }
-
-    /// ``None`` when ``document_id`` is outside the segment.
-    #[getter]
-    fn external_id(&self) -> Option<&str> {
-        self.inner.external_id()
+    fn document_id(&self) -> &str {
+        self.inner.key.id()
     }
 
     #[getter]
@@ -75,13 +70,93 @@ impl PyCandidate {
 
     fn __repr__(&self) -> String {
         format!(
-            "Candidate(segment={:?}, document_id={}, gather_score={}, gather_rank={}, provenance={:?})",
-            self.inner.segment.corpus_id(),
-            self.inner.document_id,
+            "Candidate(corpus={:?}, document_id={:?}, gather_score={}, gather_rank={}, provenance={:?})",
+            self.inner.key.corpus(),
+            self.inner.key.id(),
             self.inner.gather_score,
             self.inner.gather_rank,
             self.inner.provenance
         )
+    }
+}
+
+fn candidates_to_py<'py>(
+    py: Python<'py>,
+    candidates: &[Candidate],
+) -> PyResult<Bound<'py, PyTuple>> {
+    PyTuple::new(
+        py,
+        candidates.iter().map(|candidate| PyCandidate {
+            inner: candidate.clone(),
+        }),
+    )
+}
+
+fn candidates_from_py(candidates: &Bound<'_, PyAny>) -> PyResult<Vec<Candidate>> {
+    candidates
+        .try_iter()?
+        .map(|candidate| Ok(candidate?.downcast::<PyCandidate>()?.get().inner.clone()))
+        .collect()
+}
+
+/// What a gatherer found, and when the index it searched last committed:
+/// every write committed to that index before ``as_of`` is reflected in it.
+#[pyclass(name = "Gathered", frozen, module = "lateweave._native")]
+pub(crate) struct PyGathered {
+    inner: Gathered,
+}
+
+#[pymethods]
+impl PyGathered {
+    #[new]
+    fn new(candidates: &Bound<'_, PyAny>, as_of: SystemTime) -> PyResult<Self> {
+        Ok(Self {
+            inner: Gathered {
+                candidates: candidates_from_py(candidates)?,
+                as_of,
+            },
+        })
+    }
+
+    #[getter]
+    fn candidates<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        candidates_to_py(py, &self.inner.candidates)
+    }
+
+    #[getter]
+    fn as_of(&self) -> SystemTime {
+        self.inner.as_of
+    }
+}
+
+/// One score per candidate, or ``None`` for a document the reranker's index
+/// does not hold, and when that index last committed.
+#[pyclass(name = "Scored", frozen, module = "lateweave._native")]
+pub(crate) struct PyScored {
+    inner: Scored,
+}
+
+#[pymethods]
+impl PyScored {
+    #[new]
+    fn new(scores: &Bound<'_, PyAny>, as_of: SystemTime) -> PyResult<Self> {
+        let scores = scores
+            .try_iter()?
+            .map(|score| score?.extract::<Option<f32>>())
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            inner: Scored { scores, as_of },
+        })
+    }
+
+    #[getter]
+    fn scores(&self) -> Vec<Option<f32>> {
+        self.inner.scores.clone()
+    }
+
+    #[getter]
+    fn as_of(&self) -> SystemTime {
+        self.inner.as_of
     }
 }
 
@@ -121,56 +196,12 @@ impl PyResourceBudget {
     }
 }
 
-fn candidates_to_py<'py>(
-    py: Python<'py>,
-    candidates: &[Candidate],
-) -> PyResult<Bound<'py, PyTuple>> {
-    PyTuple::new(
-        py,
-        candidates.iter().map(|candidate| PyCandidate {
-            inner: candidate.clone(),
-        }),
-    )
-}
-
-fn candidates_from_py(candidates: &Bound<'_, PyAny>) -> PyResult<Vec<Candidate>> {
-    candidates
-        .try_iter()?
-        .map(|candidate| Ok(candidate?.downcast::<PyCandidate>()?.get().inner.clone()))
-        .collect()
-}
-
-fn segments(stage: &Bound<'_, PyAny>) -> PyResult<Vec<Segment>> {
-    stage
-        .getattr("segments")?
-        .try_iter()?
-        .map(|segment| Ok(segment?.downcast::<PySegment>()?.get().inner.clone()))
-        .collect()
-}
-
-fn segments_to_py<'py>(py: Python<'py>, segments: &[Segment]) -> PyResult<Bound<'py, PyTuple>> {
-    PyTuple::new(py, segments.iter().cloned().map(PySegment::from))
-}
-
-fn ids(values: &Bound<'_, PyAny>, what: &str) -> PyResult<Vec<u64>> {
-    let values = values.extract::<PyArrayLike1<'_, i64, AllowTypeChange>>()?;
-    values
-        .as_array()
-        .iter()
-        .map(|&document_id| {
-            u64::try_from(document_id).map_err(|_| {
-                PyValueError::new_err(format!("{what} document IDs must not be negative"))
-            })
-        })
-        .collect()
-}
-
 fn subset_to_py<'py>(py: Python<'py>, subset: &Subset) -> PyResult<Bound<'py, PyDict>> {
     let output = PyDict::new(py);
-    for (corpus_id, ids) in subset.iter() {
+    for (corpus, ids) in subset.iter() {
         output.set_item(
-            corpus_id,
-            PyArray1::from_iter(py, ids.iter().map(|&document_id| document_id as i64)),
+            corpus,
+            PyFrozenSet::new(py, ids.iter().map(AsRef::<str>::as_ref))?,
         )?;
     }
     Ok(output)
@@ -178,29 +209,19 @@ fn subset_to_py<'py>(py: Python<'py>, subset: &Subset) -> PyResult<Bound<'py, Py
 
 fn subset_from_py(subset: &Bound<'_, PyAny>) -> PyResult<Subset> {
     let mapping = subset.downcast::<PyMapping>().map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err(
-            "subset must map corpus IDs to arrays of internal IDs",
-        )
+        PyTypeError::new_err("subset must map corpora to iterables of document IDs")
     })?;
     mapping
         .items()?
         .iter()
         .try_fold(Subset::new(), |subset, item| {
-            let (corpus_id, values): (String, Bound<'_, PyAny>) = item.extract()?;
-            Ok(subset.with(corpus_id, ids(&values, "subset")?))
+            let (corpus, ids): (String, Bound<'_, PyAny>) = item.extract()?;
+            Ok(subset.with(corpus, document_ids(&ids)?))
         })
 }
 
-fn scores_from_py(scores: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
-    Ok(scores
-        .extract::<PyArrayLike1<'_, f32, AllowTypeChange>>()?
-        .as_array()
-        .to_vec())
-}
-
-/// Identity a Python stage declares, read once when it joins a pipeline.
+/// What a Python stage declares, read once when it joins a pipeline.
 struct Declaration {
-    segments: Vec<Segment>,
     requires: Requirements,
     score_semantics: String,
     name: String,
@@ -209,7 +230,6 @@ struct Declaration {
 impl Declaration {
     fn read(stage: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
-            segments: segments(stage)?,
             requires: requirements(&stage.getattr("requires")?)?,
             score_semantics: stage.getattr("score_semantics")?.extract()?,
             name: stage.get_type().name()?.extract()?,
@@ -223,10 +243,6 @@ struct PythonGatherer {
 }
 
 impl CandidateGenerator for PythonGatherer {
-    fn segments(&self) -> &[Segment] {
-        &self.declaration.segments
-    }
-
     fn requires(&self) -> &Requirements {
         &self.declaration.requires
     }
@@ -244,7 +260,7 @@ impl CandidateGenerator for PythonGatherer {
         query: &Query,
         limit: usize,
         subset: Option<&Subset>,
-    ) -> lateweave::Result<Vec<Candidate>> {
+    ) -> lateweave::Result<Gathered> {
         Python::attach(|py| {
             let arguments = PyDict::new(py);
             arguments.set_item(
@@ -254,11 +270,11 @@ impl CandidateGenerator for PythonGatherer {
             let query = PyQuery {
                 inner: query.clone(),
             };
-            candidates_from_py(&self.object.bind(py).call_method(
-                "gather",
-                (query, limit),
-                Some(&arguments),
-            )?)
+            let gathered =
+                self.object
+                    .bind(py)
+                    .call_method("gather", (query, limit), Some(&arguments))?;
+            Ok(gathered.downcast::<PyGathered>()?.get().inner.clone())
         })
         .map_err(from_py)
     }
@@ -270,10 +286,6 @@ struct PythonReranker {
 }
 
 impl Reranker for PythonReranker {
-    fn segments(&self) -> &[Segment] {
-        &self.declaration.segments
-    }
-
     fn requires(&self) -> &Requirements {
         &self.declaration.requires
     }
@@ -291,18 +303,19 @@ impl Reranker for PythonReranker {
         query: &Query,
         candidates: &[Candidate],
         budget: &ResourceBudget,
-    ) -> lateweave::Result<Vec<f32>> {
+    ) -> lateweave::Result<Scored> {
         Python::attach(|py| {
             let arguments = PyDict::new(py);
             arguments.set_item("budget", PyResourceBudget { inner: *budget })?;
             let query = PyQuery {
                 inner: query.clone(),
             };
-            scores_from_py(&self.object.bind(py).call_method(
+            let scored = self.object.bind(py).call_method(
                 "rerank",
                 (query, candidates_to_py(py, candidates)?),
                 Some(&arguments),
-            )?)
+            )?;
+            Ok(scored.downcast::<PyScored>()?.get().inner.clone())
         })
         .map_err(from_py)
     }
@@ -311,7 +324,7 @@ impl Reranker for PythonReranker {
 /// A multi-vector source implemented in Python.
 struct PythonSource {
     object: Py<PyAny>,
-    segment: Segment,
+    corpus: String,
     representation: Representation,
     score_semantics: String,
 }
@@ -320,16 +333,41 @@ impl PythonSource {
     fn new(source: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
             object: source.clone().unbind(),
-            segment: source
-                .getattr("segment")?
-                .downcast::<PySegment>()?
-                .get()
-                .inner
-                .clone(),
+            corpus: source.getattr("corpus")?.extract()?,
             representation: representation(&source.getattr("representation")?)?,
             score_semantics: source.getattr("score_semantics")?.extract()?,
         })
     }
+}
+
+impl MultiVectorSource for PythonSource {
+    fn corpus(&self) -> &str {
+        &self.corpus
+    }
+
+    fn representation(&self) -> &Representation {
+        &self.representation
+    }
+
+    fn score_semantics(&self) -> &str {
+        &self.score_semantics
+    }
+
+    fn view(&self) -> lateweave::Result<Arc<dyn VectorView>> {
+        Python::attach(|py| {
+            let view = self.object.bind(py).call_method0("view")?;
+            Ok(Arc::new(PythonView {
+                as_of: view.getattr("as_of")?.extract()?,
+                object: view.unbind(),
+            }) as Arc<dyn VectorView>)
+        })
+        .map_err(from_py)
+    }
+}
+
+struct PythonView {
+    object: Py<PyAny>,
+    as_of: SystemTime,
 }
 
 pub(crate) fn lengths(values: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
@@ -348,36 +386,28 @@ pub(crate) fn lengths(values: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
         .collect()
 }
 
-impl MultiVectorSource for PythonSource {
-    fn segment(&self) -> &Segment {
-        &self.segment
+impl VectorView for PythonView {
+    fn as_of(&self) -> SystemTime {
+        self.as_of
     }
 
-    fn representation(&self) -> &Representation {
-        &self.representation
-    }
-
-    fn score_semantics(&self) -> &str {
-        &self.score_semantics
-    }
-
-    fn document_lengths(&self, document_ids: &[u64]) -> lateweave::Result<Vec<usize>> {
+    fn document_lengths(&self, document_ids: &[&str]) -> lateweave::Result<Vec<Option<usize>>> {
         Python::attach(|py| {
             let lengths = self
                 .object
                 .bind(py)
-                .call_method1("document_lengths", (document_ids,))?;
+                .call_method1("document_lengths", (PyList::new(py, document_ids)?,))?;
             document_ids
                 .iter()
-                .map(|&document_id| lengths.get_item(document_id)?.extract())
-                .collect::<PyResult<Vec<usize>>>()
+                .map(|&document_id| lengths.call_method1("get", (document_id,))?.extract())
+                .collect::<PyResult<Vec<Option<usize>>>>()
         })
         .map_err(from_py)
     }
 
     fn fetch(
         &self,
-        document_ids: &[u64],
+        document_ids: &[&str],
         threads: Option<usize>,
     ) -> lateweave::Result<PackedDocuments> {
         let (vectors, lengths, dimension) = Python::attach(|py| {
@@ -386,7 +416,7 @@ impl MultiVectorSource for PythonSource {
             let (vectors, document_lengths): (Bound<'_, PyAny>, Bound<'_, PyAny>) = self
                 .object
                 .bind(py)
-                .call_method("fetch", (document_ids,), Some(&arguments))?
+                .call_method("fetch", (PyList::new(py, document_ids)?,), Some(&arguments))?
                 .extract()?;
             let vectors = vectors.extract::<PyArrayLike2<'_, f32, AllowTypeChange>>()?;
             let view = vectors.as_array();
@@ -397,91 +427,22 @@ impl MultiVectorSource for PythonSource {
     }
 }
 
-/// A Python object whose ``current()`` returns its current snapshot, wrapped
-/// once per distinct snapshot object.
-struct PythonLive<S: ?Sized> {
-    object: Py<PyAny>,
-    wrap: fn(&Bound<'_, PyAny>) -> PyResult<Arc<S>>,
-    last: Mutex<Option<(Py<PyAny>, Arc<S>)>>,
-}
-
-impl<S: ?Sized + Send + Sync> Live<S> for PythonLive<S> {
-    fn current(&self) -> lateweave::Result<Arc<S>> {
-        Python::attach(|py| {
-            let snapshot = self.object.bind(py).call_method0("current")?;
-            // No Python runs while the lock is held, so a thread switch
-            // inside `wrap` cannot leave another thread waiting on it.
-            if let Some((object, wrapped)) =
-                &*self.last.lock().unwrap_or_else(PoisonError::into_inner)
-            {
-                if object.bind(py).is(&snapshot) {
-                    return Ok(wrapped.clone());
-                }
-            }
-            let wrapped = (self.wrap)(&snapshot)?;
-            *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some((snapshot.unbind(), wrapped.clone()));
-            Ok(wrapped)
-        })
-        .map_err(from_py)
-    }
-}
-
-/// A Python stage or source: live when it defines ``current()``, otherwise
-/// the snapshot itself.
-fn python_stage<S: ?Sized + Send + Sync + 'static>(
-    object: &Bound<'_, PyAny>,
-    wrap: fn(&Bound<'_, PyAny>) -> PyResult<Arc<S>>,
-) -> PyResult<Arc<dyn Live<S>>> {
-    Ok(if object.hasattr("current")? {
-        Arc::new(PythonLive {
-            object: object.clone().unbind(),
-            wrap,
-            last: Mutex::new(None),
-        })
-    } else {
-        Arc::new(Fixed(wrap(object)?))
-    })
-}
-
-fn wrap_gatherer(object: &Bound<'_, PyAny>) -> PyResult<Arc<dyn CandidateGenerator>> {
-    Ok(Arc::new(PythonGatherer {
-        object: object.clone().unbind(),
-        declaration: Declaration::read(object)?,
-    }))
-}
-
-fn wrap_reranker(object: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Reranker>> {
-    Ok(Arc::new(PythonReranker {
-        object: object.clone().unbind(),
-        declaration: Declaration::read(object)?,
-    }))
-}
-
-fn wrap_source(object: &Bound<'_, PyAny>) -> PyResult<Arc<dyn MultiVectorSource>> {
-    Ok(Arc::new(PythonSource::new(object)?))
-}
-
-fn source_stage(source: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Live<dyn MultiVectorSource>>> {
-    if let Ok(snapshot) = source.downcast::<PyStoreSnapshot>() {
-        let snapshot: Arc<dyn MultiVectorSource> = snapshot.get().inner.clone();
-        return Ok(Arc::new(Fixed(snapshot)));
-    }
+fn source(source: &Bound<'_, PyAny>) -> PyResult<Arc<dyn MultiVectorSource>> {
     if let Ok(store) = source.downcast::<PyVectorStore>() {
         return Ok(store.get().inner.clone());
     }
-    python_stage(source, wrap_source)
+    Ok(Arc::new(PythonSource::new(source)?))
 }
 
 /// MaxSim between the query's token matrix and each candidate's document,
-/// read from the source of the candidate's segment.
+/// read from the source of the candidate's corpus.
 ///
-/// Each source, one per segment, is a vector store, followed as it publishes;
-/// a store snapshot; or any object implementing the ``MultiVectorSource``
-/// protocol, followed through its ``current()`` when it defines one.
+/// Each source, one per corpus, is a ``VectorStore`` or any object
+/// implementing the ``MultiVectorSource`` protocol. Every rerank takes one
+/// view of each source; a document a view does not hold is unscored.
 #[pyclass(name = "MaxSimReranker", frozen, module = "lateweave._native")]
 pub(crate) struct PyMaxSimReranker {
-    inner: Arc<LiveMaxSimReranker>,
+    inner: Arc<MaxSimReranker>,
     sources: Py<PyTuple>,
 }
 
@@ -496,10 +457,10 @@ impl PyMaxSimReranker {
         )?;
         let native = sources
             .iter()
-            .map(|source| source_stage(&source))
+            .map(|item| source(&item))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(Self {
-            inner: Arc::new(LiveMaxSimReranker::new(native, feature).map_err(to_py)?),
+            inner: Arc::new(MaxSimReranker::new(native, feature).map_err(to_py)?),
             sources: sources.unbind(),
         })
     }
@@ -509,23 +470,14 @@ impl PyMaxSimReranker {
         self.sources.clone_ref(py)
     }
 
-    /// The segments of the sources' current snapshots.
-    #[getter]
-    fn segments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let pinned = py.detach(|| self.inner.pinned()).map_err(to_py)?;
-        segments_to_py(py, pinned.segments())
-    }
-
     #[getter]
     fn requires<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let pinned = py.detach(|| self.inner.pinned()).map_err(to_py)?;
-        requirements_to_py(py, pinned.requires())
+        requirements_to_py(py, self.inner.requires())
     }
 
     #[getter]
-    fn score_semantics(&self, py: Python<'_>) -> PyResult<String> {
-        let pinned = py.detach(|| self.inner.pinned()).map_err(to_py)?;
-        Ok(pinned.score_semantics().to_string())
+    fn score_semantics(&self) -> &str {
+        self.inner.score_semantics()
     }
 
     #[getter]
@@ -533,22 +485,21 @@ impl PyMaxSimReranker {
         self.inner.feature()
     }
 
-    /// One float32 score per candidate, in candidate order.
     #[pyo3(signature = (query, candidates, *, budget))]
-    fn rerank<'py>(
+    fn rerank(
         &self,
-        py: Python<'py>,
-        query: &Bound<'py, PyQuery>,
-        candidates: &Bound<'py, PyAny>,
-        budget: &Bound<'py, PyResourceBudget>,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        py: Python<'_>,
+        query: &Bound<'_, PyQuery>,
+        candidates: &Bound<'_, PyAny>,
+        budget: &Bound<'_, PyResourceBudget>,
+    ) -> PyResult<PyScored> {
         let query = query.get().inner.clone();
         let candidates = candidates_from_py(candidates)?;
         let budget = budget.get().inner;
-        let scores = py
-            .detach(|| self.inner.pinned()?.rerank(&query, &candidates, &budget))
+        let inner = py
+            .detach(|| self.inner.rerank(&query, &candidates, &budget))
             .map_err(to_py)?;
-        Ok(PyArray1::from_vec(py, scores))
+        Ok(PyScored { inner })
     }
 }
 
@@ -560,25 +511,13 @@ pub(crate) struct PyRankedDocument {
 #[pymethods]
 impl PyRankedDocument {
     #[getter]
-    fn segment(&self) -> PySegment {
-        self.inner.segment.clone().into()
+    fn corpus(&self) -> &str {
+        self.inner.key.corpus()
     }
 
     #[getter]
-    fn corpus_id(&self) -> &str {
-        self.inner.segment.corpus_id()
-    }
-
-    #[getter]
-    fn document_id(&self) -> u64 {
-        self.inner.document_id
-    }
-
-    #[getter]
-    fn external_id(&self) -> &str {
-        self.inner
-            .external_id()
-            .expect("a search ranks only documents inside their segment")
+    fn document_id(&self) -> &str {
+        self.inner.key.id()
     }
 
     #[getter]
@@ -593,10 +532,9 @@ impl PyRankedDocument {
 
     fn __repr__(&self) -> String {
         format!(
-            "RankedDocument(corpus_id={:?}, document_id={}, external_id={:?}, score={}, rank={})",
-            self.corpus_id(),
-            self.inner.document_id,
-            self.external_id(),
+            "RankedDocument(corpus={:?}, document_id={:?}, score={}, rank={})",
+            self.inner.key.corpus(),
+            self.inner.key.id(),
             self.inner.score,
             self.inner.rank
         )
@@ -645,10 +583,18 @@ impl PySearchResult {
         candidates_to_py(py, &self.inner.candidates)
     }
 
-    /// ``scores[i]`` scores ``candidates[i]``.
+    /// ``scores[i]`` scores ``candidates[i]``; ``None`` when the reranker's
+    /// index does not hold it.
     #[getter]
-    fn scores<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
-        PyArray1::from_slice(py, &self.inner.scores)
+    fn scores(&self) -> Vec<Option<f32>> {
+        self.inner.scores.clone()
+    }
+
+    /// Every write committed to every index the search read before this is
+    /// reflected in the result.
+    #[getter]
+    fn as_of(&self) -> SystemTime {
+        self.inner.as_of
     }
 
     #[getter]
@@ -661,10 +607,10 @@ impl PySearchResult {
         let diagnostics = &self.inner.diagnostics;
         let output = PyDict::new(py);
         output.set_item("candidate_count", diagnostics.candidate_count)?;
+        output.set_item("dropped", diagnostics.dropped)?;
         output.set_item("gatherer", &diagnostics.gatherer)?;
         output.set_item("reranker", &diagnostics.reranker)?;
         output.set_item("score_semantics", &diagnostics.score_semantics)?;
-        output.set_item("stale", diagnostics.stale)?;
         Ok(output)
     }
 }
@@ -672,7 +618,8 @@ impl PySearchResult {
 /// Gather, optionally rerank, then deterministic top-k.
 ///
 /// Stages are Python objects implementing the ``CandidateGenerator`` and
-/// ``Reranker`` protocols, or native stages such as ``MaxSimReranker``.
+/// ``Reranker`` protocols, or native stages such as ``MaxSimReranker``. A
+/// document is ranked only when every stage holds it.
 #[pyclass(name = "SearchPipeline", frozen, module = "lateweave._native")]
 pub(crate) struct PySearchPipeline {
     inner: SearchPipeline,
@@ -680,39 +627,34 @@ pub(crate) struct PySearchPipeline {
 
 #[pymethods]
 impl PySearchPipeline {
-    /// A stage that defines ``current()`` is followed: the pipeline asks it
-    /// for its current snapshot at the start of every search.
     #[new]
     #[pyo3(signature = (gatherer, reranker=None))]
-    fn new(
-        py: Python<'_>,
-        gatherer: &Bound<'_, PyAny>,
-        reranker: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
-        let gatherer = python_stage(gatherer, wrap_gatherer)?;
+    fn new(gatherer: &Bound<'_, PyAny>, reranker: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let gatherer = Arc::new(PythonGatherer {
+            object: gatherer.clone().unbind(),
+            declaration: Declaration::read(gatherer)?,
+        });
         let reranker = reranker
-            .map(|reranker| -> PyResult<Arc<dyn Live<dyn Reranker>>> {
+            .map(|reranker| -> PyResult<Arc<dyn Reranker>> {
                 match reranker.downcast::<PyMaxSimReranker>() {
                     Ok(native) => Ok(native.get().inner.clone()),
-                    Err(_) => python_stage(reranker, wrap_reranker),
+                    Err(_) => Ok(Arc::new(PythonReranker {
+                        object: reranker.clone().unbind(),
+                        declaration: Declaration::read(reranker)?,
+                    })),
                 }
             })
             .transpose()?;
-        let inner = py
-            .detach(|| SearchPipeline::new(gatherer, reranker))
-            .map_err(to_py)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: SearchPipeline::new(gatherer, reranker),
+        })
     }
 
-    /// A pipeline fixed on the snapshots the next search would run on.
-    fn freeze(&self, py: Python<'_>) -> PyResult<Self> {
-        let inner = py.detach(|| self.inner.freeze()).map_err(to_py)?;
-        Ok(Self { inner })
-    }
-
-    /// ``query`` is a ``Query`` or plain text; ``subset`` maps corpus IDs to
-    /// the ascending internal IDs the search is restricted to.
-    #[pyo3(signature = (query, *, gather_limit, limit, subset=None, budget=None))]
+    /// ``query`` is a ``Query`` or plain text; ``subset`` maps corpora to the
+    /// document IDs the search is restricted to; ``max_lag`` refuses results
+    /// from indexes whose last commit is older.
+    #[pyo3(signature = (query, *, gather_limit, limit, subset=None, budget=None, max_lag=None))]
+    #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
         py: Python<'_>,
@@ -721,6 +663,7 @@ impl PySearchPipeline {
         limit: i64,
         subset: Option<&Bound<'_, PyAny>>,
         budget: Option<&Bound<'_, PyResourceBudget>>,
+        max_lag: Option<Duration>,
     ) -> PyResult<PySearchResult> {
         let query = PyQuery::from_python(query)?;
         let subset = subset.map(subset_from_py).transpose()?;
@@ -731,6 +674,7 @@ impl PySearchPipeline {
             limit: usize::try_from(limit).unwrap_or(0),
             subset: subset.as_ref(),
             budget: budget.map_or_else(ResourceBudget::default, |budget| budget.get().inner),
+            max_lag,
         };
         let result = py
             .detach(|| self.inner.search(&query, &request))

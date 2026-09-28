@@ -27,15 +27,16 @@ pub enum RankingError {
     NanScore(usize),
 }
 
-/// Validate one score per candidate and return candidate positions in final
-/// rank order.
+/// Validate one score or `None` per candidate and return the positions of
+/// the scored candidates in final rank order.
 ///
-/// `scores[i]` scores `candidates[i]`. Ties keep gather order, which is total
-/// because gather ranks are the candidates' positions. Gather scores never
-/// participate unless they are the scores.
+/// `scores[i]` scores `candidates[i]`; unscored candidates are not ranked.
+/// Ties keep gather order, which is total because gather ranks are the
+/// candidates' positions. Gather scores never participate unless they are
+/// the scores.
 pub fn validate_and_rank(
     candidates: &[Candidate],
-    scores: &[f32],
+    scores: &[Option<f32>],
     limit: usize,
 ) -> Result<Vec<usize>, RankingError> {
     if scores.len() != candidates.len() {
@@ -44,32 +45,37 @@ pub fn validate_and_rank(
             scores: scores.len(),
         });
     }
-    if let Some(position) = scores.iter().position(|score| score.is_nan()) {
+    if let Some(position) = scores
+        .iter()
+        .position(|score| score.is_some_and(f32::is_nan))
+    {
         return Err(RankingError::NanScore(position));
     }
-    let mut positions = (0..scores.len()).collect::<Vec<_>>();
-    positions.sort_unstable_by(|&left, &right| {
-        scores[right].total_cmp(&scores[left]).then_with(|| {
+    let mut ranked = scores
+        .iter()
+        .enumerate()
+        .filter_map(|(position, score)| score.map(|score| (position, score)))
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|&(left, left_score), &(right, right_score)| {
+        right_score.total_cmp(&left_score).then_with(|| {
             candidates[left]
                 .gather_rank
                 .cmp(&candidates[right].gather_rank)
         })
     });
-    positions.truncate(limit.min(positions.len()));
-    Ok(positions)
+    ranked.truncate(limit);
+    Ok(ranked.into_iter().map(|(position, _)| position).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::Segment;
+    use crate::stage::DocumentKey;
 
     fn candidates(count: usize) -> Vec<Candidate> {
-        let segment = Segment::new("docs", "1", 0, (0..count).map(|id| id.to_string())).unwrap();
         (0..count)
             .map(|rank| Candidate {
-                segment: segment.clone(),
-                document_id: rank as u64,
+                key: DocumentKey::new("docs", rank.to_string()),
                 gather_score: 0.0,
                 gather_rank: rank,
                 provenance: "test".to_string(),
@@ -79,25 +85,34 @@ mod tests {
 
     #[test]
     fn ranking_uses_gather_order_only_as_a_tie_breaker() {
-        let order = validate_and_rank(&candidates(3), &[2.0, 3.0, 2.0], 3).unwrap();
-        assert_eq!(order, vec![1, 0, 2]);
+        let scores = [Some(2.0), Some(3.0), Some(2.0)];
         assert_eq!(
-            validate_and_rank(&candidates(3), &[2.0, 3.0, 2.0], 1).unwrap(),
-            vec![1]
+            validate_and_rank(&candidates(3), &scores, 3).unwrap(),
+            [1, 0, 2]
+        );
+        assert_eq!(validate_and_rank(&candidates(3), &scores, 1).unwrap(), [1]);
+    }
+
+    #[test]
+    fn unscored_candidates_are_not_ranked() {
+        let scores = [None, Some(1.0), None, Some(4.0)];
+        assert_eq!(
+            validate_and_rank(&candidates(4), &scores, 4).unwrap(),
+            [3, 1]
         );
     }
 
     #[test]
     fn ranking_requires_one_score_per_candidate() {
         assert_eq!(
-            validate_and_rank(&candidates(2), &[1.0], 2).unwrap_err(),
+            validate_and_rank(&candidates(2), &[Some(1.0)], 2).unwrap_err(),
             RankingError::ScoreCount {
                 candidates: 2,
                 scores: 1
             }
         );
         assert_eq!(
-            validate_and_rank(&candidates(2), &[1.0, f32::NAN], 2).unwrap_err(),
+            validate_and_rank(&candidates(2), &[None, Some(f32::NAN)], 2).unwrap_err(),
             RankingError::NanScore(1)
         );
     }

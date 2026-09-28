@@ -1,62 +1,68 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pytest
 
 from lateweave import (
     Candidate,
     Feature,
-    IncompatibleIndexError,
+    Gathered,
     IncompatibleQueryError,
     Query,
     Representation,
     ResourceBudget,
+    Scored,
     SearchPipeline,
-    Segment,
+    StaleError,
     maxsim_scores_packed,
 )
 
 
-SEGMENT = Segment("corpus", "1", ["x", "y", "z"])
 REPRESENTATION = Representation("encoder", "1", 2, True)
+NOW = datetime.now(timezone.utc)
+ROWS = (("corpus", "z", 100.0), ("corpus", "x", 10.0), ("corpus", "y", 10.0))
 
 
 class TextGatherer:
     requires: dict[str, Representation] = {}
     score_semantics = "external-gather"
 
-    def __init__(self, segment: Segment = SEGMENT) -> None:
-        self.segments = (segment,)
+    def __init__(self, rows=ROWS, as_of=NOW) -> None:  # type: ignore[no-untyped-def]
+        self.rows = rows
+        self.as_of = as_of
         self.calls = 0
-        self.subsets: list[dict[str, np.ndarray] | None] = []
+        self.subsets: list[dict[str, frozenset[str]] | None] = []
 
-    def gather(self, query: Query, limit: int, *, subset=None) -> tuple[Candidate, ...]:
+    def gather(self, query: Query, limit: int, *, subset=None) -> Gathered:  # type: ignore[no-untyped-def]
         self.calls += 1
         self.subsets.append(subset)
-        assert query.text == "query"
-        (segment,) = self.segments
-        rows = [(2, 100.0), (0, 10.0), (1, 10.0)]
-        if subset is not None:
-            rows = [row for row in rows if row[0] in subset[segment.corpus_id]]
-        return tuple(
-            Candidate(segment, document_id, gather_score, rank, "external")
-            for rank, (document_id, gather_score) in enumerate(rows[:limit])
+        rows = [
+            row for row in self.rows if subset is None or row[1] in subset.get(row[0], frozenset())
+        ]
+        return Gathered(
+            [
+                Candidate(corpus, document_id, score, rank, "external")
+                for rank, (corpus, document_id, score) in enumerate(rows[:limit])
+            ],
+            self.as_of,
         )
 
 
-class VectorReranker:
+class TableReranker:
     requires = {"multi_vector": REPRESENTATION}
-    score_semantics = "external-rerank"
+    score_semantics = "table"
 
-    def __init__(self, *segments: Segment) -> None:
-        self.segments = segments or (SEGMENT,)
-        self.received: list[int] = []
+    def __init__(self, table: dict[str, float], as_of: datetime = NOW) -> None:
+        self.table = table
+        self.as_of = as_of
+        self.received: list[str] = []
 
-    def rerank(self, query, candidates, *, budget: ResourceBudget) -> list[float]:
+    def rerank(self, query, candidates, *, budget: ResourceBudget) -> Scored:  # type: ignore[no-untyped-def]
         assert query.feature("multi_vector", REPRESENTATION).shape == (1, 2)
         self.received = [candidate.document_id for candidate in candidates]
-        values = {0: 3.0, 1: 5.0, 2: 2.0}
-        return [values[item] for item in self.received]
+        return Scored([self.table.get(item) for item in self.received], self.as_of)
 
 
 def vector_query() -> Query:
@@ -65,167 +71,104 @@ def vector_query() -> Query:
     )
 
 
-def test_gatherer_and_reranker_compose_without_backend_dependencies() -> None:
-    reranker = VectorReranker()
-    result = SearchPipeline(TextGatherer(), reranker).search(
-        vector_query(), gather_limit=3, limit=2
-    )
+def ids(result) -> list[str]:  # type: ignore[no-untyped-def]
+    return [row.document_id for row in result.documents]
 
-    assert reranker.received == [2, 0, 1]
-    assert [row.document_id for row in result.documents] == [1, 0]
-    assert [row.external_id for row in result.documents] == ["y", "x"]
-    assert result.documents[0].segment == SEGMENT
-    assert result.scores.tolist() == [2.0, 3.0, 5.0]
+
+def test_gatherer_and_reranker_compose_by_document_id() -> None:
+    reranker = TableReranker({"x": 3.0, "y": 5.0, "z": 2.0})
+    result = SearchPipeline(TextGatherer(), reranker).search(vector_query(), gather_limit=3, limit=2)
+
+    assert reranker.received == ["z", "x", "y"]
+    assert ids(result) == ["y", "x"]
+    assert [row.corpus for row in result.documents] == ["corpus", "corpus"]
+    assert result.scores == [2.0, 3.0, 5.0]
+    assert result.as_of == NOW
     assert result.diagnostics == {
         "candidate_count": 3,
+        "dropped": 0,
         "gatherer": "TextGatherer",
-        "reranker": "VectorReranker",
-        "score_semantics": "external-rerank",
-        "stale": False,
+        "reranker": "TableReranker",
+        "score_semantics": "table",
     }
 
 
-def test_gather_scores_do_not_leak_into_a_reranked_result() -> None:
-    result = SearchPipeline(TextGatherer(), VectorReranker()).search(
+def test_a_document_the_reranker_lacks_is_dropped() -> None:
+    result = SearchPipeline(TextGatherer(), TableReranker({"x": 3.0, "z": 2.0})).search(
         vector_query(), gather_limit=3, limit=3
     )
-    assert [row.document_id for row in result.documents] == [1, 0, 2]
+    assert ids(result) == ["x", "z"]
+    assert result.scores == [2.0, 3.0, None]
+    assert result.diagnostics["dropped"] == 1
+
+
+def test_the_result_is_as_fresh_as_its_oldest_stage() -> None:
+    older = NOW - timedelta(minutes=5)
+    result = SearchPipeline(TextGatherer(), TableReranker({"x": 1.0}, as_of=older)).search(
+        vector_query(), gather_limit=3, limit=1
+    )
+    assert result.as_of == older
+
+
+def test_max_lag_refuses_indexes_older_than_it() -> None:
+    gatherer = TextGatherer(as_of=datetime.now(timezone.utc) - timedelta(minutes=2))
+    pipeline = SearchPipeline(gatherer)
+    assert ids(pipeline.search("query", gather_limit=3, limit=1, max_lag=timedelta(minutes=5))) == ["z"]
+    with pytest.raises(StaleError, match="allowed"):
+        pipeline.search("query", gather_limit=3, limit=1, max_lag=timedelta(minutes=1))
 
 
 def test_without_a_reranker_gather_scores_rank_with_gather_rank_tie_break() -> None:
     result = SearchPipeline(TextGatherer()).search("query", gather_limit=3, limit=3)
-
-    assert [row.document_id for row in result.documents] == [2, 0, 1]
+    assert ids(result) == ["z", "x", "y"]
     assert [row.score for row in result.documents] == [100.0, 10.0, 10.0]
     assert result.diagnostics["reranker"] is None
     assert result.diagnostics["score_semantics"] == "external-gather"
 
 
-class FusedGatherer:
-    """Appends the hits of two segments; their scores are not comparable."""
-
-    requires: dict[str, Representation] = {}
-    score_semantics = "unranked-union"
-
-    def __init__(self, left: Segment, right: Segment) -> None:
-        self.segments = (left, right)
-
-    def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
-        left, right = self.segments
-        rows = [(left, 0), (right, 1), (left, 2), (right, 0)]
-        return tuple(
-            Candidate(segment, document_id, 0.0, rank, segment.corpus_id)
-            for rank, (segment, document_id) in enumerate(rows[:limit])
-        )
-
-
-def test_one_gatherer_ranks_candidates_from_two_segments() -> None:
-    laws = Segment("laws", "1", ["l0", "l1", "l2"])
-    cases = Segment("cases", "1", ["c0", "c1"])
-
-    class TableReranker(VectorReranker):
-        def rerank(self, query, candidates, *, budget):  # type: ignore[no-untyped-def]
-            table = {"l0": 1.0, "l2": 4.0, "c0": 3.0, "c1": 2.0}
-            return np.asarray([table[candidate.external_id] for candidate in candidates])
-
-    result = SearchPipeline(FusedGatherer(laws, cases), TableReranker(laws, cases)).search(
-        vector_query(), gather_limit=4, limit=4
+def test_one_gatherer_ranks_candidates_from_two_corpora() -> None:
+    gatherer = TextGatherer(
+        [("laws", "l0", 0.0), ("cases", "c1", 0.0), ("laws", "l2", 0.0), ("cases", "c0", 0.0)]
     )
 
-    assert [(row.corpus_id, row.external_id) for row in result.documents] == [
+    class ByKey(TableReranker):
+        def rerank(self, query, candidates, *, budget):  # type: ignore[no-untyped-def]
+            table = {("laws", "l0"): 1.0, ("laws", "l2"): 4.0, ("cases", "c0"): 3.0, ("cases", "c1"): 2.0}
+            return Scored([table[(c.corpus, c.document_id)] for c in candidates], NOW)
+
+    result = SearchPipeline(gatherer, ByKey({})).search(vector_query(), gather_limit=4, limit=4)
+    assert [(row.corpus, row.document_id) for row in result.documents] == [
         ("laws", "l2"),
         ("cases", "c0"),
         ("cases", "c1"),
         ("laws", "l0"),
     ]
-    assert [candidate.provenance for candidate in result.candidates] == [
-        "laws", "cases", "laws", "cases",
-    ]
-
-
-def test_the_reranker_must_hold_every_segment_the_gatherer_searches() -> None:
-    laws = Segment("laws", "1", ["l0"])
-    cases = Segment("cases", "1", ["c0"])
-    with pytest.raises(IncompatibleIndexError, match="'cases'|\"cases\""):
-        SearchPipeline(FusedGatherer(laws, cases), VectorReranker(laws))
-    with pytest.raises(IncompatibleIndexError, match="generation"):
-        SearchPipeline(FusedGatherer(laws, cases), VectorReranker(laws, cases.appended(["c1"])))
-
-
-def test_candidates_must_come_from_a_declared_snapshot() -> None:
-    later = SEGMENT.appended(["w"])
-
-    class StaleGatherer(TextGatherer):
-        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
-            return (Candidate(later, 3, 1.0, 0, "stale"),)
-
-    with pytest.raises(IncompatibleIndexError):
-        SearchPipeline(StaleGatherer()).search("query", gather_limit=1, limit=1)
 
 
 def test_an_unservable_query_fails_before_gathering() -> None:
     gatherer = TextGatherer()
     with pytest.raises(IncompatibleQueryError, match="'multi_vector'"):
-        SearchPipeline(gatherer, VectorReranker()).search("query", gather_limit=3, limit=1)
-    assert gatherer.calls == 0
-
+        SearchPipeline(gatherer, TableReranker({})).search("query", gather_limit=3, limit=1)
     foreign = Query(
         "query",
-        multi_vector=Feature(
-            Representation("other", "1", 2, True), np.ones((1, 2), dtype=np.float32)
-        ),
+        multi_vector=Feature(Representation("other", "1", 2, True), np.ones((1, 2), dtype=np.float32)),
     )
     with pytest.raises(IncompatibleQueryError, match="encoder"):
-        SearchPipeline(gatherer, VectorReranker()).search(foreign, gather_limit=3, limit=1)
+        SearchPipeline(gatherer, TableReranker({})).search(foreign, gather_limit=3, limit=1)
     assert gatherer.calls == 0
 
 
-def test_subset_reaches_the_gatherer_per_segment_as_ascending_ids() -> None:
+def test_the_subset_reaches_the_gatherer_as_frozensets_per_corpus() -> None:
     gatherer = TextGatherer()
     result = SearchPipeline(gatherer).search(
-        "query", gather_limit=3, limit=2, subset={"corpus": np.asarray([0, 2], dtype=np.int64)}
+        "query", gather_limit=3, limit=3, subset={"corpus": ["x", "z", "x", "unknown"]}
     )
-    assert {key: value.tolist() for key, value in gatherer.subsets[0].items()} == {"corpus": [0, 2]}
-    assert [row.document_id for row in result.documents] == [2, 0]
-
-
-def test_a_segment_the_subset_omits_contributes_nothing() -> None:
-    laws = Segment("laws", "1", ["l0", "l1", "l2"])
-    cases = Segment("cases", "1", ["c0", "c1"])
-    received = []
-
-    class Recording(FusedGatherer):
-        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
-            received.append({key: value.tolist() for key, value in subset.items()})
-            return ()
-
-    SearchPipeline(Recording(laws, cases)).search(
-        "query", gather_limit=3, limit=1, subset={"cases": [1]}
-    )
-    assert received == [{"cases": [1], "laws": []}]
-
-
-def test_subset_must_be_ascending_inside_a_known_segment() -> None:
-    gatherer = TextGatherer()
-    for subset in ({"corpus": [2, 0]}, {"corpus": [0, 3]}, {"other": [0]}, {"corpus": [-1]}):
-        with pytest.raises(ValueError, match="subset"):
-            SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=subset)
-    with pytest.raises(TypeError, match="corpus IDs"):
-        SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=[0])
-    assert gatherer.calls == 0
-
-
-def test_a_repeated_subset_id_reaches_the_gatherer_once() -> None:
-    gatherer = TextGatherer()
-    SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset={"corpus": [0, 0, 2]})
-    assert gatherer.subsets[0]["corpus"].tolist() == [0, 2]
-
-
-@pytest.mark.parametrize("limits", [(-1, 1), (3, -1)])
-def test_negative_limits_are_value_errors(limits) -> None:
-    gather_limit, limit = limits
-    with pytest.raises(ValueError, match="must be positive"):
-        SearchPipeline(TextGatherer()).search("query", gather_limit=gather_limit, limit=limit)
+    assert gatherer.subsets[0] == {"corpus": frozenset({"x", "z", "unknown"})}
+    assert ids(result) == ["z", "x"]
+    with pytest.raises(TypeError, match="single string"):
+        SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset={"corpus": "x"})
+    with pytest.raises(TypeError, match="corpora"):
+        SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=["x"])
 
 
 def test_a_gatherer_that_ignores_the_subset_is_refused() -> None:
@@ -234,9 +177,14 @@ def test_a_gatherer_that_ignores_the_subset_is_refused() -> None:
             return super().gather(query, limit)
 
     with pytest.raises(ValueError, match="outside the subset"):
-        SearchPipeline(IgnoringGatherer()).search(
-            "query", gather_limit=3, limit=1, subset={"corpus": [0]}
-        )
+        SearchPipeline(IgnoringGatherer()).search("query", gather_limit=3, limit=1, subset={"corpus": ["x"]})
+
+
+@pytest.mark.parametrize("limits", [(-1, 1), (3, -1)])
+def test_negative_limits_are_value_errors(limits) -> None:  # type: ignore[no-untyped-def]
+    gather_limit, limit = limits
+    with pytest.raises(ValueError, match="must be positive"):
+        SearchPipeline(TextGatherer()).search("query", gather_limit=gather_limit, limit=limit)
 
 
 def test_gatherer_exceptions_reach_the_caller_unchanged() -> None:
@@ -248,24 +196,39 @@ def test_gatherer_exceptions_reach_the_caller_unchanged() -> None:
         SearchPipeline(FailingGatherer()).search("query", gather_limit=3, limit=1)
 
 
+def test_stage_results_must_be_gathered_and_scored_values() -> None:
+    class ListGatherer(TextGatherer):
+        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
+            return super().gather(query, limit).candidates
+
+    with pytest.raises(TypeError):
+        SearchPipeline(ListGatherer()).search("query", gather_limit=3, limit=1)
+    with pytest.raises(TypeError):
+        Gathered([], datetime(2026, 1, 1))
+
+
 def test_native_ranking_requires_one_score_per_candidate() -> None:
-    class BrokenReranker(VectorReranker):
+    class BrokenReranker(TableReranker):
         def rerank(self, query, candidates, *, budget):  # type: ignore[no-untyped-def]
-            return [1.0]
+            return Scored([1.0], NOW)
 
     with pytest.raises(ValueError, match="1 scores were returned for 3 candidates"):
-        SearchPipeline(TextGatherer(), BrokenReranker()).search(
-            vector_query(), gather_limit=3, limit=2
-        )
+        SearchPipeline(TextGatherer(), BrokenReranker({})).search(vector_query(), gather_limit=3, limit=2)
 
 
-def test_pipeline_rejects_noncanonical_gather_ranks() -> None:
-    class BrokenGatherer(TextGatherer):
+def test_pipeline_rejects_repeated_documents_and_noncanonical_ranks() -> None:
+    class Repeating(TextGatherer):
         def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
-            return (Candidate(SEGMENT, 0, 1.0, 4, "broken"),)
+            return Gathered([Candidate("corpus", "x", 1.0, 0, "t"), Candidate("corpus", "x", 1.0, 1, "t")], NOW)
 
+    class Skipping(TextGatherer):
+        def gather(self, query, limit, *, subset=None):  # type: ignore[no-untyped-def]
+            return Gathered([Candidate("corpus", "x", 1.0, 4, "t")], NOW)
+
+    with pytest.raises(ValueError, match="more than once"):
+        SearchPipeline(Repeating()).search("query", gather_limit=3, limit=1)
     with pytest.raises(ValueError, match="contiguous and zero-based"):
-        SearchPipeline(BrokenGatherer()).search("query", gather_limit=1, limit=1)
+        SearchPipeline(Skipping()).search("query", gather_limit=3, limit=1)
 
 
 def test_packed_maxsim_matches_reference_with_bounded_batches() -> None:
@@ -302,8 +265,6 @@ def test_packed_maxsim_matches_numpy_for_variable_documents(threads: int) -> Non
         expected.append(float((document @ query.T).max(axis=0).sum()))
         start += int(length)
 
-    observed = maxsim_scores_packed(
-        query, documents, lengths, max_batch_tokens=6, threads=threads
-    )
+    observed = maxsim_scores_packed(query, documents, lengths, max_batch_tokens=6, threads=threads)
 
     assert observed.tolist() == pytest.approx(expected, abs=2e-5)

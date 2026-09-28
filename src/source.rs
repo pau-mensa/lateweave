@@ -1,8 +1,10 @@
-//! Document token vectors, fetched by internal ID.
+//! Document token vectors, fetched by document ID.
+
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::error::{Error, Result};
-use crate::manifest::Representation;
-use crate::segment::Segment;
+use crate::representation::Representation;
 
 /// Token vectors of documents: a row-major float32 `[sum(lengths), dimension]`
 /// matrix holding each document's tokens contiguously, in `lengths` order.
@@ -52,31 +54,34 @@ impl PackedDocuments {
     }
 }
 
-/// Where a MaxSim reranker reads one segment's document vectors from.
-///
-/// A source is a snapshot: the vectors an internal ID of [`segment`] names
-/// never change for the life of the source, so a reranker holding it can
-/// never score an ID against another document's vectors. A mutable engine
-/// hands out a new source per snapshot.
+/// Where a MaxSim reranker reads one corpus's document vectors from.
 ///
 /// An engine that already holds document vectors implements this over them
-/// and stores nothing twice; a [`VectorStore`](crate::VectorStore) snapshot
+/// and stores nothing twice; a [`VectorStore`](crate::VectorStore)
 /// implements it for gatherers that keep no vectors. `score_semantics`
 /// qualifies what MaxSim over the fetched vectors means, since a source may
 /// reconstruct from a lossy code.
-///
-/// [`segment`]: MultiVectorSource::segment
 pub trait MultiVectorSource: Send + Sync {
-    /// The snapshot whose internal IDs `fetch` takes.
-    fn segment(&self) -> &Segment;
+    fn corpus(&self) -> &str;
 
     fn representation(&self) -> &Representation;
 
     fn score_semantics(&self) -> &str;
 
-    /// Token counts of `document_ids`, in the same order.
-    fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>>;
+    /// The source's current state, which a rerank reads throughout.
+    fn view(&self) -> Result<Arc<dyn VectorView>>;
+}
 
-    /// The documents' vectors in the requested order.
-    fn fetch(&self, document_ids: &[u64], threads: Option<usize>) -> Result<PackedDocuments>;
+/// One consistent state of a [`MultiVectorSource`]: the vectors a document
+/// ID names never change for the life of the view.
+pub trait VectorView: Send + Sync {
+    /// Every write committed to the source before this is visible in the view.
+    fn as_of(&self) -> SystemTime;
+
+    /// Token counts of `document_ids`, in the same order; `None` for a
+    /// document the view does not hold.
+    fn document_lengths(&self, document_ids: &[&str]) -> Result<Vec<Option<usize>>>;
+
+    /// The vectors of `document_ids`, which the view must hold, in order.
+    fn fetch(&self, document_ids: &[&str], threads: Option<usize>) -> Result<PackedDocuments>;
 }

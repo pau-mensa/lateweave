@@ -56,30 +56,38 @@ def test_query_text_is_always_available() -> None:
 
 DEADLOCK_PROBE = """
 import threading, time
+from datetime import datetime, timezone
 import numpy as np
 from lateweave import (
-    Candidate, Feature, MaxSimReranker, Query, Representation, SearchPipeline, Segment,
+    Candidate, Feature, Gathered, MaxSimReranker, Query, Representation, SearchPipeline,
 )
 
 representation = Representation("encoder", "1", 2, True)
-segment = Segment("corpus", "1", ["a", "b"])
+rows = {"a": 0, "b": 1}
+now = datetime.now(timezone.utc)
 
-class Source:
-    representation = representation
-    score_semantics = "in-memory"
-    segment = segment
+class View:
+    as_of = now
     def document_lengths(self, document_ids):
         return {item: 1 for item in document_ids}
     def fetch(self, document_ids, *, threads=None):
-        rows = np.eye(2, dtype=np.float32)[list(document_ids)]
-        return rows, np.ones(len(document_ids), dtype=np.int64)
+        vectors = np.eye(2, dtype=np.float32)[[rows[item] for item in document_ids]]
+        return vectors, np.ones(len(document_ids), dtype=np.int64)
+
+class Source:
+    corpus = "corpus"
+    representation = representation
+    score_semantics = "in-memory"
+    def view(self):
+        return View()
 
 class Gatherer:
-    segments = (segment,)
     requires = {}
     score_semantics = "gather"
     def gather(self, query, limit, *, subset=None):
-        return (Candidate(segment, 0, 1.0, 0, "t"), Candidate(segment, 1, 1.0, 1, "t"))
+        return Gathered(
+            [Candidate("corpus", "a", 1.0, 0, "t"), Candidate("corpus", "b", 1.0, 1, "t")], now
+        )
 
 def encode():
     time.sleep(0.3)

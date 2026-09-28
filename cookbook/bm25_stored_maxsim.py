@@ -14,25 +14,24 @@ Run from the lateweave package directory:
 
     uv run --with-editable . cookbook/bm25_stored_maxsim.py --help
 
+Two sides share one index directory and nothing else. ``build``, ``upsert``,
+``delete``, and ``compact`` are the indexer: they keep ``documents.jsonl``, a
+bm25s index, and a lateweave vector store up to date, each committed on its
+own. ``search`` is the server: it follows whatever each index last committed,
+ranks only the documents both hold, and reports how fresh the answer is.
+
 The lexical stage is bm25s. It consumes only the query text, so it declares no
 query features. What a caller can still get wrong is building with one analyzer
 and querying with another, which loses terms silently. So the analyzer is
 persisted next to the index and read back on every open and every mutation.
+bm25s has no incremental append or delete, so each mutation builds the next
+lexical generation from ``documents.jsonl`` and publishes it by renaming
+``bm25/current.json``.
 
-The rerank stage is lateweave's MaxSim reranker over a lateweave vector store.
-The store carries the encoder representation it was built from, and a search
-that supplies token embeddings must supply them from that encoder. A search
-without embeddings is gather-only: BM25 scores rank.
-
-Both stages index one segment: the external IDs of ``documents.jsonl`` in
-order, at the generation ``corpus-manifest.json`` records. The vector store
-keeps its own copy of the segment, so a pipeline pairing the lexical index with
-a store built over other documents, or left at another generation, is refused.
-
-bm25s has no incremental append or delete, so ``update`` and ``delete`` rebuild
-the lexical index from ``documents.jsonl``, which this recipe maintains anyway.
-The vector store keeps its incremental paths, and each mutation checks that the
-store's next segment is the one the documents file now describes.
+The rerank stage is lateweave's MaxSim reranker over a lateweave vector store,
+which carries the encoder representation it was built from: a search that
+supplies token embeddings must supply them from that encoder. A search without
+embeddings is gather-only: BM25 scores rank.
 """
 
 from __future__ import annotations
@@ -40,42 +39,38 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import fcntl
-import gc
 import json
 from pathlib import Path
 import re
 import shutil
 import sys
-import tempfile
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 import unicodedata
-import uuid
 
 import numpy as np
 
 from lateweave import (
     Candidate,
-    CorpusManifest,
     Feature,
-    Float32VectorStore,
-    Int8VectorStore,
+    Gathered,
     MaxSimReranker,
     Query,
     Representation,
     ResourceBudget,
     SearchPipeline,
-    Segment,
-    open_vector_store,
+    VectorStore,
+    VectorStoreWriter,
 )
 
 
-CORPUS_MANIFEST = "corpus-manifest.json"
 ANALYZER_FILE = "analyzer.json"
 DOCUMENTS_FILE = "documents.jsonl"
 VECTOR_DIRECTORY = "vectors"
 LEXICAL_DIRECTORY = "bm25"
-STORES = {"float32": Float32VectorStore, "int8": Int8VectorStore}
+CURRENT_FILE = "current.json"
+IDS_FILE = "ids.json"
 
 # Lucene's defaults, spelled out so a bm25s default change cannot move results.
 LEXICAL_METHOD = "lucene"
@@ -146,129 +141,61 @@ class Analyzer:
         return cls(stemmer=parameters.get("stemmer"))
 
 
-def write_lexical_index(path: Path, texts: Sequence[str], analyzer: Analyzer) -> None:
-    """Build the lexical index at ``path``, replacing anything already there."""
+# -- the indexer --------------------------------------------------------------
+
+
+def replace_file(path: Path, text: str) -> None:
+    staged = path.with_name(f".{path.name}.tmp")
+    staged.write_text(text, encoding="utf-8")
+    staged.replace(path)
+
+
+def publish_lexical_index(
+    index: Path, corpus: str, documents: Sequence[dict[str, str]], analyzer: Analyzer
+) -> None:
+    """Build the next lexical generation and make it current by rename."""
     import bm25s
 
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True)
-    index = bm25s.BM25(method=LEXICAL_METHOD, k1=LEXICAL_K1, b=LEXICAL_B)
-    index.index([analyzer.tokens(text) for text in texts], show_progress=False)
-    index.save(str(path), show_progress=False)
-    del index
-    gc.collect()
+    directory = index / LEXICAL_DIRECTORY
+    current = directory / CURRENT_FILE
+    generation = json.loads(current.read_text())["generation"] + 1 if current.exists() else 0
+    target = directory / str(generation)
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    lexical = bm25s.BM25(method=LEXICAL_METHOD, k1=LEXICAL_K1, b=LEXICAL_B)
+    lexical.index([analyzer.tokens(row["text"]) for row in documents], show_progress=False)
+    lexical.save(str(target), show_progress=False)
+    (target / IDS_FILE).write_text(json.dumps([row["id"] for row in documents]))
+    replace_file(
+        current,
+        json.dumps(
+            {
+                "corpus": corpus,
+                "generation": generation,
+                "committed_at": datetime.now(timezone.utc).timestamp(),
+            }
+        ),
+    )
+    for older in directory.iterdir():
+        if older.is_dir() and older.name != str(generation):
+            shutil.rmtree(older, ignore_errors=True)
 
 
 @contextmanager
-def index_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+def writer_lock(path: Path) -> Iterator[None]:
+    """Serializes indexers; searches never take it."""
     lock_path = path.parent / f".{path.name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def staged_index_copy(source: Path) -> Path:
-    temporary = Path(tempfile.mkdtemp(prefix=f".{source.name}.mutation.", dir=source.parent))
-    shutil.copytree(source, temporary, dirs_exist_ok=True)
-    return temporary
-
-
-def publish_replacement(source: Path, replacement: Path) -> None:
-    backup = source.parent / f".{source.name}.backup.{uuid.uuid4().hex}"
-    source.replace(backup)
-    try:
-        replacement.replace(source)
-    except BaseException:
-        backup.replace(source)
-        raise
-    else:
-        shutil.rmtree(backup)
-
-
-def read_segment(source: Path) -> Segment:
-    """The segment the manifest records, checked against ``documents.jsonl``."""
-    documents = load_documents(source / DOCUMENTS_FILE)
-    return Segment.from_manifest(
-        CorpusManifest.read(source / CORPUS_MANIFEST), [row["id"] for row in documents]
-    )
-
-
-def require_same_segment(store_segment: Segment, expected: Segment) -> None:
-    if store_segment != expected:
-        raise RuntimeError(
-            f"the vector store moved to {store_segment!r}, but the documents describe {expected!r}"
-        )
-
-
-class LexicalCandidateGenerator:
-    """Cookbook adapter; the lexical index remains external to lateweave."""
-
-    requires: dict[str, Representation] = {}
-    score_semantics = "bm25s-lucene"
-
-    def __init__(self, index: Any, segment: Segment, analyzer: Analyzer) -> None:
-        self.index = index
-        self.segment = segment
-        self.segments = (segment,)
-        self.analyzer = analyzer
-
-    @classmethod
-    def open(cls, path: Path, segment: Segment, analyzer: Analyzer) -> "LexicalCandidateGenerator":
-        import bm25s
-
-        index = bm25s.BM25.load(str(path), mmap=True, load_corpus=False, show_progress=False)
-        stored = int(index.scores["num_docs"])
-        if stored != len(segment):
-            raise RuntimeError(
-                f"lexical index holds {stored:,} documents but the segment "
-                f"holds {len(segment):,}"
-            )
-        return cls(index, segment, analyzer)
-
-    def gather(
-        self, query: Query, limit: int, *, subset: dict[str, np.ndarray] | None = None
-    ) -> tuple[Candidate, ...]:
-        terms = self.analyzer.tokens(query.text)
-        if not terms:
-            return ()
-        document_count = len(self.segment)
-        weight_mask = None
-        if subset is not None:
-            # bm25s multiplies scores by the mask; masked documents score zero
-            # and are dropped below with every other non-matching document.
-            weight_mask = np.zeros(document_count, dtype=np.float32)
-            weight_mask[subset[self.segment.corpus_id]] = 1.0
-        documents, scores = self.index.retrieve(
-            [terms],
-            k=min(limit, document_count),
-            show_progress=False,
-            weight_mask=weight_mask,
-        )
-        candidates = []
-        seen: set[int] = set()
-        for raw_document_id, raw_score in zip(documents[0].tolist(), scores[0].tolist()):
-            score = float(raw_score)
-            # Under the Lucene idf a zero score shares no term with the query.
-            if score != score or score <= 0.0:
-                continue
-            document_id = int(raw_document_id)
-            if not 0 <= document_id < document_count:
-                raise RuntimeError(f"bm25s returned out-of-range ID {document_id}")
-            if document_id in seen:
-                raise RuntimeError(f"bm25s returned duplicate ID {document_id}")
-            seen.add(document_id)
-            candidates.append(
-                Candidate(self.segment, document_id, score, len(candidates), "bm25s")
-            )
-        return tuple(candidates)
-
-
-def load_documents(path: Path) -> list[dict[str, str]]:
+def load_documents(path: Path, *, allow_empty: bool = False) -> list[dict[str, str]]:
     documents = []
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
@@ -279,12 +206,16 @@ def load_documents(path: Path) -> list[dict[str, str]]:
                 documents.append({"id": str(row["id"]), "text": str(row["text"])})
             except (json.JSONDecodeError, KeyError, TypeError) as error:
                 raise ValueError(f"invalid document at {path}:{line_number}") from error
-    if not documents:
+    if not documents and not allow_empty:
         raise ValueError("document input is empty")
     ids = [row["id"] for row in documents]
     if len(ids) != len(set(ids)):
-        raise ValueError("external document IDs must be unique")
+        raise ValueError("document IDs must be unique")
     return documents
+
+
+def write_documents(path: Path, documents: Sequence[dict[str, str]]) -> None:
+    replace_file(path, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in documents))
 
 
 def load_packed_embeddings(embeddings_path: Path, lengths_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -299,15 +230,8 @@ def load_packed_embeddings(embeddings_path: Path, lengths_path: Path) -> tuple[n
     return embeddings, lengths
 
 
-def write_documents(path: Path, documents: Sequence[dict[str, str]]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for document in documents:
-            handle.write(json.dumps(document, ensure_ascii=False) + "\n")
-
-
 def build_index(args: argparse.Namespace) -> None:
-    destination = args.index.expanduser().resolve()
-    analyzer = Analyzer(stemmer=args.stemmer)
+    index = args.index.expanduser().resolve()
     documents = load_documents(args.documents)
     packed, lengths = load_packed_embeddings(args.embeddings, args.document_lengths)
     if len(documents) != len(lengths):
@@ -320,158 +244,173 @@ def build_index(args: argparse.Namespace) -> None:
         query_template=args.query_template,
         document_template=args.document_template,
     )
-    segment = Segment(args.corpus_id, args.corpus_version, [row["id"] for row in documents])
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with index_lock(destination, exclusive=True):
-        if destination.exists():
-            raise FileExistsError(f"index already exists: {destination}")
-        temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
-        try:
-            write_documents(temporary / DOCUMENTS_FILE, documents)
-            analyzer.write(temporary / ANALYZER_FILE)
-            write_lexical_index(
-                temporary / LEXICAL_DIRECTORY, [row["text"] for row in documents], analyzer
-            )
-            STORES[args.storage].create(
-                temporary / VECTOR_DIRECTORY,
-                segment,
-                packed,
-                lengths,
-                representation,
-                threads=args.threads,
-            )
-            segment.manifest.write(temporary / CORPUS_MANIFEST)
-            temporary.replace(destination)
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
-    print(f"built {len(documents):,}-document {args.storage} index at {destination}")
+    analyzer = Analyzer(stemmer=args.stemmer)
+    with writer_lock(index):
+        if index.exists():
+            raise FileExistsError(f"index already exists: {index}")
+        index.mkdir(parents=True)
+        analyzer.write(index / ANALYZER_FILE)
+        write_documents(index / DOCUMENTS_FILE, documents)
+        publish_lexical_index(index, args.corpus_id, documents, analyzer)
+        writer = VectorStoreWriter.create(
+            index / VECTOR_DIRECTORY, args.corpus_id, representation, encoding=args.storage
+        )
+        writer.append([row["id"] for row in documents], packed, lengths, threads=args.threads)
+        writer.commit()
+    print(f"built {len(documents):,}-document {args.storage} index at {index}")
 
 
-def update_index(args: argparse.Namespace) -> None:
-    source = args.index.expanduser().resolve()
+def upsert_index(args: argparse.Namespace) -> None:
+    index = args.index.expanduser().resolve()
     additions = load_documents(args.documents)
     packed, lengths = load_packed_embeddings(args.embeddings, args.document_lengths)
     if len(additions) != len(lengths):
-        raise ValueError("new document and embedding counts differ")
-
-    with index_lock(source, exclusive=True):
-        if not source.is_dir():
-            raise FileNotFoundError(f"index not found: {source}")
-        existing = load_documents(source / DOCUMENTS_FILE)
-        # Refuses an external ID that already exists before anything is copied.
-        segment = read_segment(source).appended([row["id"] for row in additions])
-        analyzer = Analyzer.read(source / ANALYZER_FILE)
-        replacement = staged_index_copy(source)
-        try:
-            store = open_vector_store(replacement / VECTOR_DIRECTORY)
-            snapshot = store.append([row["id"] for row in additions], packed, lengths, threads=args.threads)
-            require_same_segment(snapshot.segment, segment)
-            documents = [*existing, *additions]
-            write_lexical_index(
-                replacement / LEXICAL_DIRECTORY, [row["text"] for row in documents], analyzer
-            )
-            write_documents(replacement / DOCUMENTS_FILE, documents)
-            segment.manifest.write(replacement / CORPUS_MANIFEST)
-            del store, snapshot
-            gc.collect()
-            publish_replacement(source, replacement)
-        finally:
-            if replacement.exists():
-                shutil.rmtree(replacement)
-    print(f"appended {len(additions):,} documents to {source}; generation {segment.generation}")
+        raise ValueError("document and embedding counts differ")
+    with writer_lock(index):
+        replaced = {row["id"] for row in additions}
+        existing = load_documents(index / DOCUMENTS_FILE, allow_empty=True)
+        documents = [row for row in existing if row["id"] not in replaced] + additions
+        writer = VectorStoreWriter(index / VECTOR_DIRECTORY)
+        writer.append([row["id"] for row in additions], packed, lengths, threads=args.threads)
+        writer.commit()
+        write_documents(index / DOCUMENTS_FILE, documents)
+        publish_lexical_index(index, writer.corpus, documents, Analyzer.read(index / ANALYZER_FILE))
+    print(f"upserted {len(additions):,} documents into {index}")
 
 
 def delete_index(args: argparse.Namespace) -> None:
-    source = args.index.expanduser().resolve()
-    requested = list(dict.fromkeys(args.document_id))
-    with index_lock(source, exclusive=True):
-        if not source.is_dir():
-            raise FileNotFoundError(f"index not found: {source}")
-        documents = load_documents(source / DOCUMENTS_FILE)
-        known = {row["id"] for row in documents}
-        missing = [item for item in requested if item not in known]
-        if missing:
-            raise ValueError(f"external document ID not found: {missing[0]}")
-        if len(requested) == len(documents):
-            raise ValueError("delete cannot remove every document from the index")
-        segment = read_segment(source).deleted(requested)
-        deleted = set(requested)
+    index = args.index.expanduser().resolve()
+    deleted = set(args.document_id)
+    with writer_lock(index):
+        documents = load_documents(index / DOCUMENTS_FILE, allow_empty=True)
         remaining = [row for row in documents if row["id"] not in deleted]
-        analyzer = Analyzer.read(source / ANALYZER_FILE)
-        replacement = staged_index_copy(source)
-        try:
-            store = open_vector_store(replacement / VECTOR_DIRECTORY)
-            snapshot = store.delete(requested)
-            require_same_segment(snapshot.segment, segment)
-            # Rebuilding over the survivors compacts internal IDs to 0..n-1 in
-            # document order, which is the order the segment compacts to.
-            write_lexical_index(
-                replacement / LEXICAL_DIRECTORY, [row["text"] for row in remaining], analyzer
+        writer = VectorStoreWriter(index / VECTOR_DIRECTORY)
+        count = writer.delete(sorted(deleted))
+        writer.commit()
+        write_documents(index / DOCUMENTS_FILE, remaining)
+        publish_lexical_index(index, writer.corpus, remaining, Analyzer.read(index / ANALYZER_FILE))
+    print(f"deleted {count:,} documents from {index}")
+
+
+def compact_index(args: argparse.Namespace) -> None:
+    index = args.index.expanduser().resolve()
+    with writer_lock(index):
+        writer = VectorStoreWriter(index / VECTOR_DIRECTORY)
+        writer.compact()
+        writer.commit()
+    print(f"compacted the vector store of {index}")
+
+
+# -- the server ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LexicalGeneration:
+    corpus: str
+    generation: int
+    committed_at: datetime
+    index: Any
+    ids: list[str]
+    rows: dict[str, int]
+
+
+class LexicalCandidateGenerator:
+    """Cookbook adapter; the lexical index remains external to lateweave.
+
+    Every search reads ``current.json`` and opens a generation only when it
+    moved, so what the indexer publishes is served on the next search.
+    """
+
+    requires: dict[str, Representation] = {}
+    score_semantics = "bm25s-lucene"
+
+    def __init__(self, path: Path, analyzer: Analyzer) -> None:
+        self.path = path
+        self.analyzer = analyzer
+        self.pinned: LexicalGeneration | None = None
+
+    def current(self) -> LexicalGeneration:
+        import bm25s
+
+        state = json.loads((self.path / CURRENT_FILE).read_text())
+        if self.pinned is None or self.pinned.generation != state["generation"]:
+            directory = self.path / str(state["generation"])
+            ids = json.loads((directory / IDS_FILE).read_text())
+            self.pinned = LexicalGeneration(
+                corpus=state["corpus"],
+                generation=state["generation"],
+                committed_at=datetime.fromtimestamp(state["committed_at"], timezone.utc),
+                index=bm25s.BM25.load(str(directory), mmap=True, load_corpus=False, show_progress=False),
+                ids=ids,
+                rows={item: row for row, item in enumerate(ids)},
             )
-            write_documents(replacement / DOCUMENTS_FILE, remaining)
-            segment.manifest.write(replacement / CORPUS_MANIFEST)
-            del store, snapshot
-            gc.collect()
-            publish_replacement(source, replacement)
-        finally:
-            if replacement.exists():
-                shutil.rmtree(replacement)
-    print(f"deleted {len(requested):,} documents from {source}; generation {segment.generation}")
+        return self.pinned
+
+    def gather(
+        self, query: Query, limit: int, *, subset: Mapping[str, frozenset[str]] | None = None
+    ) -> Gathered:
+        lexical = self.current()
+        terms = self.analyzer.tokens(query.text)
+        if not terms or not lexical.ids:
+            return Gathered([], lexical.committed_at)
+        weight_mask = None
+        if subset is not None:
+            # bm25s multiplies scores by the mask; masked documents score zero
+            # and are dropped below with every other non-matching document.
+            weight_mask = np.zeros(len(lexical.ids), dtype=np.float32)
+            allowed = subset.get(lexical.corpus, frozenset())
+            weight_mask[[lexical.rows[item] for item in allowed if item in lexical.rows]] = 1.0
+        rows, scores = lexical.index.retrieve(
+            [terms], k=min(limit, len(lexical.ids)), show_progress=False, weight_mask=weight_mask
+        )
+        candidates = []
+        for row, raw_score in zip(rows[0].tolist(), scores[0].tolist()):
+            score = float(raw_score)
+            # Under the Lucene idf a zero score shares no term with the query.
+            if score != score or score <= 0.0:
+                continue
+            candidates.append(Candidate(lexical.corpus, lexical.ids[int(row)], score, len(candidates), "bm25s"))
+        return Gathered(candidates, lexical.committed_at)
 
 
 def search_index(args: argparse.Namespace) -> None:
-    source = args.index.expanduser().resolve()
-    with index_lock(source, exclusive=False):
-        segment = read_segment(source)
-        gatherer = LexicalCandidateGenerator.open(
-            source / LEXICAL_DIRECTORY, segment, Analyzer.read(source / ANALYZER_FILE)
+    index = args.index.expanduser().resolve()
+    gatherer = LexicalCandidateGenerator(index / LEXICAL_DIRECTORY, Analyzer.read(index / ANALYZER_FILE))
+    reranker = None
+    features: dict[str, Feature] = {}
+    if args.query_embeddings is not None:
+        store = VectorStore(index / VECTOR_DIRECTORY)
+        reranker = MaxSimReranker([store])
+        features["multi_vector"] = Feature(
+            store.representation,
+            provider=lambda: np.ascontiguousarray(np.load(args.query_embeddings), dtype=np.float32),
         )
-        reranker = None
-        features: dict[str, Feature] = {}
-        if args.query_embeddings is not None:
-            # The pipeline refuses the store while it holds another segment
-            # than the lexical index's.
-            store = open_vector_store(source / VECTOR_DIRECTORY)
-            reranker = MaxSimReranker([store])
-            features["multi_vector"] = Feature(
-                store.representation,
-                provider=lambda: np.ascontiguousarray(
-                    np.load(args.query_embeddings), dtype=np.float32
-                ),
-            )
-        subset = None
-        if args.subset_id:
-            subset = {segment.corpus_id: np.sort(segment.to_internal(args.subset_id))}
-        result = SearchPipeline(gatherer, reranker).search(
-            Query(args.query, **features),
-            gather_limit=args.gather_limit,
-            limit=args.limit,
-            subset=subset,
-            budget=ResourceBudget(
-                max_batch_tokens=args.max_batch_tokens,
-                max_documents_per_batch=args.max_documents_per_batch,
-                threads=args.threads,
-            ),
-        )
-        output = {
-            "results": [
-                {
-                    "rank": row.rank,
-                    "document_id": row.document_id,
-                    "external_id": row.external_id,
-                    "score": row.score,
-                }
-                for row in result.documents
-            ],
-            "timings": {
-                "gather_seconds": result.timings.gather_seconds,
-                "rerank_seconds": result.timings.rerank_seconds,
-                "total_seconds": result.timings.total_seconds,
-            },
-            "diagnostics": result.diagnostics,
-        }
+    corpus = gatherer.current().corpus
+    result = SearchPipeline(gatherer, reranker).search(
+        Query(args.query, **features),
+        gather_limit=args.gather_limit,
+        limit=args.limit,
+        subset={corpus: args.subset_id} if args.subset_id else None,
+        budget=ResourceBudget(
+            max_batch_tokens=args.max_batch_tokens,
+            max_documents_per_batch=args.max_documents_per_batch,
+            threads=args.threads,
+        ),
+        max_lag=None if args.max_lag_seconds is None else timedelta(seconds=args.max_lag_seconds),
+    )
+    output = {
+        "results": [
+            {"rank": row.rank, "corpus": row.corpus, "document_id": row.document_id, "score": row.score}
+            for row in result.documents
+        ],
+        "as_of": result.as_of.isoformat(),
+        "timings": {
+            "gather_seconds": result.timings.gather_seconds,
+            "rerank_seconds": result.timings.rerank_seconds,
+            "total_seconds": result.timings.total_seconds,
+        },
+        "diagnostics": result.diagnostics,
+    }
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
@@ -484,9 +423,8 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--documents", type=Path, required=True)
     build.add_argument("--embeddings", type=Path, required=True)
     build.add_argument("--document-lengths", type=Path, required=True)
-    build.add_argument("--storage", choices=tuple(STORES), default="float32")
+    build.add_argument("--storage", choices=("float32", "int8"), default="float32")
     build.add_argument("--corpus-id", required=True)
-    build.add_argument("--corpus-version", required=True)
     build.add_argument("--encoder", required=True)
     build.add_argument("--encoder-revision", required=True)
     build.add_argument("--query-template", default="")
@@ -500,18 +438,22 @@ def parser() -> argparse.ArgumentParser:
     )
     build.set_defaults(function=build_index)
 
-    update = commands.add_parser("update", help="append documents and vectors")
-    update.add_argument("--index", type=Path, required=True)
-    update.add_argument("--documents", type=Path, required=True)
-    update.add_argument("--embeddings", type=Path, required=True)
-    update.add_argument("--document-lengths", type=Path, required=True)
-    update.add_argument("--threads", type=int)
-    update.set_defaults(function=update_index)
+    upsert = commands.add_parser("upsert", help="add documents, replacing any with the same ID")
+    upsert.add_argument("--index", type=Path, required=True)
+    upsert.add_argument("--documents", type=Path, required=True)
+    upsert.add_argument("--embeddings", type=Path, required=True)
+    upsert.add_argument("--document-lengths", type=Path, required=True)
+    upsert.add_argument("--threads", type=int)
+    upsert.set_defaults(function=upsert_index)
 
-    delete = commands.add_parser("delete", help="delete external document IDs")
+    delete = commands.add_parser("delete", help="delete document IDs")
     delete.add_argument("--index", type=Path, required=True)
     delete.add_argument("--document-id", action="append", required=True)
     delete.set_defaults(function=delete_index)
+
+    compact = commands.add_parser("compact", help="reclaim the space of deleted and replaced vectors")
+    compact.add_argument("--index", type=Path, required=True)
+    compact.set_defaults(function=compact_index)
 
     search = commands.add_parser("search", help="BM25 gather, MaxSim rerank when embeddings are given")
     search.add_argument("--index", type=Path, required=True)
@@ -522,12 +464,13 @@ def parser() -> argparse.ArgumentParser:
         help="float32 [query_tokens, dimension] .npy from the index's encoder; omit for gather-only",
     )
     search.add_argument(
-        "--subset-id", action="append", help="restrict the search to this external ID (repeatable)"
+        "--subset-id", action="append", help="restrict the search to this document ID (repeatable)"
     )
     search.add_argument("--gather-limit", type=int, default=500)
     search.add_argument("--limit", type=int, default=100)
     search.add_argument("--max-batch-tokens", type=int, default=131_072)
     search.add_argument("--max-documents-per-batch", type=int, default=256)
+    search.add_argument("--max-lag-seconds", type=float, help="fail rather than answer from older indexes")
     search.add_argument("--threads", type=int)
     search.set_defaults(function=search_index)
     return value

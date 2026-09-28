@@ -2,23 +2,23 @@
 
 ## Ownership boundary
 
-Lateweave owns the search algebra, the identity checks that make composition
-safe, deterministic ranking, and the CPU MaxSim kernel. It does not own
-retrieval algorithms, encoders, or engine index layouts.
+Lateweave owns the search algebra, the checks that make composition safe,
+deterministic ranking, and the CPU MaxSim kernel. It does not own retrieval
+algorithms, encoders, engine index layouts, or keeping any index up to date.
 
 ```text
 External engines                          lateweave
 
-text / features -> (segment, ID)s ------>  CandidateGenerator contract
-(segment, ID)s  -> qualified scores ---->  Reranker contract (optional)
-one segment's document vectors   ------>  MultiVectorSource contract
+text / features -> (corpus, ID)s, as_of -->  CandidateGenerator contract
+(corpus, ID)s  -> scores or None, as_of -->  Reranker contract (optional)
+one corpus's document vectors, as_of ---->  MultiVectorSource contract
                                             |
-                                            +-- segment identity between stages
                                             +-- representation identity with the query
                                             +-- exact candidate-set validation
+                                            +-- presence in every stage, freshness
                                             +-- deterministic top-k, timings
 
-Optional lateweave store snapshot ------->  MultiVectorSource -> MaxSimReranker
+A lateweave vector store ---------------->  MultiVectorSource -> MaxSimReranker
 ```
 
 No engine is named in the package. Adapters live with their engine or in
@@ -29,8 +29,9 @@ persistence of its own records, authorization, HTTP/MCP, quotas, billing, and
 choosing which gatherer, reranker, and source make up a retrieval recipe.
 Lateweave owns the recipe's execution: candidate generation contracts,
 optional reranking, representation compatibility, search results with
-provenance, the pipeline entrypoint, and the vector stores a MaxSim rerank
-reads.
+provenance and freshness, the pipeline entrypoint, and reading the vector
+stores a MaxSim rerank scores. Writing indexes, stores included, belongs to
+whatever indexes the corpus.
 
 ## One implementation, two languages
 
@@ -43,12 +44,12 @@ lateweave-python             PyO3 module lateweave._native
   (bindings/python)           adapts Python stages, sources, and features
   ^
   |
-lateweave (Python package)   manifest dataclasses, protocols, type stubs
+lateweave (Python package)   Representation, protocols, type stubs
 ```
 
 A Rust service depends on the crate directly. The Python package is a binding:
-`SearchPipeline`, `MaxSimReranker`, `Query`, `Feature`, and the stores are
-native classes, and a Python gatherer, reranker, or `MultiVectorSource` is
+`SearchPipeline`, `MaxSimReranker`, `Query`, `Feature`, and the store reader and
+writer are native classes, and a Python gatherer, reranker, or `MultiVectorSource` is
 wrapped so the Rust pipeline can call it. An exception raised by Python code
 crosses the pipeline as `Error::External` and reaches the caller unchanged.
 Search releases the GIL and reacquires it only to call back into Python, so a
@@ -59,18 +60,12 @@ stage that needs a token matrix gets it converted, once, on first use.
 
 ## Two identities
 
-**Segment identity** (`Segment`, identified by its `CorpusManifest`): which
-documents, in which internal order, at which mutation generation. A segment is
-an immutable snapshot of one corpus: its manifest plus the external IDs its
-internal IDs name. Internal IDs are dense `0..n-1` and local to the segment, so
-a document is `(segment, internal ID)` and corpora indexed separately never
-share, or have to agree on, an ID space. Anything outside the pipeline that
-must survive re-indexing refers to external IDs, never to internal ones.
-
-A mutation never changes a segment; it yields the next generation.
-`Segment.appended` and `Segment.deleted` compute it, compacted exactly as a
-store mutation leaves it, so an engine that renumbers on delete can check it
-agrees with the store rather than trust that it does.
+**Document identity** (`DocumentKey`): the corpus a document belongs to and the
+ID the system of record gives it. It is the only name for a document that
+crosses a stage boundary. Every engine maps it to its own internal positions
+privately and may renumber, rebuild, or compact whenever it likes, since no
+other stage ever sees those positions; stages indexed separately never share,
+or have to agree on, anything but the keys.
 
 **Representation identity** (`Representation`): which encoder, revision,
 dimension, normalization, and templates produced a vector feature.
@@ -96,65 +91,77 @@ stages that consume them. The package fixes none; `MaxSimReranker` defaults to
 
 ## Stages
 
-`CandidateGenerator.segments` are the snapshots a gatherer searches, each under
-a distinct corpus ID; one gatherer may search several, and fusing the hits of
-several engines is a gatherer like any other. `gather(query, limit,
-subset=None)` returns unique `(segment, internal ID)` candidates with gather
-scores, dense zero-based ranks, and provenance. `subset` maps every searched
-corpus ID to the strictly ascending internal IDs the search is restricted to;
-a gatherer that cannot honour it raises rather than ignores it, and the
-pipeline refuses any candidate outside it, outside its segment, or from a
-snapshot the gatherer did not declare. The gatherer's `score_semantics`
-qualifies its gather scores, which rank the results when no reranker follows.
+`CandidateGenerator.gather(query, limit, subset=None)` returns `Gathered`:
+unique candidates, each a `DocumentKey` with a gather score, a dense zero-based
+rank, and provenance, plus `as_of`. One gatherer may search several corpora,
+and fusing the hits of several engines is a gatherer like any other. `subset`
+maps corpora to the document IDs the search is restricted to; a corpus it does
+not name contributes nothing, an ID the index does not hold is not a
+candidate, and a gatherer that cannot honour it raises rather than ignores it.
+The pipeline refuses a repeated candidate or one outside the subset. The
+gatherer's `score_semantics` qualifies its gather scores, which rank the
+results when no reranker follows.
 
-`Reranker.segments` must hold the same snapshot of every segment the gatherer
-searches; the pipeline checks that once, at construction. `rerank(query,
-candidates, budget=...)` returns exactly one qualified score per candidate, in
-candidate order. Gather scores never influence a reranked result.
-`ResourceBudget` crosses the boundary because bounded execution is caller
-policy; each reranker maps it onto its own representation.
+`Reranker.rerank(query, candidates, budget=...)` returns `Scored`: exactly one
+qualified score or `None` per candidate, in candidate order, plus `as_of`.
+`None` means the reranker's index does not hold the document; a candidate from
+a corpus the reranker cannot score at all is an error. Gather scores never
+influence a reranked result. `ResourceBudget` crosses the boundary because
+bounded execution is caller policy; each reranker maps it onto its own
+representation.
 
-## Live stages
+Each call reads one consistent state of each index it touches, and `as_of` is
+when that state was committed: every write committed to the index before it is
+reflected in the result. Consistency is needed only there, inside a stage;
+between stages, keys carry it.
 
-Indexes and stores move while a service searches them, often through writers in
-other processes. A stage is therefore `Live`: something whose `current()` hands
-out an immutable snapshot, the gatherer or reranker described above. At the
-start of every search the pipeline asks each stage for its current snapshot
-and checks that they agree, so a publish is served on the next search and a
-running search finishes on the snapshots it started with. When the snapshots
-are the ones the last search used, nothing is checked again.
+## Freshness
 
-While they disagree, as between a writer publishing an index and publishing the
-store beside it, the pipeline serves the last snapshots that agreed and reports
-the search as stale, rather than failing or pairing a gatherer's ID with
-another generation's vectors. `freeze` returns a pipeline fixed on the current
-snapshots, for work that must see one generation throughout; `fixed` builds one
-over stages that never move.
+Indexes move while a service searches them, often through writers in other
+processes using other libraries, and no two of them move together. The
+pipeline treats each as an independent, possibly lagging replica of the
+corpus, and asks nothing of whoever maintains them:
 
-`current()` must read a segment together with the engine state it describes.
-That is only possible when a writer publishes each generation immutably behind
-one atomic pointer, as the stores do with `storage.json`; an engine updated in
-place cannot be snapshotted, and no check downstream can detect it. A store is
-its own live source: `snapshot()` reads which generation `storage.json` names
-and loads it only when it moved, and `MaxSimReranker` over live sources re-pins
-them per search and rebuilds only when one moved.
+- A document is ranked only when every stage holds it. The gatherer holds
+  every candidate it returns; a candidate the reranker scores `None` is
+  dropped and counted in the diagnostics. So a delete is served as soon as
+  any index applies it, and an insert once every index has. An update is
+  recalled from whatever text the gatherer indexed and scored on whatever the
+  reranker holds, both of that document.
+- `SearchResult.as_of` is the oldest `as_of` among the stages: every write
+  committed to every index before it is reflected in the result.
+- `SearchRequest.max_lag` makes that a guarantee: a search whose `as_of` is
+  older fails with `Error::Stale` instead of answering.
+
+There is no snapshot to agree on, so there is nothing to wait for, pin, or
+detect as stale beyond `as_of`: a pipeline is built without looking at any
+index, and an index rebuilt from scratch, restored from a backup, or left
+behind by a crashed writer is served as whatever it holds, with its age. A
+search may return fewer than `limit` documents while an index lags; the
+dropped count says how many.
+
+The price is that `as_of` must be honest: it is the commit time of the state
+read, not the time a stage reloaded it, and an idle index has to keep
+committing to stay within a `max_lag`.
 
 ## Multi-vector sources
 
-A `MultiVectorSource` is a snapshot of one segment's vectors: it names its
-`segment`, and the vectors an internal ID names never change for its lifetime.
-`fetch(document_ids)` returns a packed float32 token matrix for the requested
-documents in the requested order, plus their lengths, and the source declares
-the representation of those vectors and the score semantics MaxSim over them
-has. `MaxSimReranker` is the kernel plus one source per segment: it routes each
-candidate to its segment's source, refuses a candidate from any other snapshot,
-and requires every source to share one representation and one score semantics
-so that scores across segments share a scale.
+A `MultiVectorSource` serves one corpus's vectors: it names its `corpus`,
+declares the representation of its vectors and the score semantics MaxSim over
+them has, and hands out views. A `VectorView` is one consistent state with its
+`as_of`: `document_lengths(ids)` gives the token count of each document it
+holds and `None` for the rest, and `fetch(ids)` returns a packed float32 token
+matrix for held documents in the requested order, plus their lengths.
+`MaxSimReranker` is the kernel plus one source per corpus: each rerank takes
+one view of every source, routes each candidate to its corpus's view, leaves
+unscored what a view does not hold, and reports the oldest view's `as_of`.
+Every source must share one representation and one score semantics so that
+scores across corpora share a scale.
 
-Snapshots of the two lateweave stores are sources for gatherers that hold no
-document vectors. An engine that already reconstructs its own vectors implements the
+A lateweave `VectorStore` is a source for gatherers that hold no document
+vectors. An engine that already reconstructs its own vectors implements the
 protocol over them and stores nothing twice. When a rerank is meant to add
-fidelity over a lossy engine index, a `Float32VectorStore` alongside it is the
+fidelity over a lossy engine index, a float32 store alongside it is the
 deliberate second copy.
 
 Sources are not generalized beyond multi-vector. Another kind of reranker brings
@@ -163,28 +170,33 @@ its own document representation behind the same `Reranker` protocol.
 ## Stores
 
 ```text
-FixedRecordVectorStore
-├── Float32VectorStore   exact
-└── Int8VectorStore      symmetric INT8 per token, float32 row scale
+VectorStore          reads; follows manifest.json
+VectorStoreWriter    one writer of the format; any other process may write it
 ```
 
-Both use memory-mapped fixed-width token records. Each generation is its own
-file set: one `.npy` per array, `document-offsets-G.npy`, and
-`document-ids-G.json` holding the segment's external IDs. `storage.json` names
-the live generation and carries the format, representation, corpus manifest,
-and token count. In Rust they are one `VectorStore` parameterized by
-`StoreFormat`.
+The format, specified in [STORE_FORMAT.md](STORE_FORMAT.md), is the contract,
+so the process that maintains a corpus need not use lateweave to maintain its
+vectors. A store is a list of immutable segments, each `.npy` arrays with fixed
+width token records (`float32`, or `int8` codes with a float32 row scale) plus
+its document IDs, and per segment an immutable tombstone file of deleted rows.
+`manifest.json`, replaced by rename, is the only file that changes: it names
+the live segments and tombstones, the commit number, and `committed_at`, which
+is the store's `as_of`. The newest row of a document decides whether it is
+present.
 
-A store holds one segment. Mutations take external IDs: append streams the
-existing records and the new ones into the next generation's files; delete
-copies the surviving runs of records and compacts IDs. Either loads the new
-files and then publishes them by replacing `storage.json`, the single atomic
-step, and removes the staged files if anything before it fails. Files are
-never modified after they are written, so a `StoreSnapshot` keeps reading its
-generation through its own maps however many mutations follow; the files of
-superseded generations are removed on the next publish once nothing maps them.
-Mutations run one at a time; one process writes a store and any number read
-it. The files are ordinary little-endian `.npy`, readable by NumPy.
+So maintenance is as cheap and as deferred as the format allows. An append
+writes one segment of the new documents, whether or not they were present; a
+delete writes one small tombstone file; neither touches existing records, and
+neither renumbers anything any other index depends on. Compaction, merging the
+present documents into one segment, reclaims space and changes no read; it
+runs whenever the writer likes, or never.
+
+`VectorStore::view` rereads `manifest.json` and loads only segments and
+tombstones it has not seen. A view maps its files and keeps reading them
+however many commits follow; a reader that finds a file its manifest names
+already removed rereads the manifest. One writer writes a store at a time and
+any number read it. The files are ordinary little-endian `.npy`, readable and
+writable by NumPy.
 
 ## Native scoring and execution
 
@@ -199,8 +211,9 @@ internally nests inside that and oversubscribes: on a 16-core host, capping the
 inner layer with `OMP_NUM_THREADS=4` is worth about 24% against leaving it to
 spawn a thread per core.
 
-The pipeline's ranking step enforces the reranker contract (one score per
-candidate, no NaN) and orders by score, then gather rank.
+The pipeline's ranking step enforces the reranker contract (one score or
+`None` per candidate, no NaN) and orders the scored candidates by score, then
+gather rank.
 
 ## The SGEMM dependency
 

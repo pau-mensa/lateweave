@@ -1,39 +1,64 @@
 //! The two stage contracts a pipeline composes, and the values crossing them.
 
 use std::any::type_name;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::error::{Error, Result};
-use crate::manifest::Representation;
 use crate::query::Query;
-use crate::segment::Segment;
+use crate::representation::Representation;
 
 /// Feature name to the representation a stage was built for.
 pub type Requirements = BTreeMap<String, Representation>;
 
-/// One gathered document: `document_id` is an internal ID of `segment`;
-/// `provenance` names what produced it.
+/// A document as every stage names it: the corpus it belongs to and the ID
+/// the system of record gives it. Engines map keys to their own internal
+/// positions privately, so they never have to agree on one.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocumentKey {
+    corpus: Arc<str>,
+    id: Arc<str>,
+}
+
+impl DocumentKey {
+    pub fn new(corpus: impl Into<Arc<str>>, id: impl Into<Arc<str>>) -> Self {
+        Self {
+            corpus: corpus.into(),
+            id: id.into(),
+        }
+    }
+
+    pub fn corpus(&self) -> &str {
+        &self.corpus
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl fmt::Debug for DocumentKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}/{:?}", self.corpus, self.id)
+    }
+}
+
+/// One gathered document; `provenance` names what produced it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
-    pub segment: Segment,
-    pub document_id: u64,
+    pub key: DocumentKey,
     pub gather_score: f32,
     pub gather_rank: usize,
     pub provenance: String,
 }
 
-impl Candidate {
-    /// `None` when `document_id` is outside the segment.
-    pub fn external_id(&self) -> Option<&str> {
-        self.segment.external(self.document_id)
-    }
-}
-
-/// The documents a search is restricted to: internal IDs per segment, keyed
-/// by corpus ID. A segment it does not name contributes no documents.
+/// The documents a search is restricted to, by corpus. A corpus it does not
+/// name contributes no documents; an ID an index does not hold is ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Subset {
-    ids: BTreeMap<String, Vec<u64>>,
+    ids: BTreeMap<Arc<str>, HashSet<Arc<str>>>,
 }
 
 impl Subset {
@@ -41,23 +66,47 @@ impl Subset {
         Self::default()
     }
 
-    /// Replaces any IDs already given for `corpus_id`.
-    pub fn with(mut self, corpus_id: impl Into<String>, document_ids: impl Into<Vec<u64>>) -> Self {
-        self.ids.insert(corpus_id.into(), document_ids.into());
+    /// Replaces any IDs already given for `corpus`.
+    pub fn with<I>(mut self, corpus: impl Into<Arc<str>>, ids: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Arc<str>>,
+    {
+        self.ids
+            .insert(corpus.into(), ids.into_iter().map(Into::into).collect());
         self
     }
 
-    /// The segment's IDs; empty when the subset does not name it.
-    pub fn ids(&self, corpus_id: &str) -> &[u64] {
-        self.ids.get(corpus_id).map_or(&[], Vec::as_slice)
+    /// `None` when the subset does not name `corpus`.
+    pub fn ids(&self, corpus: &str) -> Option<&HashSet<Arc<str>>> {
+        self.ids.get(corpus)
     }
 
-    /// Named segments and their IDs, by corpus ID.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &[u64])> {
-        self.ids
-            .iter()
-            .map(|(corpus_id, ids)| (corpus_id.as_str(), ids.as_slice()))
+    pub fn contains(&self, key: &DocumentKey) -> bool {
+        self.ids(key.corpus())
+            .is_some_and(|ids| ids.contains(key.id()))
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &HashSet<Arc<str>>)> {
+        self.ids.iter().map(|(corpus, ids)| (corpus.as_ref(), ids))
+    }
+}
+
+/// What a gatherer found, and how fresh the index it searched was: every
+/// write committed to that index before `as_of` is reflected in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gathered {
+    pub candidates: Vec<Candidate>,
+    pub as_of: SystemTime,
+}
+
+/// `scores[i]` scores candidate `i`, or is `None` when the reranker's index
+/// does not hold that document: not written to it yet, or already deleted.
+/// Every write committed to that index before `as_of` is reflected in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scored {
+    pub scores: Vec<Option<f32>>,
+    pub as_of: SystemTime,
 }
 
 /// Bounded execution is caller policy; each reranker maps it onto its own
@@ -120,17 +169,13 @@ fn short_type_name<T: ?Sized>() -> &'static str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
-/// First stage: selects candidate documents from its segments.
+/// First stage: selects candidate documents.
 ///
-/// Returns unique `(segment, document_id)` candidates from the segments it
-/// declares, with gather scores, dense zero-based ranks, and provenance.
-/// `subset`, when given, names strictly ascending internal IDs per segment
-/// and restricts the search to them; a gatherer that cannot honour it must
-/// fail rather than ignore it.
+/// Returns unique candidates with gather scores and dense zero-based ranks,
+/// read from one consistent state of each index it searches. `subset`, when
+/// given, restricts the search to the documents it names; a gatherer that
+/// cannot honour it must fail rather than ignore it.
 pub trait CandidateGenerator: Send + Sync {
-    /// The snapshots this gatherer searches, each under a distinct corpus ID.
-    fn segments(&self) -> &[Segment];
-
     /// A text-only gatherer requires nothing.
     fn requires(&self) -> &Requirements;
 
@@ -142,21 +187,14 @@ pub trait CandidateGenerator: Send + Sync {
         short_type_name::<Self>()
     }
 
-    fn gather(
-        &self,
-        query: &Query,
-        limit: usize,
-        subset: Option<&Subset>,
-    ) -> Result<Vec<Candidate>>;
+    fn gather(&self, query: &Query, limit: usize, subset: Option<&Subset>) -> Result<Gathered>;
 }
 
-/// Second stage: exactly one qualified score for every candidate it is given,
-/// in candidate order. Gather scores never influence a reranked result.
+/// Second stage: one qualified score, or `None`, for every candidate it is
+/// given, in candidate order, read from one consistent state of each index it
+/// scores. A candidate from a corpus the reranker cannot score at all is an
+/// error, not `None`. Gather scores never influence a reranked result.
 pub trait Reranker: Send + Sync {
-    /// The snapshots this reranker can score; they must cover every segment
-    /// the gatherer searches.
-    fn segments(&self) -> &[Segment];
-
     fn requires(&self) -> &Requirements;
 
     fn score_semantics(&self) -> &str;
@@ -171,5 +209,5 @@ pub trait Reranker: Send + Sync {
         query: &Query,
         candidates: &[Candidate],
         budget: &ResourceBudget,
-    ) -> Result<Vec<f32>>;
+    ) -> Result<Scored>;
 }
