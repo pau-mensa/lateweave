@@ -42,8 +42,11 @@ pub(crate) fn from_py(error: PyErr) -> Error {
     Error::External(Box::new(error))
 }
 
-fn attribute<'py, T: FromPyObject<'py>>(object: &Bound<'py, PyAny>, name: &str) -> PyResult<T> {
-    object.getattr(name)?.extract()
+fn attribute<'py, T: FromPyObjectOwned<'py>>(
+    object: &Bound<'py, PyAny>,
+    name: &str,
+) -> PyResult<T> {
+    object.getattr(name)?.extract().map_err(Into::into)
 }
 
 pub(crate) fn representation(object: &Bound<'_, PyAny>) -> PyResult<Representation> {
@@ -64,7 +67,7 @@ pub(crate) fn representation(object: &Bound<'_, PyAny>) -> PyResult<Representati
 }
 
 pub(crate) fn requirements(object: &Bound<'_, PyAny>) -> PyResult<Requirements> {
-    let mapping = object.downcast::<PyMapping>()?;
+    let mapping = object.cast::<PyMapping>()?;
     mapping
         .items()?
         .iter()

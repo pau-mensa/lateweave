@@ -120,7 +120,7 @@ impl PyQuery {
         if let Ok(text) = query.extract::<String>() {
             return Ok(Query::new(text));
         }
-        Ok(query.downcast::<PyQuery>()?.get().inner.clone())
+        Ok(query.cast::<PyQuery>()?.get().inner.clone())
     }
 }
 
@@ -131,7 +131,7 @@ impl PyQuery {
     fn new(text: String, features: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let mut query = Query::new(text);
         for (name, feature) in features.into_iter().flatten() {
-            let feature = feature.downcast::<PyFeature>()?.get().inner.clone();
+            let feature = feature.cast::<PyFeature>()?.get().inner.clone();
             query = query.with_feature(name.extract::<String>()?, feature);
         }
         Ok(Self { inner: query })

@@ -95,7 +95,7 @@ fn candidates_to_py<'py>(
 fn candidates_from_py(candidates: &Bound<'_, PyAny>) -> PyResult<Vec<Candidate>> {
     candidates
         .try_iter()?
-        .map(|candidate| Ok(candidate?.downcast::<PyCandidate>()?.get().inner.clone()))
+        .map(|candidate| Ok(candidate?.cast::<PyCandidate>()?.get().inner.clone()))
         .collect()
 }
 
@@ -208,7 +208,7 @@ fn subset_to_py<'py>(py: Python<'py>, subset: &Subset) -> PyResult<Bound<'py, Py
 }
 
 fn subset_from_py(subset: &Bound<'_, PyAny>) -> PyResult<Subset> {
-    let mapping = subset.downcast::<PyMapping>().map_err(|_| {
+    let mapping = subset.cast::<PyMapping>().map_err(|_| {
         PyTypeError::new_err("subset must map corpora to iterables of document IDs")
     })?;
     mapping
@@ -274,7 +274,7 @@ impl CandidateGenerator for PythonGatherer {
                 self.object
                     .bind(py)
                     .call_method("gather", (query, limit), Some(&arguments))?;
-            Ok(gathered.downcast::<PyGathered>()?.get().inner.clone())
+            Ok(gathered.cast::<PyGathered>()?.get().inner.clone())
         })
         .map_err(from_py)
     }
@@ -315,7 +315,7 @@ impl Reranker for PythonReranker {
                 (query, candidates_to_py(py, candidates)?),
                 Some(&arguments),
             )?;
-            Ok(scored.downcast::<PyScored>()?.get().inner.clone())
+            Ok(scored.cast::<PyScored>()?.get().inner.clone())
         })
         .map_err(from_py)
     }
@@ -428,7 +428,7 @@ impl VectorView for PythonView {
 }
 
 fn source(source: &Bound<'_, PyAny>) -> PyResult<Arc<dyn MultiVectorSource>> {
-    if let Ok(store) = source.downcast::<PyVectorStore>() {
+    if let Ok(store) = source.cast::<PyVectorStore>() {
         return Ok(store.get().inner.clone());
     }
     Ok(Arc::new(PythonSource::new(source)?))
@@ -636,7 +636,7 @@ impl PySearchPipeline {
         });
         let reranker = reranker
             .map(|reranker| -> PyResult<Arc<dyn Reranker>> {
-                match reranker.downcast::<PyMaxSimReranker>() {
+                match reranker.cast::<PyMaxSimReranker>() {
                     Ok(native) => Ok(native.get().inner.clone()),
                     Err(_) => Ok(Arc::new(PythonReranker {
                         object: reranker.clone().unbind(),

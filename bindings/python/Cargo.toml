@@ -15,8 +15,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lateweave = { path = "../.." }
-numpy = "0.26"
-pyo3 = "0.26"
+numpy = "0.29"
+pyo3 = "0.29"
 
 [features]
 default = []
