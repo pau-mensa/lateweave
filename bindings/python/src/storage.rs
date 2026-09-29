@@ -1,97 +1,63 @@
-use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
 
-use lateweave::{StoreFormat, VectorStore};
+use lateweave::{Encoding, StoreView, VectorStore, VectorStoreWriter};
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple, PyType};
+use pyo3::types::{PyDict, PyTuple};
 
-use crate::convert::{representation, representation_to_py, row_major_borrowed, to_py};
+use crate::convert::{
+    document_ids, representation, representation_to_py, row_major_borrowed, to_py,
+};
 use crate::stages::lengths;
 
-/// Any float32 matrix, copied only when it is not already C-contiguous.
-fn embeddings<'a>(embeddings: &'a PyReadonlyArray2<'_, f32>) -> (Cow<'a, [f32]>, usize) {
-    (
-        row_major_borrowed(embeddings.as_array()),
-        embeddings.shape()[1],
-    )
-}
-
-fn wrap(py: Python<'_>, store: VectorStore) -> PyResult<Py<PyAny>> {
-    let base = PyVectorStore {
-        inner: Arc::new(store),
-    };
-    let format = base.inner.format();
-    Ok(match format {
-        StoreFormat::Float32 => Py::new(
-            py,
-            PyClassInitializer::from(base).add_subclass(PyFloat32VectorStore),
-        )?
-        .into_any(),
-        StoreFormat::Int8 => Py::new(
-            py,
-            PyClassInitializer::from(base).add_subclass(PyInt8VectorStore),
-        )?
-        .into_any(),
+fn encoding(name: &str) -> PyResult<Encoding> {
+    Encoding::from_name(name).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "unknown encoding {name:?}; expected \"float32\" or \"int8\""
+        ))
     })
 }
 
-fn open_as(py: Python<'_>, path: PathBuf, format: StoreFormat) -> PyResult<PyVectorStore> {
-    let store = py.detach(|| VectorStore::open(&path)).map_err(to_py)?;
-    if store.format() != format {
-        return Err(PyValueError::new_err(format!(
-            "{} is not a {} store",
-            path.display(),
-            format.name()
-        )));
-    }
-    Ok(PyVectorStore {
-        inner: Arc::new(store),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn create(
-    py: Python<'_>,
-    format: StoreFormat,
-    path: PathBuf,
-    embeddings: PyReadonlyArray2<'_, f32>,
-    document_lengths: &Bound<'_, PyAny>,
-    representation: &Bound<'_, PyAny>,
-    threads: Option<usize>,
-) -> PyResult<Py<PyAny>> {
-    let (values, dimension) = self::embeddings(&embeddings);
-    let lengths = lengths(document_lengths)?;
-    let representation = self::representation(representation)?;
-    let store = py
-        .detach(|| {
-            VectorStore::create(
-                &path,
-                format,
-                &values,
-                dimension,
-                &lengths,
-                representation,
-                threads,
-            )
-        })
-        .map_err(to_py)?;
-    wrap(py, store)
-}
-
-/// Memory-mapped fixed-width token records; a ``MultiVectorSource``.
-#[pyclass(name = "VectorStore", subclass, frozen, module = "lateweave._native")]
+/// Reads a lateweave vector store, following what its writer commits.
+///
+/// ``view()`` rereads ``manifest.json`` and loads only what it has not seen;
+/// passed to ``MaxSimReranker`` the store hands every rerank its latest view.
+#[pyclass(name = "VectorStore", frozen, module = "lateweave._native")]
 pub(crate) struct PyVectorStore {
     pub(crate) inner: Arc<VectorStore>,
 }
 
 #[pymethods]
 impl PyVectorStore {
+    #[new]
+    fn new(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
+        let inner = py.detach(|| VectorStore::open(&path)).map_err(to_py)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
     #[getter]
     fn path(&self) -> PathBuf {
         self.inner.path().to_path_buf()
+    }
+
+    #[getter]
+    fn corpus(&self) -> &str {
+        self.inner.corpus()
+    }
+
+    #[getter]
+    fn encoding(&self) -> &'static str {
+        self.inner.encoding().name()
+    }
+
+    #[getter]
+    fn score_semantics(&self) -> &'static str {
+        self.inner.encoding().score_semantics()
     }
 
     #[getter]
@@ -104,40 +70,73 @@ impl PyVectorStore {
         self.inner.dimension()
     }
 
+    fn view(&self, py: Python<'_>) -> PyResult<PyStoreView> {
+        let inner = py.detach(|| self.inner.view()).map_err(to_py)?;
+        Ok(PyStoreView { inner })
+    }
+}
+
+/// One commit of a vector store. It stays readable after later commits.
+#[pyclass(name = "StoreView", frozen, module = "lateweave._native")]
+pub(crate) struct PyStoreView {
+    inner: Arc<StoreView>,
+}
+
+#[pymethods]
+impl PyStoreView {
+    /// When the writer committed this view.
     #[getter]
-    fn document_count(&self) -> u64 {
-        self.inner.document_count()
+    fn as_of(&self) -> SystemTime {
+        self.inner.as_of()
     }
 
     #[getter]
-    fn token_count(&self) -> u64 {
-        self.inner.token_count()
+    fn commit(&self) -> u64 {
+        self.inner.commit()
     }
 
+    /// The IDs of every document present, sorted.
+    #[getter]
+    fn document_ids(&self) -> Vec<&str> {
+        self.inner.document_ids()
+    }
+
+    fn __contains__(&self, document_id: &str) -> bool {
+        self.inner.contains(document_id)
+    }
+
+    /// Token counts of the documents present among ``document_ids``.
     fn document_lengths<'py>(
         &self,
         py: Python<'py>,
-        document_ids: Vec<u64>,
+        document_ids: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let lengths = self.inner.document_lengths(&document_ids).map_err(to_py)?;
+        let ids = self::document_ids(document_ids)?;
+        let ids = ids.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
         let output = PyDict::new(py);
-        for (document_id, length) in document_ids.into_iter().zip(lengths) {
-            output.set_item(document_id, length)?;
+        for (id, length) in ids.iter().zip(self.inner.document_lengths(&ids)) {
+            if let Some(length) = length {
+                output.set_item(id, length)?;
+            }
         }
         Ok(output)
     }
 
-    /// Packed float32 ``[tokens, dimension]`` vectors of ``document_ids`` in
-    /// the requested order, plus their int64 lengths.
+    /// Packed float32 ``[tokens, dimension]`` vectors of ``document_ids``,
+    /// which must be present, in order, plus their int64 lengths.
     #[pyo3(signature = (document_ids, *, threads=None))]
     fn fetch<'py>(
         &self,
         py: Python<'py>,
-        document_ids: Vec<u64>,
+        document_ids: &Bound<'py, PyAny>,
         threads: Option<usize>,
     ) -> PyResult<Bound<'py, PyTuple>> {
+        let ids = self::document_ids(document_ids)?;
         let packed = py
-            .detach(|| self.inner.fetch(&document_ids, threads))
+            .detach(|| {
+                let ids = ids.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
+                self.inner.fetch(&ids, threads)
+            })
             .map_err(to_py)?;
         let rows = packed.vectors().len() / packed.dimension();
         let vectors =
@@ -146,120 +145,116 @@ impl PyVectorStore {
         PyTuple::new(py, [vectors.into_any(), lengths.into_any()])
     }
 
-    #[pyo3(signature = (embeddings, document_lengths, *, threads=None))]
+    fn __repr__(&self) -> String {
+        format!(
+            "StoreView(corpus={:?}, commit={}, encoding={:?})",
+            self.inner.corpus(),
+            self.inner.commit(),
+            self.inner.encoding().name()
+        )
+    }
+}
+
+/// Stages appends, deletes, and compactions of one vector store, and
+/// publishes them together on ``commit()``.
+///
+/// Appending a document that is already present replaces it; deleting one
+/// that is not present does nothing. A commit with nothing staged still
+/// advances the time readers report as fresh.
+#[pyclass(name = "VectorStoreWriter", frozen, module = "lateweave._native")]
+pub(crate) struct PyVectorStoreWriter {
+    inner: Mutex<VectorStoreWriter>,
+}
+
+impl PyVectorStoreWriter {
+    fn with<T: Send>(
+        &self,
+        py: Python<'_>,
+        operation: impl FnOnce(&mut VectorStoreWriter) -> lateweave::Result<T> + Send,
+    ) -> PyResult<T> {
+        py.detach(|| operation(&mut self.inner.lock().unwrap_or_else(PoisonError::into_inner)))
+            .map_err(to_py)
+    }
+}
+
+#[pymethods]
+impl PyVectorStoreWriter {
+    #[new]
+    fn new(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
+        let inner = py
+            .detach(|| VectorStoreWriter::open(&path))
+            .map_err(to_py)?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// Writes an empty store at ``path``, which must not exist.
+    #[staticmethod]
+    #[pyo3(signature = (path, corpus, representation, *, encoding="float32"))]
+    fn create(
+        py: Python<'_>,
+        path: PathBuf,
+        corpus: String,
+        representation: &Bound<'_, PyAny>,
+        encoding: &str,
+    ) -> PyResult<Self> {
+        let encoding = self::encoding(encoding)?;
+        let representation = self::representation(representation)?;
+        let inner = py
+            .detach(|| VectorStoreWriter::create(&path, encoding, corpus, representation))
+            .map_err(to_py)?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    #[getter]
+    fn corpus(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .corpus()
+            .to_string()
+    }
+
+    /// Stages documents; ``embeddings`` is a float32 ``[tokens, dimension]``
+    /// matrix packed by document in the order of ``document_ids``.
+    #[pyo3(signature = (document_ids, embeddings, document_lengths, *, threads=None))]
     fn append(
         &self,
         py: Python<'_>,
+        document_ids: &Bound<'_, PyAny>,
         embeddings: PyReadonlyArray2<'_, f32>,
         document_lengths: &Bound<'_, PyAny>,
         threads: Option<usize>,
     ) -> PyResult<()> {
-        let (values, dimension) = self::embeddings(&embeddings);
+        let ids = self::document_ids(document_ids)?;
+        let dimension = embeddings.shape()[1];
+        let values = row_major_borrowed(embeddings.as_array());
         let lengths = lengths(document_lengths)?;
-        py.detach(|| self.inner.append(&values, dimension, &lengths, threads))
-            .map_err(to_py)
+        self.with(py, |writer| {
+            writer.append(ids, &values, dimension, &lengths, threads)
+        })
     }
 
-    /// Removes documents and compacts internal IDs to ``0..n-1``.
-    fn delete(&self, py: Python<'_>, document_ids: Vec<u64>) -> PyResult<()> {
-        py.detach(|| self.inner.delete(&document_ids))
-            .map_err(to_py)
-    }
-}
-
-/// Exact float32 token vectors.
-#[pyclass(name = "Float32VectorStore", extends = PyVectorStore, frozen, module = "lateweave._native")]
-pub(crate) struct PyFloat32VectorStore;
-
-#[pymethods]
-impl PyFloat32VectorStore {
-    #[classattr]
-    fn format() -> &'static str {
-        StoreFormat::Float32.name()
+    /// Stages the deletion of the documents present among ``document_ids``
+    /// and returns how many there were.
+    fn delete(&self, py: Python<'_>, document_ids: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let ids = self::document_ids(document_ids)?;
+        self.with(py, |writer| Ok(writer.delete(&ids)))
     }
 
-    #[classattr]
-    fn score_semantics() -> &'static str {
-        StoreFormat::Float32.score_semantics()
+    /// Stages the present documents as one segment.
+    fn compact(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, VectorStoreWriter::compact)
     }
 
-    #[new]
-    fn new(py: Python<'_>, path: PathBuf) -> PyResult<(Self, PyVectorStore)> {
-        Ok((Self, open_as(py, path, StoreFormat::Float32)?))
+    /// Publishes everything staged and returns the commit time readers
+    /// report for it.
+    fn commit(&self, py: Python<'_>) -> PyResult<SystemTime> {
+        self.with(py, VectorStoreWriter::commit)
     }
-
-    #[classmethod]
-    #[pyo3(signature = (path, embeddings, document_lengths, representation, *, threads=None))]
-    fn create(
-        _class: &Bound<'_, PyType>,
-        py: Python<'_>,
-        path: PathBuf,
-        embeddings: PyReadonlyArray2<'_, f32>,
-        document_lengths: &Bound<'_, PyAny>,
-        representation: &Bound<'_, PyAny>,
-        threads: Option<usize>,
-    ) -> PyResult<Py<PyAny>> {
-        create(
-            py,
-            StoreFormat::Float32,
-            path,
-            embeddings,
-            document_lengths,
-            representation,
-            threads,
-        )
-    }
-}
-
-/// Symmetric INT8 per token with one float32 row scale; lossy.
-#[pyclass(name = "Int8VectorStore", extends = PyVectorStore, frozen, module = "lateweave._native")]
-pub(crate) struct PyInt8VectorStore;
-
-#[pymethods]
-impl PyInt8VectorStore {
-    #[classattr]
-    fn format() -> &'static str {
-        StoreFormat::Int8.name()
-    }
-
-    #[classattr]
-    fn score_semantics() -> &'static str {
-        StoreFormat::Int8.score_semantics()
-    }
-
-    #[new]
-    fn new(py: Python<'_>, path: PathBuf) -> PyResult<(Self, PyVectorStore)> {
-        Ok((Self, open_as(py, path, StoreFormat::Int8)?))
-    }
-
-    #[classmethod]
-    #[pyo3(signature = (path, embeddings, document_lengths, representation, *, threads=None))]
-    fn create(
-        _class: &Bound<'_, PyType>,
-        py: Python<'_>,
-        path: PathBuf,
-        embeddings: PyReadonlyArray2<'_, f32>,
-        document_lengths: &Bound<'_, PyAny>,
-        representation: &Bound<'_, PyAny>,
-        threads: Option<usize>,
-    ) -> PyResult<Py<PyAny>> {
-        create(
-            py,
-            StoreFormat::Int8,
-            path,
-            embeddings,
-            document_lengths,
-            representation,
-            threads,
-        )
-    }
-}
-
-/// Opens a store as the class its format names.
-#[pyfunction]
-pub(crate) fn open_vector_store(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyAny>> {
-    let store = py.detach(|| VectorStore::open(&path)).map_err(to_py)?;
-    wrap(py, store)
 }
 
 #[pyfunction]

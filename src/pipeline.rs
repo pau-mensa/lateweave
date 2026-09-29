@@ -1,22 +1,22 @@
 //! Gather, optionally rerank, then deterministic top-k.
 
-use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{Error, Result};
 use crate::query::Query;
 use crate::ranking::validate_and_rank;
-use crate::stage::{Candidate, CandidateGenerator, Requirements, Reranker, ResourceBudget, Score};
+use crate::stage::{
+    Candidate, CandidateGenerator, DocumentKey, Requirements, Reranker, ResourceBudget, Subset,
+};
 
 /// Per-search parameters.
 #[derive(Clone, Copy, Debug)]
 pub struct SearchRequest<'a> {
     pub gather_limit: usize,
     pub limit: usize,
-    /// Ascending internal IDs the search is restricted to; a repeated ID
-    /// counts once, and the gatherer receives each ID once.
-    pub subset: Option<&'a [u64]>,
+    pub subset: Option<&'a Subset>,
     pub budget: ResourceBudget,
 }
 
@@ -30,7 +30,7 @@ impl<'a> SearchRequest<'a> {
         }
     }
 
-    pub fn with_subset(mut self, subset: &'a [u64]) -> Self {
+    pub fn with_subset(mut self, subset: &'a Subset) -> Self {
         self.subset = Some(subset);
         self
     }
@@ -41,9 +41,9 @@ impl<'a> SearchRequest<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RankedDocument {
-    pub document_id: u64,
+    pub key: DocumentKey,
     pub score: f32,
     /// One-based.
     pub rank: usize,
@@ -59,6 +59,8 @@ pub struct SearchTimings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchDiagnostics {
     pub candidate_count: usize,
+    /// Candidates the reranker's index does not hold, left out of the ranking.
+    pub dropped: usize,
     pub gatherer: String,
     pub reranker: Option<String>,
     /// Qualifies the scores in [`SearchResult::documents`].
@@ -70,39 +72,35 @@ pub struct SearchResult {
     pub documents: Vec<RankedDocument>,
     /// Everything the gatherer returned, with provenance, in gather order.
     pub candidates: Vec<Candidate>,
-    /// One score per candidate: the reranker's, or the gather scores.
-    pub scores: Vec<Score>,
+    /// `scores[i]` scores `candidates[i]`: the reranker's, `None` when its
+    /// index does not hold the document, or the gather score.
+    pub scores: Vec<Option<f32>>,
+    /// Every write committed to every index the search read before this is
+    /// reflected in the result.
+    pub as_of: SystemTime,
     pub timings: SearchTimings,
     pub diagnostics: SearchDiagnostics,
 }
 
-/// Stages must index the same corpus; that is checked once, at construction.
-/// Each stage must be able to consume the query; that is checked per search,
-/// before any stage runs, so a query that cannot be served fails without
-/// gathering. Without a reranker the gather scores rank the results.
-#[derive(Clone)]
+/// A gatherer, optionally followed by a reranker.
+///
+/// Stages speak in [`DocumentKey`]s and each reads its own indexes, which
+/// writers anywhere move independently. A document is ranked only when every
+/// stage holds it, so a delete takes effect as soon as any index applies it
+/// and an insert once all of them have. Each search reports, as
+/// [`SearchResult::as_of`], the oldest commit among the indexes it read.
+///
+/// Each stage must be able to consume the query; that is checked before any
+/// stage runs, so a query that cannot be served fails without gathering.
+/// Without a reranker the gather scores rank the results.
 pub struct SearchPipeline {
     gatherer: Arc<dyn CandidateGenerator>,
     reranker: Option<Arc<dyn Reranker>>,
 }
 
 impl SearchPipeline {
-    pub fn new(
-        gatherer: Arc<dyn CandidateGenerator>,
-        reranker: Option<Arc<dyn Reranker>>,
-    ) -> Result<Self> {
-        if let Some(reranker) = &reranker {
-            gatherer.corpus().assert_compatible(reranker.corpus())?;
-        }
-        Ok(Self { gatherer, reranker })
-    }
-
-    pub fn gatherer(&self) -> &Arc<dyn CandidateGenerator> {
-        &self.gatherer
-    }
-
-    pub fn reranker(&self) -> Option<&Arc<dyn Reranker>> {
-        self.reranker.as_ref()
+    pub fn new(gatherer: Arc<dyn CandidateGenerator>, reranker: Option<Arc<dyn Reranker>>) -> Self {
+        Self { gatherer, reranker }
     }
 
     pub fn search(&self, query: &Query, request: &SearchRequest<'_>) -> Result<SearchResult> {
@@ -115,38 +113,33 @@ impl SearchPipeline {
         if request.limit > request.gather_limit {
             return Err(Error::invalid("limit cannot exceed gather_limit"));
         }
-        let document_count = self.gatherer.corpus().document_count();
-        let subset = request.subset.map(unique_subset).transpose()?;
-        if let Some(subset) = &subset {
-            if subset.last().is_some_and(|&last| last >= document_count) {
-                return Err(Error::invalid(format!(
-                    "subset reaches outside the corpus of {document_count} documents"
-                )));
-            }
-        }
-        let subset = subset.as_deref();
         require(query, self.gatherer.requires())?;
         if let Some(reranker) = &self.reranker {
             require(query, reranker.requires())?;
         }
 
         let started = Instant::now();
-        let candidates = self.gatherer.gather(query, request.gather_limit, subset)?;
-        let gathered = Instant::now();
-        validate_candidates(&candidates, request.gather_limit, subset, document_count)?;
-        let (scores, score_semantics) = match &self.reranker {
-            Some(reranker) => (
-                reranker.rerank(query, &candidates, &request.budget)?,
-                reranker.score_semantics(),
-            ),
+        let gathered = self
+            .gatherer
+            .gather(query, request.gather_limit, request.subset)?;
+        let gathered_at = Instant::now();
+        validate(&gathered.candidates, request.gather_limit, request.subset)?;
+        let candidates = gathered.candidates;
+        let (scores, as_of, score_semantics) = match &self.reranker {
+            Some(reranker) => {
+                let scored = reranker.rerank(query, &candidates, &request.budget)?;
+                (
+                    scored.scores,
+                    gathered.as_of.min(scored.as_of),
+                    reranker.score_semantics(),
+                )
+            }
             None => (
                 candidates
                     .iter()
-                    .map(|candidate| Score {
-                        document_id: candidate.document_id,
-                        value: candidate.gather_score,
-                    })
+                    .map(|candidate| Some(candidate.gather_score))
                     .collect(),
+                gathered.as_of,
                 self.gatherer.score_semantics(),
             ),
         };
@@ -156,8 +149,8 @@ impl SearchPipeline {
             .into_iter()
             .enumerate()
             .map(|(rank, position)| RankedDocument {
-                document_id: scores[position].document_id,
-                score: scores[position].value,
+                key: candidates[position].key.clone(),
+                score: scores[position].expect("only scored candidates are ranked"),
                 rank: rank + 1,
             })
             .collect();
@@ -166,6 +159,7 @@ impl SearchPipeline {
             documents,
             diagnostics: SearchDiagnostics {
                 candidate_count: candidates.len(),
+                dropped: scores.iter().filter(|score| score.is_none()).count(),
                 gatherer: self.gatherer.name().to_string(),
                 reranker: self
                     .reranker
@@ -175,13 +169,43 @@ impl SearchPipeline {
             },
             candidates,
             scores,
+            as_of,
             timings: SearchTimings {
-                gather: gathered - started,
-                rerank: reranked - gathered,
+                gather: gathered_at - started,
+                rerank: reranked - gathered_at,
                 total: finished - started,
             },
         })
     }
+}
+
+fn validate(candidates: &[Candidate], gather_limit: usize, subset: Option<&Subset>) -> Result<()> {
+    if candidates.len() > gather_limit {
+        return Err(Error::invalid(
+            "gatherer returned more candidates than requested",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(candidates.len());
+    for (rank, candidate) in candidates.iter().enumerate() {
+        if candidate.gather_rank != rank {
+            return Err(Error::invalid(
+                "candidate gather ranks must be contiguous and zero-based",
+            ));
+        }
+        if subset.is_some_and(|subset| !subset.contains(&candidate.key)) {
+            return Err(Error::invalid(format!(
+                "gatherer returned document {:?}, which is outside the subset",
+                candidate.key
+            )));
+        }
+        if !seen.insert(&candidate.key) {
+            return Err(Error::invalid(format!(
+                "gatherer returned document {:?} more than once",
+                candidate.key
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Checks presence and representation only, so a lazy feature is still
@@ -193,92 +217,53 @@ fn require(query: &Query, requirements: &Requirements) -> Result<()> {
     Ok(())
 }
 
-/// `subset` with repeats removed, borrowed when it has none.
-fn unique_subset(subset: &[u64]) -> Result<Cow<'_, [u64]>> {
-    if subset.windows(2).any(|pair| pair[0] > pair[1]) {
-        return Err(Error::invalid("subset must be ascending"));
-    }
-    if subset.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Ok(Cow::Borrowed(subset));
-    }
-    let mut unique = subset.to_vec();
-    unique.dedup();
-    Ok(Cow::Owned(unique))
-}
-
-fn validate_candidates(
-    candidates: &[Candidate],
-    gather_limit: usize,
-    subset: Option<&[u64]>,
-    document_count: u64,
-) -> Result<()> {
-    if candidates.len() > gather_limit {
-        return Err(Error::invalid(
-            "gatherer returned more candidates than requested",
-        ));
-    }
-    for (rank, candidate) in candidates.iter().enumerate() {
-        if candidate.gather_rank != rank {
-            return Err(Error::invalid(
-                "candidate gather ranks must be contiguous and zero-based",
-            ));
-        }
-        if candidate.document_id >= document_count {
-            return Err(Error::invalid(format!(
-                "gatherer returned document ID {}, outside the corpus of {document_count} documents",
-                candidate.document_id
-            )));
-        }
-        if let Some(subset) = subset {
-            if subset.binary_search(&candidate.document_id).is_err() {
-                return Err(Error::invalid(format!(
-                    "gatherer returned document ID {}, which is outside the subset",
-                    candidate.document_id
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
-    use crate::manifest::{CorpusManifest, Representation};
     use crate::query::{Feature, TokenMatrix};
-
-    fn corpus() -> CorpusManifest {
-        CorpusManifest::new("corpus", "1", 3, "abc").unwrap()
-    }
+    use crate::representation::Representation;
+    use crate::stage::{Gathered, Scored};
 
     fn representation() -> Representation {
         Representation::new("encoder", "1", 2, true).unwrap()
     }
 
-    struct TextGatherer {
-        corpus: CorpusManifest,
+    fn key(id: &str) -> DocumentKey {
+        DocumentKey::new("docs", id)
+    }
+
+    fn seconds_ago(seconds: u64) -> SystemTime {
+        SystemTime::now() - Duration::from_secs(seconds)
+    }
+
+    /// Returns `rows` in order, filtered by the subset.
+    struct FixedGatherer {
+        rows: Vec<(DocumentKey, f32)>,
+        as_of: SystemTime,
         requires: Requirements,
         calls: AtomicUsize,
     }
 
-    impl TextGatherer {
+    impl FixedGatherer {
         fn new() -> Self {
+            Self::over(vec![(key("z"), 100.0), (key("x"), 10.0), (key("y"), 10.0)])
+        }
+
+        fn over(rows: Vec<(DocumentKey, f32)>) -> Self {
             Self {
-                corpus: corpus(),
+                rows,
+                as_of: seconds_ago(5),
                 requires: BTreeMap::new(),
                 calls: AtomicUsize::new(0),
             }
         }
     }
 
-    impl CandidateGenerator for TextGatherer {
-        fn corpus(&self) -> &CorpusManifest {
-            &self.corpus
-        }
-
+    impl CandidateGenerator for FixedGatherer {
         fn requires(&self) -> &Requirements {
             &self.requires
         }
@@ -287,71 +272,73 @@ mod tests {
             "external-gather"
         }
 
-        fn gather(
-            &self,
-            _: &Query,
-            limit: usize,
-            subset: Option<&[u64]>,
-        ) -> Result<Vec<Candidate>> {
+        fn gather(&self, _: &Query, limit: usize, subset: Option<&Subset>) -> Result<Gathered> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok([(2, 100.0), (0, 10.0), (1, 10.0)]
-                .into_iter()
-                .filter(|(document_id, _)| {
-                    subset.map_or(true, |subset| subset.contains(document_id))
-                })
+            let candidates = self
+                .rows
+                .iter()
+                .filter(|(key, _)| subset.map_or(true, |subset| subset.contains(key)))
                 .take(limit)
                 .enumerate()
-                .map(|(rank, (document_id, gather_score))| Candidate {
-                    document_id,
-                    gather_score,
+                .map(|(rank, (key, gather_score))| Candidate {
+                    key: key.clone(),
+                    gather_score: *gather_score,
                     gather_rank: rank,
                     provenance: "external".to_string(),
                 })
-                .collect())
+                .collect();
+            Ok(Gathered {
+                candidates,
+                as_of: self.as_of,
+            })
         }
     }
 
-    struct VectorReranker {
-        corpus: CorpusManifest,
+    /// Scores by ID; an ID it does not hold is unscored.
+    struct TableReranker {
+        scores: BTreeMap<String, f32>,
+        as_of: SystemTime,
         requires: Requirements,
+        received: Mutex<Vec<DocumentKey>>,
     }
 
-    impl VectorReranker {
-        fn new(corpus: CorpusManifest) -> Self {
+    impl TableReranker {
+        fn new(scores: &[(&str, f32)]) -> Self {
             Self {
-                corpus,
+                scores: scores
+                    .iter()
+                    .map(|&(id, score)| (id.to_string(), score))
+                    .collect(),
+                as_of: seconds_ago(1),
                 requires: BTreeMap::from([("multi_vector".to_string(), representation())]),
+                received: Mutex::new(Vec::new()),
             }
         }
     }
 
-    impl Reranker for VectorReranker {
-        fn corpus(&self) -> &CorpusManifest {
-            &self.corpus
-        }
-
+    impl Reranker for TableReranker {
         fn requires(&self) -> &Requirements {
             &self.requires
         }
 
         fn score_semantics(&self) -> &str {
-            "external-rerank"
+            "table"
         }
 
         fn rerank(
             &self,
-            query: &Query,
+            _: &Query,
             candidates: &[Candidate],
             _: &ResourceBudget,
-        ) -> Result<Vec<Score>> {
-            query.feature_as::<TokenMatrix>("multi_vector", &representation())?;
-            Ok(candidates
-                .iter()
-                .map(|candidate| Score {
-                    document_id: candidate.document_id,
-                    value: [3.0, 5.0, 2.0][candidate.document_id as usize],
-                })
-                .collect())
+        ) -> Result<Scored> {
+            *self.received.lock().unwrap() = candidates.iter().map(|c| c.key.clone()).collect();
+            Ok(Scored {
+                scores: candidates
+                    .iter()
+                    .map(|candidate| self.scores.get(candidate.key.id()).copied())
+                    .collect(),
+                as_of: self.as_of,
+            })
         }
     }
 
@@ -360,112 +347,132 @@ mod tests {
             "multi_vector",
             Feature::new(
                 representation(),
-                TokenMatrix::new(vec![1.0, 1.0], 2).unwrap(),
+                TokenMatrix::new(vec![1.0, 0.0], 2).unwrap(),
             ),
         )
     }
 
-    #[test]
-    fn a_reranked_result_ignores_gather_scores() {
-        let pipeline = SearchPipeline::new(
-            Arc::new(TextGatherer::new()),
-            Some(Arc::new(VectorReranker::new(corpus()))),
-        )
-        .unwrap();
-        let result = pipeline
-            .search(&vector_query(), &SearchRequest::new(3, 3))
-            .unwrap();
-        let ids = result
+    fn ids(result: &SearchResult) -> Vec<&str> {
+        result
             .documents
             .iter()
-            .map(|row| row.document_id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1, 0, 2]);
-        assert_eq!(
-            result.diagnostics,
-            SearchDiagnostics {
-                candidate_count: 3,
-                gatherer: "TextGatherer".to_string(),
-                reranker: Some("VectorReranker".to_string()),
-                score_semantics: "external-rerank".to_string(),
-            }
-        );
+            .map(|document| document.key.id())
+            .collect()
     }
 
     #[test]
-    fn without_a_reranker_gather_scores_rank() {
-        let pipeline = SearchPipeline::new(Arc::new(TextGatherer::new()), None).unwrap();
+    fn the_reranker_orders_the_gathered_keys() {
+        let reranker = Arc::new(TableReranker::new(&[("x", 3.0), ("y", 5.0), ("z", 2.0)]));
+        let pipeline = SearchPipeline::new(Arc::new(FixedGatherer::new()), Some(reranker.clone()));
         let result = pipeline
+            .search(&vector_query(), &SearchRequest::new(3, 2))
+            .unwrap();
+        assert_eq!(
+            *reranker.received.lock().unwrap(),
+            [key("z"), key("x"), key("y")]
+        );
+        assert_eq!(ids(&result), ["y", "x"]);
+        assert_eq!(result.scores, [Some(2.0), Some(3.0), Some(5.0)]);
+        assert_eq!(result.as_of, result.as_of.min(reranker.as_of));
+        assert_eq!(
+            result.diagnostics.reranker.as_deref(),
+            Some("TableReranker")
+        );
+        assert_eq!(result.diagnostics.dropped, 0);
+    }
+
+    #[test]
+    fn a_document_one_stage_lacks_is_dropped() {
+        let gatherer = Arc::new(FixedGatherer::new());
+        let reranker = Arc::new(TableReranker::new(&[("x", 3.0), ("z", 2.0)]));
+        let result = SearchPipeline::new(gatherer.clone(), Some(reranker))
+            .search(&vector_query(), &SearchRequest::new(3, 3))
+            .unwrap();
+        assert_eq!(ids(&result), ["x", "z"]);
+        assert_eq!(result.scores, [Some(2.0), Some(3.0), None]);
+        assert_eq!(result.diagnostics.dropped, 1);
+        assert_eq!(result.as_of, gatherer.as_of);
+    }
+
+    #[test]
+    fn without_a_reranker_gather_scores_rank_with_gather_rank_tie_break() {
+        let gatherer = Arc::new(FixedGatherer::new());
+        let result = SearchPipeline::new(gatherer.clone(), None)
             .search(&Query::new("query"), &SearchRequest::new(3, 3))
             .unwrap();
-        let ids = result
-            .documents
-            .iter()
-            .map(|row| row.document_id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![2, 0, 1]);
+        assert_eq!(ids(&result), ["z", "x", "y"]);
+        assert_eq!(result.as_of, gatherer.as_of);
         assert_eq!(result.diagnostics.score_semantics, "external-gather");
     }
 
     #[test]
-    fn stages_must_index_the_same_corpus() {
-        let error = SearchPipeline::new(
-            Arc::new(TextGatherer::new()),
-            Some(Arc::new(VectorReranker::new(corpus().with_generation(1)))),
-        )
-        .err()
-        .unwrap();
-        assert!(matches!(error, Error::IncompatibleIndex(_)));
-    }
-
-    #[test]
     fn an_unservable_query_fails_before_gathering() {
-        let gatherer = Arc::new(TextGatherer::new());
-        let pipeline = SearchPipeline::new(
-            gatherer.clone(),
-            Some(Arc::new(VectorReranker::new(corpus()))),
-        )
-        .unwrap();
+        let gatherer = Arc::new(FixedGatherer::new());
+        let pipeline =
+            SearchPipeline::new(gatherer.clone(), Some(Arc::new(TableReranker::new(&[]))));
         let error = pipeline
-            .search(&Query::new("query"), &SearchRequest::new(3, 1))
+            .search(&Query::new("query"), &SearchRequest::new(3, 3))
             .unwrap_err();
         assert!(matches!(error, Error::IncompatibleQuery(_)));
         assert_eq!(gatherer.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn checking_requirements_leaves_lazy_features_unmaterialized() {
-        let encodings = Arc::new(AtomicUsize::new(0));
-        let counter = encodings.clone();
-        let query = Query::new("query").with_feature(
-            "multi_vector",
-            Feature::lazy(representation(), move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                TokenMatrix::new(vec![1.0, 0.0], 2)
-            }),
-        );
-        let mut gatherer = TextGatherer::new();
-        gatherer.requires = BTreeMap::from([("multi_vector".to_string(), representation())]);
-        let pipeline = SearchPipeline::new(Arc::new(gatherer), None).unwrap();
-        pipeline.search(&query, &SearchRequest::new(3, 3)).unwrap();
-        assert_eq!(encodings.load(Ordering::SeqCst), 0);
+    fn the_subset_reaches_the_gatherer_and_bounds_its_candidates() {
+        let subset = Subset::new().with("docs", ["x", "unknown"]);
+        let result = SearchPipeline::new(Arc::new(FixedGatherer::new()), None)
+            .search(
+                &Query::new("query"),
+                &SearchRequest::new(3, 3).with_subset(&subset),
+            )
+            .unwrap();
+        assert_eq!(ids(&result), ["x"]);
+
+        struct Ignoring(FixedGatherer);
+        impl CandidateGenerator for Ignoring {
+            fn requires(&self) -> &Requirements {
+                self.0.requires()
+            }
+            fn score_semantics(&self) -> &str {
+                self.0.score_semantics()
+            }
+            fn gather(&self, query: &Query, limit: usize, _: Option<&Subset>) -> Result<Gathered> {
+                self.0.gather(query, limit, None)
+            }
+        }
+        let error = SearchPipeline::new(Arc::new(Ignoring(FixedGatherer::new())), None)
+            .search(
+                &Query::new("query"),
+                &SearchRequest::new(3, 3).with_subset(&subset),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("outside the subset"));
     }
 
     #[test]
-    fn subsets_must_be_ascending_and_inside_the_corpus() {
-        let pipeline = SearchPipeline::new(Arc::new(TextGatherer::new()), None).unwrap();
-        let query = Query::new("query");
-        let result = pipeline
-            .search(&query, &SearchRequest::new(3, 3).with_subset(&[0, 2]))
-            .unwrap();
-        assert_eq!(result.candidates.len(), 2);
-        let repeated = pipeline
-            .search(&query, &SearchRequest::new(3, 3).with_subset(&[0, 0, 2]))
-            .unwrap();
-        assert_eq!(repeated.candidates, result.candidates);
-        for subset in [&[2, 0][..], &[0, 3][..]] {
+    fn candidates_must_be_unique_with_dense_ranks() {
+        let repeated = FixedGatherer::over(vec![(key("x"), 1.0), (key("x"), 0.5)]);
+        let error = SearchPipeline::new(Arc::new(repeated), None)
+            .search(&Query::new("query"), &SearchRequest::new(3, 3))
+            .unwrap_err();
+        assert!(error.to_string().contains("more than once"));
+
+        let same_id_elsewhere =
+            FixedGatherer::over(vec![(key("x"), 1.0), (DocumentKey::new("other", "x"), 0.5)]);
+        assert!(SearchPipeline::new(Arc::new(same_id_elsewhere), None)
+            .search(&Query::new("query"), &SearchRequest::new(3, 3))
+            .is_ok());
+    }
+
+    #[test]
+    fn limits_are_validated() {
+        let pipeline = SearchPipeline::new(Arc::new(FixedGatherer::new()), None);
+        for (gather_limit, limit) in [(0, 1), (3, 0), (2, 3)] {
             assert!(pipeline
-                .search(&query, &SearchRequest::new(3, 3).with_subset(subset))
+                .search(
+                    &Query::new("query"),
+                    &SearchRequest::new(gather_limit, limit)
+                )
                 .is_err());
         }
     }

@@ -23,7 +23,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<query::PyFeature>()?;
     module.add_class::<query::PyQuery>()?;
     module.add_class::<stages::PyCandidate>()?;
-    module.add_class::<stages::PyScore>()?;
+    module.add_class::<stages::PyGathered>()?;
+    module.add_class::<stages::PyScored>()?;
     module.add_class::<stages::PyResourceBudget>()?;
     module.add_class::<stages::PyMaxSimReranker>()?;
     module.add_class::<stages::PyRankedDocument>()?;
@@ -31,17 +32,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<stages::PySearchResult>()?;
     module.add_class::<stages::PySearchPipeline>()?;
     module.add_class::<storage::PyVectorStore>()?;
-    module.add_class::<storage::PyFloat32VectorStore>()?;
-    module.add_class::<storage::PyInt8VectorStore>()?;
-    module.add_function(wrap_pyfunction!(storage::open_vector_store, module)?)?;
+    module.add_class::<storage::PyStoreView>()?;
+    module.add_class::<storage::PyVectorStoreWriter>()?;
     module.add_function(wrap_pyfunction!(storage::maxsim_scores_packed, module)?)?;
-    module.add_function(wrap_pyfunction!(convert::document_ids_digest, module)?)?;
-    module.add_function(wrap_pyfunction!(convert::check_corpus_manifest, module)?)?;
     module.add_function(wrap_pyfunction!(convert::check_representation, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        convert::assert_corpora_compatible,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(
         convert::assert_representations_compatible,
         module

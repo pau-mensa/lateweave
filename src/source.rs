@@ -1,7 +1,10 @@
-//! Document token vectors, fetched by internal ID.
+//! Document token vectors, fetched by document ID.
+
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::error::{Error, Result};
-use crate::manifest::Representation;
+use crate::representation::Representation;
 
 /// Token vectors of documents: a row-major float32 `[sum(lengths), dimension]`
 /// matrix holding each document's tokens contiguously, in `lengths` order.
@@ -51,30 +54,34 @@ impl PackedDocuments {
     }
 }
 
-/// Where a MaxSim reranker reads document vectors from.
+/// Where a MaxSim reranker reads one corpus's document vectors from.
 ///
 /// An engine that already holds document vectors implements this over them
-/// and stores nothing twice; the lateweave vector stores implement it for
-/// gatherers that keep no vectors. `score_semantics` qualifies what MaxSim
-/// over the fetched vectors means, since a source may reconstruct from a lossy
-/// code.
+/// and stores nothing twice; a [`VectorStore`](crate::VectorStore)
+/// implements it for gatherers that keep no vectors. `score_semantics`
+/// qualifies what MaxSim over the fetched vectors means, since a source may
+/// reconstruct from a lossy code.
 pub trait MultiVectorSource: Send + Sync {
+    fn corpus(&self) -> &str;
+
     fn representation(&self) -> &Representation;
 
     fn score_semantics(&self) -> &str;
 
-    fn document_count(&self) -> u64;
+    /// The source's current state, which a rerank reads throughout.
+    fn view(&self) -> Result<Arc<dyn VectorView>>;
+}
 
-    /// Changes whenever a mutation may have changed which vectors an ID
-    /// holds. A reranker built over the source refuses to score once it has
-    /// moved; a source that never mutates keeps the default.
-    fn generation(&self) -> u64 {
-        0
-    }
+/// One consistent state of a [`MultiVectorSource`]: the vectors a document
+/// ID names never change for the life of the view.
+pub trait VectorView: Send + Sync {
+    /// Every write committed to the source before this is visible in the view.
+    fn as_of(&self) -> SystemTime;
 
-    /// Token counts of `document_ids`, in the same order.
-    fn document_lengths(&self, document_ids: &[u64]) -> Result<Vec<usize>>;
+    /// Token counts of `document_ids`, in the same order; `None` for a
+    /// document the view does not hold.
+    fn document_lengths(&self, document_ids: &[&str]) -> Result<Vec<Option<usize>>>;
 
-    /// The documents' vectors in the requested order.
-    fn fetch(&self, document_ids: &[u64], threads: Option<usize>) -> Result<PackedDocuments>;
+    /// The vectors of `document_ids`, which the view must hold, in order.
+    fn fetch(&self, document_ids: &[&str], threads: Option<usize>) -> Result<PackedDocuments>;
 }

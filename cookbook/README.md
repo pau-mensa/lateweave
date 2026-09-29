@@ -1,9 +1,10 @@
 # Cookbook: BM25 gather, optional stored MaxSim rerank
 
-This recipe maintains one retrieval index, a bm25s lexical index, plus a
-lateweave vector store used to rerank BM25 candidates when the query supplies
-token embeddings. It is the reference case for the substrate: a gatherer that
-consumes only text, feeding a reranker that consumes a multi-vector feature.
+This recipe keeps one retrieval index, a bm25s lexical index plus a lateweave
+vector store used to rerank BM25 candidates when the query supplies token
+embeddings. It is the reference case for the substrate: a gatherer that
+consumes only text, feeding a reranker that consumes a multi-vector feature,
+over indexes an indexer keeps moving while a server searches them.
 
 bm25s is declared in the script's PEP 723 metadata rather than in lateweave's
 package dependencies:
@@ -16,15 +17,19 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py --help
 
 ```text
 index/
-  corpus-manifest.json   CorpusManifest: which documents, which generation
   analyzer.json          lexical analysis chain, read back on every command
-  documents.jsonl        external ID and text, in internal-ID order
-  bm25/                  bm25s index
-  vectors/               lateweave store; carries its Representation
+  documents.jsonl        the indexer's record of every document: ID and text
+  bm25/
+    current.json         corpus, live generation, and when it was committed
+    <generation>/        bm25s index plus ids.json, its row order
+  vectors/               lateweave vector store; carries its Representation
 ```
 
-The corpus manifest is the one identity both stages share. The store's
-representation is what a query's embeddings are checked against.
+The two indexes share document IDs and nothing else. Each is committed on its
+own: bm25 by renaming `current.json`, the store by renaming its
+`manifest.json`. Neither knows the other's row order, and the server never
+needs them to agree: it ranks only the documents both hold and reports the
+older of the two commits as the answer's `as_of`.
 
 ## The lexical stage
 
@@ -43,7 +48,7 @@ built with, which would return fewer documents with no error.
 
 ## Inputs
 
-Documents are JSON Lines in stable internal order:
+Documents are JSON Lines:
 
 ```json
 {"id": "law-1", "text": "document text"}
@@ -56,7 +61,7 @@ Embeddings use two NumPy files: `embeddings.npy`, a finite unit-norm float32
 `total_tokens`. Queries use a float32 `[query_tokens, dimension]` `.npy` file
 from the same encoder.
 
-## Build
+## The indexer
 
 ```bash
 uv run --with-editable . cookbook/bm25_stored_maxsim.py build \
@@ -66,16 +71,11 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py build \
   --document-lengths var/document-lengths.npy \
   --storage float32 \
   --corpus-id laws \
-  --corpus-version 2026-09-01 \
   --encoder lightonai/LateOn-Code \
   --encoder-revision main \
   --threads 8
-```
 
-## Append and delete
-
-```bash
-uv run --with-editable . cookbook/bm25_stored_maxsim.py update \
+uv run --with-editable . cookbook/bm25_stored_maxsim.py upsert \
   --index var/laws \
   --documents var/new-documents.jsonl \
   --embeddings var/new-embeddings.npy \
@@ -85,18 +85,19 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py delete \
   --index var/laws \
   --document-id law-17 \
   --document-id law-42
+
+uv run --with-editable . cookbook/bm25_stored_maxsim.py compact --index var/laws
 ```
 
-Existing external IDs are rejected on append. After a delete, remaining
-documents are renumbered 0..n-1 in document order. The lexical index has no
-incremental path, so both commands rebuild it from `documents.jsonl`; the store
-appends or compacts in place. Each mutation advances the corpus generation.
+`upsert` replaces any document with the same ID; `delete` ignores IDs it does
+not hold. The store appends one segment or writes one tombstone file per
+mutation and never rewrites existing vectors; `compact` merges them whenever
+convenient and changes no result. bm25s has no incremental path, so every
+mutation builds the next lexical generation from `documents.jsonl` and renames
+`current.json` to publish it. A file lock serializes indexers; searches never
+take it.
 
-Build, append, and delete publish copy-on-write directory replacements while a
-file lock excludes readers, so a failure cannot expose a BM25 generation paired
-with a different store generation.
-
-## Search
+## The server
 
 ```bash
 uv run --with-editable . cookbook/bm25_stored_maxsim.py search \
@@ -109,5 +110,9 @@ uv run --with-editable . cookbook/bm25_stored_maxsim.py search \
 
 Without `--query-embeddings` the search is gather-only and BM25 scores rank.
 With them, only BM25 candidates are fetched from the store and scored by the
-CPU MaxSim kernel. `--subset-id EXTERNAL_ID` (repeatable) restricts the search
-to those documents; the gatherer honours it through bm25s's weight mask.
+CPU MaxSim kernel; a candidate the store does not hold yet, or no longer, is
+dropped and counted in `diagnostics.dropped`. `--subset-id ID` (repeatable)
+restricts the search to those documents; the gatherer honours it through
+bm25s's weight mask. The output's `as_of` is the older of the two indexes'
+commits. A long-running server built the same way, as `LexicalCandidateGenerator` plus `VectorStore`, serves each commit on
+its next search.

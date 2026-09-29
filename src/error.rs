@@ -6,7 +6,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Two stages do not index the same documents.
+    /// Stages or sources that cannot be composed: another representation,
+    /// another score scale, or a corpus the reranker has no source for.
     #[error("{0}")]
     IncompatibleIndex(String),
     /// A query lacks a feature a stage needs, or supplies it from another encoder.

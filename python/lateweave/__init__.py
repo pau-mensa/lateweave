@@ -1,38 +1,30 @@
 from ._native import (
     Candidate,
     Feature,
-    Float32VectorStore,
-    Int8VectorStore,
+    Gathered,
     MaxSimReranker,
     Query,
     RankedDocument,
     ResourceBudget,
-    Score,
+    Scored,
     SearchPipeline,
     SearchResult,
     SearchTimings,
+    StoreView,
     VectorStore,
+    VectorStoreWriter,
     maxsim_scores_packed,
-    open_vector_store,
 )
-from .interfaces import CandidateGenerator, MultiVectorSource, Reranker
-from .manifest import (
-    CorpusManifest,
-    IncompatibleIndexError,
-    IncompatibleQueryError,
-    Representation,
-    document_ids_digest,
-)
+from .interfaces import CandidateGenerator, MultiVectorSource, Reranker, VectorView
+from .representation import IncompatibleIndexError, IncompatibleQueryError, Representation
 
 __all__ = [
     "Candidate",
     "CandidateGenerator",
-    "CorpusManifest",
     "Feature",
-    "Float32VectorStore",
+    "Gathered",
     "IncompatibleIndexError",
     "IncompatibleQueryError",
-    "Int8VectorStore",
     "MaxSimReranker",
     "MultiVectorSource",
     "Query",
@@ -40,12 +32,13 @@ __all__ = [
     "Representation",
     "Reranker",
     "ResourceBudget",
-    "Score",
+    "Scored",
     "SearchPipeline",
     "SearchResult",
     "SearchTimings",
+    "StoreView",
     "VectorStore",
-    "document_ids_digest",
+    "VectorStoreWriter",
+    "VectorView",
     "maxsim_scores_packed",
-    "open_vector_store",
 ]

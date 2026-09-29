@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crate::error::{Error, Result};
-use crate::manifest::Representation;
+use crate::representation::Representation;
 
 /// Whatever an encoder produced for the query text: a token matrix, a dense
 /// vector, a sparse weighting. Stages downcast to the type they consume.
