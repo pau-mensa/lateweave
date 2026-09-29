@@ -11,12 +11,14 @@ license = "Apache-2.0"
 description = "Composable candidate generation and optional late-interaction reranking"
 
 [dependencies]
+getrandom = "0.4"
 matrixmultiply = "0.3"
 memmap2 = "0.9"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+tempfile = "3"
 
 # Only reachable through the `openblas` feature, or on macOS where Accelerate
 # is part of the operating system and therefore always present.
@@ -25,9 +27,6 @@ blas = { version = "0.23", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 blas = "0.23"
 blas-src = { version = "0.11", default-features = false, features = ["accelerate"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [features]
 default = []

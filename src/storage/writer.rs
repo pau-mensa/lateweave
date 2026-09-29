@@ -11,9 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rayon::prelude::*;
 
 use super::npy::{Dtype, NpyWriter};
+use super::publication::{sync_directory, ImmutableFiles};
 use super::{
-    int8, locate, segment_file, segment_files, tombstones_file, Encoding, LiveSegment, Manifest,
-    SegmentData, SegmentEntry, MANIFEST_FILE, STORE_FORMAT,
+    int8, locate, segment_file, tombstones_file, Encoding, LiveSegment, Manifest, SegmentData,
+    SegmentEntry, MANIFEST_FILE, STORE_FORMAT,
 };
 use crate::error::{Error, Result};
 use crate::ranking::all_finite;
@@ -64,16 +65,26 @@ impl VectorStoreWriter {
         let manifest = Manifest {
             format: STORE_FORMAT.to_string(),
             encoding: encoding.name().to_string(),
+            store_id: store_id()?,
             corpus,
             representation,
             commit: 0,
+            next_segment_id: 0,
             committed_at: now(),
             segments: Vec::new(),
         };
-        if let Err(error) = write_manifest(path, &manifest) {
-            let _ = fs::remove_dir_all(path);
+        let mut published = false;
+        if let Err(error) = write_manifest(path, &manifest, &mut published) {
+            if !published {
+                let _ = fs::remove_dir_all(path);
+            }
             return Err(error);
         }
+        sync_directory(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?;
         Self::open(path)
     }
 
@@ -81,12 +92,11 @@ impl VectorStoreWriter {
         let path = path.as_ref().to_path_buf();
         let committed = Manifest::read(&path)?;
         let segments = super::load_segments(&path, &committed, &[])?;
+        sync_directory(&path)?;
+        remove_unreferenced(&path, &committed);
         Ok(Self {
             encoding: committed.encoding()?,
-            next_segment: committed
-                .segments
-                .last()
-                .map_or(0, |segment| segment.id + 1),
+            next_segment: committed.next_segment_id,
             path,
             committed,
             segments,
@@ -146,8 +156,9 @@ impl VectorStoreWriter {
                 "document ID {repeated:?} appears more than once"
             )));
         }
+        let id = self.allocate_segment()?;
         let entry = SegmentEntry {
-            id: self.next_segment,
+            id,
             documents: ids.len() as u64,
             tokens: (embeddings.len() / dimension) as u64,
             tombstones: None,
@@ -156,7 +167,6 @@ impl VectorStoreWriter {
             encode(self.encoding, embeddings, dimension, threads, arrays)?;
             write_segment_index(path, entry.id, &ids, lengths.iter().copied())
         })?;
-        self.next_segment += 1;
         self.segments.push(LiveSegment {
             entry,
             data: Arc::new(data),
@@ -213,22 +223,23 @@ impl VectorStoreWriter {
                     .map(move |(row, id)| (position, row, id))
             })
             .filter(|&(position, row, id)| locate(&self.segments, id) == Some((position, row)))
-            .map(|(position, row, id)| (&self.segments[position].data, row, id.clone()))
+            .map(|(position, row, id)| (position, row, id.clone()))
             .collect::<Vec<_>>();
-        self.retombstoned.clear();
         if kept.is_empty() {
+            self.retombstoned.clear();
             self.segments.clear();
             return Ok(());
         }
+        let id = self.allocate_segment()?;
         let lengths = kept
             .iter()
-            .map(|(data, row, _)| {
-                let (first, last) = data.tokens(*row);
+            .map(|(position, row, _)| {
+                let (first, last) = self.segments[*position].data.tokens(*row);
                 last - first
             })
             .collect::<Vec<_>>();
         let entry = SegmentEntry {
-            id: self.next_segment,
+            id,
             documents: kept.len() as u64,
             tokens: lengths.iter().sum::<usize>() as u64,
             tombstones: None,
@@ -236,14 +247,18 @@ impl VectorStoreWriter {
         let specs = self.encoding.arrays(self.representation().dimension());
         let data = self.stage(entry, |path, arrays| {
             for (index, (writer, spec)) in arrays.iter_mut().zip(&specs).enumerate() {
-                for (data, row, _) in &kept {
-                    writer.write_bytes(data.record_bytes(index, spec, *row))?;
+                for (position, row, _) in &kept {
+                    writer.write_bytes(
+                        self.segments[*position]
+                            .data
+                            .record_bytes(index, spec, *row),
+                    )?;
                 }
             }
             let ids = kept.iter().map(|(_, _, id)| id.clone()).collect::<Vec<_>>();
             write_segment_index(path, entry.id, &ids, lengths.iter().copied())
         })?;
-        self.next_segment += 1;
+        self.retombstoned.clear();
         self.segments = vec![LiveSegment {
             entry,
             data: Arc::new(data),
@@ -255,57 +270,65 @@ impl VectorStoreWriter {
     /// Publishes everything staged, and returns the commit time readers
     /// report for it. Files no longer named are then removed.
     pub fn commit(&mut self) -> Result<SystemTime> {
-        let commit = self.committed.commit + 1;
-        let mut written = Vec::new();
-        let published = (|| {
-            for segment in &mut self.segments {
-                if !self.retombstoned.contains(&segment.entry.id) {
-                    continue;
-                }
-                let file = tombstones_file(&self.path, segment.entry.id, commit);
-                let mut writer =
-                    NpyWriter::create(file.clone(), Dtype::U64, &[segment.tombstones.len()])?;
-                written.push(file);
-                writer.write(&segment.tombstones)?;
-                writer.finish()?;
-                segment.entry.tombstones = Some(commit);
-            }
-            let manifest = Manifest {
-                commit,
-                committed_at: now(),
-                segments: self.segments.iter().map(|segment| segment.entry).collect(),
-                ..self.committed.clone()
-            };
-            write_manifest(&self.path, &manifest)?;
-            Ok(manifest)
-        })();
-        let manifest = match published {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                for file in written {
-                    let _ = fs::remove_file(file);
-                }
-                for segment in &mut self.segments {
-                    if let Some(entry) = self
-                        .committed
-                        .segments
-                        .iter()
-                        .find(|entry| entry.id == segment.entry.id)
-                    {
-                        segment.entry.tombstones = entry.tombstones;
-                    }
-                }
-                return Err(error);
-            }
+        self.commit_with(write_manifest)
+    }
+
+    pub(super) fn commit_with(
+        &mut self,
+        publish: impl FnOnce(&Path, &Manifest, &mut bool) -> Result<()>,
+    ) -> Result<SystemTime> {
+        let commit = self
+            .committed
+            .commit
+            .checked_add(1)
+            .ok_or_else(|| Error::storage("commit numbers exhausted"))?;
+        let mut files = ImmutableFiles::new(&self.path)?;
+        let mut manifest = Manifest {
+            commit,
+            next_segment_id: self.next_segment,
+            committed_at: now(),
+            segments: self.segments.iter().map(|segment| segment.entry).collect(),
+            ..self.committed.clone()
         };
-        self.retombstoned.clear();
-        self.committed = manifest;
+        for (segment, entry) in self.segments.iter().zip(&mut manifest.segments) {
+            if !self.retombstoned.contains(&entry.id) {
+                continue;
+            }
+            let mut writer = NpyWriter::create(
+                tombstones_file(files.path(), entry.id, commit),
+                Dtype::U64,
+                &[segment.tombstones.len()],
+            )?;
+            writer.write(&segment.tombstones)?;
+            writer.finish()?;
+            entry.tombstones = Some(commit);
+        }
+        files.install(&self.path)?;
+        let mut published = false;
+        let result = publish(&self.path, &manifest, &mut published);
+        if published {
+            files.retain();
+            for (segment, entry) in self.segments.iter_mut().zip(&manifest.segments) {
+                segment.entry = *entry;
+            }
+            self.retombstoned.clear();
+            self.committed = manifest;
+        }
+        result?;
         remove_unreferenced(&self.path, &self.committed);
         self.committed.committed_at()
     }
 
+    fn allocate_segment(&mut self) -> Result<u64> {
+        let id = self.next_segment;
+        self.next_segment = id
+            .checked_add(1)
+            .ok_or_else(|| Error::storage("segment IDs exhausted"))?;
+        Ok(id)
+    }
+
     /// Writes one segment's arrays with `write`, which also writes its index
-    /// files, and loads it; on failure no file of the segment remains.
+    /// files, and loads it. Failed attempts remove only their own files.
     fn stage(
         &self,
         entry: SegmentEntry,
@@ -313,27 +336,23 @@ impl VectorStoreWriter {
     ) -> Result<SegmentData> {
         let dimension = self.representation().dimension();
         let specs = self.encoding.arrays(dimension);
-        let staged = (|| {
-            let mut arrays = specs
-                .iter()
-                .map(|spec| {
-                    NpyWriter::create(
-                        segment_file(&self.path, entry.id, &format!("{}.npy", spec.name)),
-                        spec.dtype,
-                        &spec.shape(entry.tokens as usize),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            write(&self.path, &mut arrays)?;
-            arrays.into_iter().try_for_each(NpyWriter::finish)?;
-            SegmentData::load(&self.path, entry, self.encoding, dimension)
-        })();
-        if staged.is_err() {
-            for file in segment_files(&self.path, entry.id, &specs) {
-                let _ = fs::remove_file(file);
-            }
-        }
-        staged
+        let mut files = ImmutableFiles::new(&self.path)?;
+        let mut arrays = specs
+            .iter()
+            .map(|spec| {
+                NpyWriter::create(
+                    segment_file(files.path(), entry.id, &format!("{}.npy", spec.name)),
+                    spec.dtype,
+                    &spec.shape(entry.tokens as usize),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        write(files.path(), &mut arrays)?;
+        arrays.into_iter().try_for_each(NpyWriter::finish)?;
+        let data = SegmentData::load(files.path(), entry, self.encoding, dimension)?;
+        files.install(&self.path)?;
+        files.retain();
+        Ok(data)
     }
 }
 
@@ -385,7 +404,12 @@ fn write_segment_index(
     offsets.write(&values)?;
     offsets.finish()?;
 
-    let mut file = BufWriter::new(File::create(segment_file(path, segment, "ids.json"))?);
+    let mut file = BufWriter::new(
+        File::options()
+            .write(true)
+            .create_new(true)
+            .open(segment_file(path, segment, "ids.json"))?,
+    );
     let ids = ids.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
     serde_json::to_writer(&mut file, &ids).map_err(|error| Error::storage(error.to_string()))?;
     file.into_inner()
@@ -394,22 +418,28 @@ fn write_segment_index(
     Ok(())
 }
 
+/// 128 random bits, in hex.
+fn store_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| Error::storage(error.to_string()))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// Replaces `manifest.json` by rename, which is what commits.
-fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
+fn write_manifest(path: &Path, manifest: &Manifest, published: &mut bool) -> Result<()> {
     let mut encoded = serde_json::to_string_pretty(manifest)
         .map_err(|error| Error::storage(error.to_string()))?;
     encoded.push('\n');
-    let staged = path.join(format!("{MANIFEST_FILE}.{}.tmp", manifest.commit));
-    let written = (|| {
-        let mut file = File::create(&staged)?;
-        file.write_all(encoded.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&staged, path.join(MANIFEST_FILE))
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&staged);
-    }
-    Ok(written?)
+    let mut staged = tempfile::Builder::new()
+        .prefix("manifest.json.")
+        .tempfile_in(path)?;
+    staged.write_all(encoded.as_bytes())?;
+    staged.as_file().sync_all()?;
+    fs::rename(staged.path(), path.join(MANIFEST_FILE))?;
+    *published = true;
+    sync_directory(path).map_err(|error| Error::storage(format!(
+        "manifest published but directory synchronization failed; retry commit or reopen the writer: {error}"
+    )))
 }
 
 /// Best effort: a file a reader still maps may not be removable on every
@@ -423,6 +453,10 @@ fn remove_unreferenced(path: &Path, manifest: &Manifest) {
         let Some(name) = name.to_str() else {
             continue;
         };
+        if name.starts_with(".staging-") && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = fs::remove_dir_all(entry.path());
+            continue;
+        }
         let ours = name.starts_with("segment-") || name.starts_with(&format!("{MANIFEST_FILE}."));
         if ours && !referenced.contains(&entry.path()) {
             let _ = fs::remove_file(entry.path());

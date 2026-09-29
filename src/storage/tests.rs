@@ -189,6 +189,250 @@ fn compacting_away_every_document_leaves_an_empty_store() {
 }
 
 #[test]
+fn segment_identity_survives_an_empty_commit_and_writer_restart() {
+    for encoding in [Encoding::Float32, Encoding::Int8] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vectors");
+        let mut writer = writer(&path, encoding);
+        append(&mut writer, &[("a", 0)]);
+        writer.commit().unwrap();
+        let store = VectorStore::open(&path).unwrap();
+        let before = store.view().unwrap();
+        let watermark = Manifest::read(&path).unwrap().next_segment_id;
+
+        writer.delete(["a"]);
+        writer.compact().unwrap();
+        writer.commit().unwrap();
+        assert_eq!(Manifest::read(&path).unwrap().next_segment_id, watermark);
+        drop(writer);
+
+        let mut writer = VectorStoreWriter::open(&path).unwrap();
+        append(&mut writer, &[("b", 1)]);
+        writer.commit().unwrap();
+        let after = store.view().unwrap();
+        assert_eq!(after.document_ids(), ["b"]);
+        assert_eq!(vectors(&after, &["b"]), rows(&[1]));
+        assert_eq!(before.document_ids(), ["a"]);
+        assert_eq!(vectors(&before, &["a"]), rows(&[0]));
+        assert_eq!(after.manifest.segments[0].id, watermark);
+    }
+}
+
+#[test]
+fn an_existing_segment_file_is_preserved_when_publication_collides() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors");
+    let mut writer = writer(&path, Encoding::Float32);
+    let destination = segment_file(&path, 0, "vectors.npy");
+    let mut array = NpyWriter::create(destination.clone(), Dtype::F32, &[1, DIMENSION]).unwrap();
+    array.write(&rows(&[0])).unwrap();
+    array.finish().unwrap();
+    let mapped = NpyArray::open(&destination).unwrap();
+    let original = fs::read(&destination).unwrap();
+    assert!(NpyWriter::create(destination.clone(), Dtype::F32, &[1, DIMENSION]).is_err());
+
+    assert!(writer
+        .append(["b"], &rows(&[1]), DIMENSION, &[1], None)
+        .is_err());
+    assert_eq!(fs::read(&destination).unwrap(), original);
+    assert_eq!(mapped.values::<f32>().unwrap(), rows(&[0]));
+    assert_eq!(
+        files(&path),
+        BTreeSet::from([
+            MANIFEST_FILE.to_string(),
+            "segment-0.vectors.npy".to_string()
+        ])
+    );
+    assert!(Manifest::read(&path).unwrap().segments.is_empty());
+}
+
+#[test]
+fn a_failed_compaction_preserves_pending_deletions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors");
+    let mut writer = writer(&path, Encoding::Float32);
+    append(&mut writer, &[("a", 0), ("b", 1)]);
+    writer.commit().unwrap();
+    writer.delete(["a"]);
+    let collision = segment_file(&path, 1, "ids.json");
+    fs::write(&collision, b"existing").unwrap();
+    assert!(writer.compact().is_err());
+    assert_eq!(fs::read(&collision).unwrap(), b"existing");
+    writer.commit().unwrap();
+    let view = VectorStore::open(&path).unwrap().view().unwrap();
+    assert_eq!(view.document_ids(), ["b"]);
+    assert_eq!(vectors(&view, &["b"]), rows(&[1]));
+}
+
+#[test]
+fn a_tombstone_collision_preserves_existing_files_and_can_be_retried() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors");
+    let mut writer = writer(&path, Encoding::Float32);
+    append(&mut writer, &[("a", 0), ("b", 1)]);
+    writer.commit().unwrap();
+    writer.delete(["a"]);
+    let collision = tombstones_file(&path, 0, 2);
+    fs::write(&collision, b"existing").unwrap();
+    let manifest = fs::read(path.join(MANIFEST_FILE)).unwrap();
+    assert!(writer.commit().is_err());
+    assert_eq!(fs::read(&collision).unwrap(), b"existing");
+    assert_eq!(fs::read(path.join(MANIFEST_FILE)).unwrap(), manifest);
+    fs::remove_file(collision).unwrap();
+    writer.commit().unwrap();
+    let view = VectorStore::open(&path).unwrap().view().unwrap();
+    assert_eq!(view.document_ids(), ["b"]);
+}
+
+#[test]
+fn a_known_segment_cannot_change_dimensions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors");
+    let mut writer = writer(&path, Encoding::Float32);
+    append(&mut writer, &[("a", 0)]);
+    writer.commit().unwrap();
+    let store = VectorStore::open(&path).unwrap();
+    let mut manifest = Manifest::read(&path).unwrap();
+    manifest.segments[0].tokens += 1;
+    fs::write(
+        path.join(MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(store.view(), Err(Error::Storage(_))));
+}
+
+#[test]
+fn recovery_reclaims_unpublished_files_before_reusing_their_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors");
+    let mut writer = writer(&path, Encoding::Float32);
+    append(&mut writer, &[("a", 0)]);
+    writer.commit().unwrap();
+    append(&mut writer, &[("unpublished", 1)]);
+    drop(writer);
+    fs::create_dir(path.join(".staging-interrupted")).unwrap();
+    fs::write(path.join(".staging-interrupted/partial"), b"partial").unwrap();
+    fs::write(path.join("manifest.json.interrupted"), b"partial").unwrap();
+
+    let mut writer = VectorStoreWriter::open(&path).unwrap();
+    assert!(!path.join(".staging-interrupted").exists());
+    assert!(!path.join("manifest.json.interrupted").exists());
+    assert!(!segment_file(&path, 1, "vectors.npy").exists());
+    append(&mut writer, &[("b", 2)]);
+    writer.commit().unwrap();
+    let view = VectorStore::open(&path).unwrap().view().unwrap();
+    assert_eq!(view.document_ids(), ["a", "b"]);
+    assert_eq!(vectors(&view, &["a", "b"]), rows(&[0, 2]));
+    assert_eq!(view.manifest.segments[1].id, 1);
+}
+
+#[test]
+fn manifest_publication_failures_preserve_the_authoritative_files() {
+    for after_rename in [false, true] {
+        for reopen in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("vectors");
+            let mut writer = writer(&path, Encoding::Float32);
+            append(&mut writer, &[("a", 0), ("b", 1)]);
+            writer.commit().unwrap();
+            let store = VectorStore::open(&path).unwrap();
+            let before = store.view().unwrap();
+            writer.delete(["a"]);
+            let result = writer.commit_with(|path, manifest, published| {
+                if after_rename {
+                    let mut file = File::create(path.join("manifest.json.test")).unwrap();
+                    serde_json::to_writer(&mut file, manifest).unwrap();
+                    file.sync_all().unwrap();
+                    fs::rename(path.join("manifest.json.test"), path.join(MANIFEST_FILE)).unwrap();
+                    *published = true;
+                }
+                Err(Error::storage("injected publication failure"))
+            });
+            assert!(result.is_err());
+            let manifest = Manifest::read(&path).unwrap();
+            assert_eq!(manifest.commit, if after_rename { 2 } else { 1 });
+            assert_eq!(tombstones_file(&path, 0, 2).exists(), after_rename);
+            for file in manifest.files(&path).unwrap() {
+                assert!(file.exists());
+            }
+            let visible = store.view().unwrap();
+            assert_eq!(
+                visible.document_ids(),
+                if after_rename {
+                    vec!["b"]
+                } else {
+                    vec!["a", "b"]
+                }
+            );
+            if reopen {
+                drop(writer);
+                writer = VectorStoreWriter::open(&path).unwrap();
+                writer.delete(["a"]);
+            }
+            writer.commit().unwrap();
+            let after = store.view().unwrap();
+            assert_eq!(after.document_ids(), ["b"]);
+            assert_eq!(vectors(&before, &["a", "b"]), rows(&[0, 1]));
+        }
+    }
+}
+
+#[test]
+fn allocation_metadata_is_required_and_checked() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors");
+    let mut writer = writer(&path, Encoding::Float32);
+    append(&mut writer, &[("a", 0)]);
+    writer.commit().unwrap();
+    drop(writer);
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(path.join(MANIFEST_FILE)).unwrap()).unwrap();
+    for watermark in [None, Some(serde_json::json!(0))] {
+        let mut manifest = original.clone();
+        manifest.as_object_mut().unwrap().remove("next_segment_id");
+        if let Some(value) = watermark {
+            manifest["next_segment_id"] = value;
+        }
+        fs::write(
+            path.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(VectorStore::open(&path).is_err());
+        assert!(VectorStoreWriter::open(&path).is_err());
+    }
+}
+
+#[test]
+fn identifiers_do_not_wrap_on_exhaustion() {
+    for field in ["next_segment_id", "commit"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vectors");
+        drop(writer(&path, Encoding::Float32));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join(MANIFEST_FILE)).unwrap()).unwrap();
+        manifest[field] = serde_json::json!(u64::MAX);
+        fs::write(
+            path.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let mut writer = VectorStoreWriter::open(&path).unwrap();
+        let before = fs::read(path.join(MANIFEST_FILE)).unwrap();
+        if field == "commit" {
+            assert!(writer.commit().is_err());
+        } else {
+            assert!(writer
+                .append(["a"], &rows(&[0]), DIMENSION, &[1], None)
+                .is_err());
+        }
+        assert_eq!(fs::read(path.join(MANIFEST_FILE)).unwrap(), before);
+        assert_eq!(files(&path), BTreeSet::from([MANIFEST_FILE.to_string()]));
+    }
+}
+
+#[test]
 fn nothing_staged_is_visible_before_a_commit_and_an_empty_commit_advances_as_of() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("vectors");
@@ -259,11 +503,13 @@ fn a_store_written_by_another_process_is_read_from_its_files_alone() {
     fs::write(
         path.join(MANIFEST_FILE),
         r#"{
-          "format": "lateweave-vectors-1",
+          "format": "lateweave-vectors-2",
+          "store_id": "5f0c8e2a9b1d4c7e8a3f6b2d1e9c4a70",
           "encoding": "float32",
           "corpus": "docs",
           "representation": {"encoder": "encoder", "encoder_revision": "1", "dimension": 4, "normalized": true},
           "commit": 4,
+          "next_segment_id": 8,
           "committed_at": 1700000000.5,
           "segments": [{"id": 7, "documents": 2, "tokens": 3, "tombstones": 4}]
         }"#,
@@ -280,13 +526,53 @@ fn a_store_written_by_another_process_is_read_from_its_files_alone() {
 }
 
 #[test]
+fn a_reader_reloads_a_store_recreated_at_the_same_path() {
+    for recreated in [&[("b", 1)][..], &[("b", 1), ("c", 2)][..]] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vectors");
+        let mut first = writer(&path, Encoding::Float32);
+        append(&mut first, &[("a", 0)]);
+        first.commit().unwrap();
+        let store = VectorStore::open(&path).unwrap();
+        assert_eq!(store.view().unwrap().document_ids(), ["a"]);
+        drop(first);
+
+        fs::remove_dir_all(&path).unwrap();
+        let mut second = writer(&path, Encoding::Float32);
+        append(&mut second, recreated);
+        second.commit().unwrap();
+        let view = store.view().unwrap();
+        let ids = recreated.iter().map(|&(id, _)| id).collect::<Vec<_>>();
+        let values = recreated.iter().map(|&(_, value)| value).collect::<Vec<_>>();
+        assert_eq!(view.document_ids(), ids);
+        assert_eq!(vectors(&view, &ids), rows(&values));
+    }
+}
+
+#[test]
+fn a_manifest_without_a_store_id_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("vectors");
+    drop(writer(&path, Encoding::Float32));
+    let mut manifest = Manifest::read(&path).unwrap();
+    manifest.store_id.clear();
+    fs::write(
+        path.join(MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert!(VectorStore::open(&path).is_err());
+    assert!(VectorStoreWriter::open(&path).is_err());
+}
+
+#[test]
 fn a_manifest_this_version_cannot_read_is_refused() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("vectors");
     writer(&path, Encoding::Float32);
     let manifest = fs::read_to_string(path.join(MANIFEST_FILE)).unwrap();
     for (from, to) in [
-        ("lateweave-vectors-1", "lateweave-vectors-9"),
+        ("lateweave-vectors-2", "lateweave-vectors-9"),
         ("\"float32\"", "\"float16\""),
     ] {
         fs::write(path.join(MANIFEST_FILE), manifest.replace(from, to)).unwrap();

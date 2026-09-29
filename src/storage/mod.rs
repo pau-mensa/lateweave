@@ -14,6 +14,7 @@
 
 mod int8;
 mod npy;
+mod publication;
 mod writer;
 
 use std::collections::{BTreeSet, HashMap};
@@ -34,7 +35,7 @@ pub use writer::VectorStoreWriter;
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 /// The `format` every manifest this version reads declares.
-pub const STORE_FORMAT: &str = "lateweave-vectors-1";
+pub const STORE_FORMAT: &str = "lateweave-vectors-2";
 
 /// How often a read retries when the writer commits and removes a file the
 /// manifest it read still named.
@@ -113,10 +114,14 @@ impl Encoding {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Manifest {
     format: String,
+    /// Random, chosen at creation: a store recreated at the same path
+    /// reuses segment IDs and commit numbers, but never this.
+    store_id: String,
     encoding: String,
     corpus: String,
     representation: Representation,
     commit: u64,
+    next_segment_id: u64,
     /// Seconds since the Unix epoch.
     committed_at: f64,
     segments: Vec<SegmentEntry>,
@@ -146,10 +151,20 @@ impl Manifest {
                 manifest.format
             )));
         }
+        if manifest
+            .segments
+            .iter()
+            .any(|segment| segment.id >= manifest.next_segment_id)
+        {
+            return Err(Error::storage("segment IDs must be below next_segment_id"));
+        }
         manifest.encoding()?;
         manifest.committed_at()?;
         if manifest.corpus.is_empty() {
             return Err(Error::storage("a vector store's corpus must not be empty"));
+        }
+        if manifest.store_id.is_empty() {
+            return Err(Error::storage("a vector store's store_id must not be empty"));
         }
         if manifest
             .segments
@@ -375,9 +390,12 @@ fn load_segments(
         .segments
         .iter()
         .map(|&entry| {
-            let known = loaded.get(&entry.id).filter(|segment| {
-                (segment.entry.documents, segment.entry.tokens) == (entry.documents, entry.tokens)
-            });
+            let known = loaded.get(&entry.id);
+            if known.is_some_and(|segment| {
+                (segment.entry.documents, segment.entry.tokens) != (entry.documents, entry.tokens)
+            }) {
+                return Err(Error::storage("a known segment's dimensions changed"));
+            }
             let data = match known {
                 Some(segment) => segment.data.clone(),
                 None => Arc::new(SegmentData::load(directory, entry, encoding, dimension)?),
@@ -417,6 +435,7 @@ pub struct StoreView {
 
 impl StoreView {
     fn load(directory: &Path, manifest: Manifest, previous: Option<&StoreView>) -> Result<Self> {
+        let previous = previous.filter(|view| view.manifest.store_id == manifest.store_id);
         let segments = load_segments(
             directory,
             &manifest,

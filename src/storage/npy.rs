@@ -198,7 +198,10 @@ impl NpyWriter {
         let header_length = u16::try_from(header.len())
             .map_err(|_| Error::storage("array shape is too long for a .npy header"))?;
 
-        let mut file = BufWriter::with_capacity(1 << 20, File::create(&path)?);
+        let mut file = BufWriter::with_capacity(
+            1 << 20,
+            File::options().write(true).create_new(true).open(&path)?,
+        );
         file.write_all(MAGIC)?;
         file.write_all(&[1, 0])?;
         file.write_all(&header_length.to_le_bytes())?;

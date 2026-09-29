@@ -140,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "blas",
  "blas-src",
+ "getrandom",
  "matrixmultiply",
  "memmap2",
  "rayon",
