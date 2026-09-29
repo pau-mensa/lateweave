@@ -2,13 +2,41 @@
 members = [".", "bindings/python"]
 resolver = "2"
 
-[package]
-name = "lateweave"
+# The one version of the release: the crate, and through maturin the Python
+# package, both read it from here.
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.85"
 license = "Apache-2.0"
+authors = ["Pau Montserrat <pau@usetaizen.com>"]
+repository = "https://github.com/pau-mensa/lateweave"
+homepage = "https://github.com/pau-mensa/lateweave"
+
+[package]
+name = "lateweave"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/lateweave"
+readme = "README.md"
 description = "Composable candidate generation and optional late-interaction reranking"
+keywords = ["retrieval", "search", "reranking", "maxsim", "colbert"]
+categories = ["algorithms", "text-processing"]
+include = [
+  "/src",
+  "/examples",
+  "/build.rs",
+  "/README.md",
+  "/ARCHITECTURE.md",
+  "/STORE_FORMAT.md",
+  "/LICENSE",
+  "/NOTICE",
+]
 
 [dependencies]
 getrandom = "0.4"
@@ -16,7 +44,9 @@ matrixmultiply = "0.3"
 memmap2 = "0.9"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# float_roundtrip: a manifest's committed_at must parse back to the exact f64 the
+# writer returned, or `as_of` differs between writer and reader by an ULP.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 thiserror = "2.0"
 tempfile = "3"
 

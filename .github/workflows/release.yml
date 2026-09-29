@@ -1,0 +1,283 @@
+name: Release
+
+# Publishes the version in Cargo.toml's [workspace.package] -- the crate to
+# crates.io, the wheels and sdist to PyPI -- then tags the commit and creates
+# the GitHub release from its CHANGELOG.md section. Bump the version and the
+# changelog in a pull request first; this workflow never edits the repository
+# beyond the tag.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and test everything, publish nothing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHON_INTERPRETERS: python3.11 python3.12 python3.13 python3.14
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require main for a real release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are published from main, not $GITHUB_REF. Use dry_run to test another ref."
+            exit 1
+          fi
+      - name: Read the version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lateweave") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing lateweave $version" >> "$GITHUB_STEP_SUMMARY"
+      - name: Require an unreleased version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2>/dev/null; then
+            echo "::error::$TAG already exists. Bump [workspace.package] version in Cargo.toml."
+            exit 1
+          fi
+      - name: Require a changelog entry
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section."
+            exit 1
+          fi
+
+  ci:
+    name: CI
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+
+  crate:
+    name: Package crate
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - run: cargo publish -p lateweave --locked --dry-run
+
+  wheels-linux:
+    name: Wheels (linux ${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64, runner: ubuntu-24.04 }
+          - { target: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Built natively in the PyPA image, where openblas-devel is the serial
+      # OpenBLAS exporting `sgemm_`; auditwheel vendors it into the wheel.
+      # `--features` replaces the list in pyproject.toml, hence the repeated
+      # pyo3/extension-module (ARCHITECTURE.md, "The SGEMM dependency").
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          container: quay.io/pypa/manylinux_2_28_${{ matrix.target }}
+          before-script-linux: dnf install -y openblas-devel
+          args: >-
+            --release --locked --out dist
+            --features pyo3/extension-module,openblas
+            --interpreter ${{ env.PYTHON_INTERPRETERS }}
+      - name: Require a vendored OpenBLAS
+        run: |
+          for wheel in dist/*.whl; do
+            python3 -m zipfile -l "$wheel" | grep -q 'lateweave.libs/libopenblas' \
+              || { echo "::error::$wheel does not vendor libopenblas"; exit 1; }
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-linux-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  wheels-macos:
+    name: Wheels (macos ${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { target: aarch64, runner: macos-15, deployment-target: "11.0" }
+          - { target: x86_64, runner: macos-15-intel, deployment-target: "10.15" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
+        with:
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist --interpreter ${{ env.PYTHON_INTERPRETERS }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-macos-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Build and test from the sdist
+        run: |
+          uv venv --python 3.13
+          uv pip install pytest -r cookbook/bm25_stored_maxsim.py
+          uv pip install dist/*.tar.gz
+          .venv/bin/python -m pytest
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-sdist
+          path: dist
+          if-no-files-found: error
+
+  test-wheels:
+    name: Test wheel (${{ matrix.platform }}, Python ${{ matrix.python }})
+    needs: [wheels-linux, wheels-macos]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - { platform: linux-x86_64, runner: ubuntu-24.04 }
+          - { platform: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { platform: macos-aarch64, runner: macos-15 }
+          - { platform: macos-x86_64, runner: macos-15-intel }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Install the built wheel
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install pytest -r cookbook/bm25_stored_maxsim.py
+          uv pip install --no-index --find-links dist lateweave
+      - run: .venv/bin/python -m pytest
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [prepare, ci, crate, sdist, test-wheels]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/lateweave/${{ needs.prepare.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  publish-crate:
+    name: Publish to crates.io
+    needs: [prepare, ci, crate, sdist, test-wheels]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/lateweave/${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - run: cargo publish -p lateweave --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  github-release:
+    name: GitHub release
+    needs: [prepare, publish-pypi, publish-crate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          # The body of this version's section, up to the next version heading,
+          # without the link definitions at the foot of the file.
+          awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]*\]: / { next }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md

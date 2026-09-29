@@ -4,11 +4,32 @@ build-backend = "maturin"
 
 [project]
 name = "lateweave"
-version = "0.1.0"
+# Read from the workspace version in Cargo.toml.
+dynamic = ["version"]
 description = "Composable candidate generation and optional late-interaction reranking"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Pau Montserrat", email = "pau@usetaizen.com" }]
+keywords = ["retrieval", "search", "reranking", "late-interaction", "maxsim", "colbert"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Text Processing :: Indexing",
+  "Typing :: Typed",
+]
 dependencies = [
   "numpy>=1.26,<3; python_version < '3.14'",
   # No numpy before 2.3 ships a cp314 wheel.
@@ -17,6 +38,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "maturin>=1.8,<2"]
+
+[project.urls]
+Homepage = "https://github.com/pau-mensa/lateweave"
+Repository = "https://github.com/pau-mensa/lateweave"
+Documentation = "https://github.com/pau-mensa/lateweave/blob/main/ARCHITECTURE.md"
+Issues = "https://github.com/pau-mensa/lateweave/issues"
+Changelog = "https://github.com/pau-mensa/lateweave/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "bindings/python/Cargo.toml"

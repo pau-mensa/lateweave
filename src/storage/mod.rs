@@ -164,7 +164,9 @@ impl Manifest {
             return Err(Error::storage("a vector store's corpus must not be empty"));
         }
         if manifest.store_id.is_empty() {
-            return Err(Error::storage("a vector store's store_id must not be empty"));
+            return Err(Error::storage(
+                "a vector store's store_id must not be empty",
+            ));
         }
         if manifest
             .segments
@@ -363,7 +365,7 @@ fn load_tombstones(directory: &Path, entry: &SegmentEntry) -> Result<Vec<u64>> {
     match rows {
         Some(rows)
             if rows.windows(2).all(|pair| pair[0] < pair[1])
-                && rows.last().map_or(true, |&last| last < entry.documents) =>
+                && rows.last().is_none_or(|&last| last < entry.documents) =>
         {
             Ok(rows.to_vec())
         }

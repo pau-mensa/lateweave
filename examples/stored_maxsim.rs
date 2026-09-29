@@ -39,7 +39,7 @@ impl CandidateGenerator for TermGatherer {
             .documents
             .iter()
             .map(|&(id, text)| (DocumentKey::new("fruit", id), text))
-            .filter(|(key, _)| subset.map_or(true, |subset| subset.contains(key)))
+            .filter(|(key, _)| subset.is_none_or(|subset| subset.contains(key)))
             .map(|(key, text)| {
                 let count = text
                     .split_whitespace()

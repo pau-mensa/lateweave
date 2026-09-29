@@ -1,0 +1,43 @@
+name: Bug report
+description: Something lateweave does that it should not, or fails to do
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The smallest program or script that shows it.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      options:
+        - Python package
+        - Rust crate
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: lateweave version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and architecture; Python or Rust version; whether the `openblas` feature is enabled.
+      placeholder: Ubuntu 24.04 x86_64, Python 3.13
+    validations:
+      required: true
