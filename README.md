@@ -1,5 +1,13 @@
 # lateweave
 
+[![CI](https://github.com/pau-mensa/lateweave/actions/workflows/ci.yml/badge.svg)](https://github.com/pau-mensa/lateweave/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/lateweave.svg)](https://crates.io/crates/lateweave)
+[![docs.rs](https://img.shields.io/docsrs/lateweave)](https://docs.rs/lateweave)
+[![PyPI](https://img.shields.io/pypi/v/lateweave.svg)](https://pypi.org/project/lateweave/)
+[![Python versions](https://img.shields.io/pypi/pyversions/lateweave.svg)](https://pypi.org/project/lateweave/)
+[![MSRV](https://img.shields.io/crates/msrv/lateweave)](https://crates.io/crates/lateweave)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/pau-mensa/lateweave/blob/main/LICENSE)
+
 `lateweave` is a Rust library, with Python bindings, for composing retrieval
 pipelines out of engines it does not implement:
 
@@ -28,7 +36,7 @@ The package supplies:
   worker pools);
 - `VectorStore`, a reader of memory-mapped multi-vector stores for gatherers,
   such as BM25, that keep no document vectors, and `VectorStoreWriter`, one
-  writer of their [documented format](STORE_FORMAT.md).
+  writer of their [documented format](https://github.com/pau-mensa/lateweave/blob/main/STORE_FORMAT.md).
 
 All of it is implemented once, in the `lateweave` crate, which builds without
 PyO3 or NumPy. The Python package is a binding over that crate: a Python
@@ -37,6 +45,42 @@ pipeline, MaxSim, and stores run natively.
 
 Nothing in the package names an engine. bm25s, FastPLAID, NextPlaid and others
 appear only in cookbooks.
+
+## Installation
+
+### Python
+
+```bash
+pip install lateweave
+```
+
+Wheels are published for CPython 3.11 to 3.14 on:
+
+| Platform | Wheel | SGEMM |
+|---|---|---|
+| Linux x86_64, aarch64 | `manylinux_2_28` (glibc 2.28+) | OpenBLAS, vendored in the wheel |
+| macOS arm64 | macOS 11+ | Accelerate |
+| macOS x86_64 | macOS 10.15+ | Accelerate |
+
+Nothing needs to be installed on the host: the Linux wheels carry their own
+OpenBLAS. Elsewhere pip builds from the source distribution, which needs a Rust
+toolchain and uses the bundled pure-Rust SGEMM (see
+[Building from source](#building-from-source)).
+
+### Rust
+
+```bash
+cargo add lateweave
+```
+
+The crate needs Rust 1.85 or later and, by default, no system library. On
+Linux, enable the `openblas` feature for the faster kernel if the machine has
+`libopenblas.so.0`:
+
+```toml
+[dependencies]
+lateweave = { version = "0.1", features = ["openblas"] }
+```
 
 ## Layout
 
@@ -50,11 +94,6 @@ STORE_FORMAT.md     the vector store on disk, for writers outside lateweave
 ```
 
 ## Using it from Rust
-
-```toml
-[dependencies]
-lateweave = { git = "https://github.com/pau-mensa/lateweave" }
-```
 
 ```rust
 use std::sync::Arc;
@@ -83,10 +122,10 @@ for document in &result.documents {
 ```
 
 Stage and source errors from outside lateweave travel as `Error::External`.
-[examples/stored_maxsim.rs](examples/stored_maxsim.rs) is a complete program:
+[examples/stored_maxsim.rs](https://github.com/pau-mensa/lateweave/blob/main/examples/stored_maxsim.rs) is a complete program:
 `cargo run --example stored_maxsim`.
 
-## Building
+## Building from source
 
 ```bash
 cargo test                 # the Rust library and its example
@@ -96,11 +135,13 @@ maturin build --release    # the Python wheel
 
 That default build has no external library dependency: the MaxSim kernel's
 SGEMM comes from the bundled pure-Rust `matrixmultiply`, so the library links
-and the extension imports on any host.
+and the extension imports on any host. [CONTRIBUTING.md](https://github.com/pau-mensa/lateweave/blob/main/CONTRIBUTING.md)
+has the full development setup.
 
-For a deployment, take the OpenBLAS kernel instead — about 1.75x faster on the
-shapes this kernel sees, bit-identical results. Rust dependents enable the
-crate's `openblas` feature; the wheel forwards the same feature:
+For a deployment, take the OpenBLAS kernel instead, as the published Linux
+wheels do: about 1.75x faster on the shapes this kernel sees, bit-identical
+results. Rust dependents enable the crate's `openblas` feature; the wheel
+forwards the same feature:
 
 ```bash
 maturin build --release --features pyo3/extension-module,openblas
@@ -122,8 +163,9 @@ Two things to know about that command line:
   OpenBLAS, but every symbol carries a `scipy_` prefix.
 
 macOS needs no feature flag: Accelerate ships with the OS and is used
-automatically. [ARCHITECTURE.md](ARCHITECTURE.md#the-sgemm-dependency) explains
-why Linux does not have an equivalent default.
+automatically.
+[ARCHITECTURE.md](https://github.com/pau-mensa/lateweave/blob/main/ARCHITECTURE.md#the-sgemm-dependency)
+explains why Linux does not have an equivalent default.
 
 ## Queries and features
 
@@ -279,7 +321,7 @@ order, never NaN.
 A `VectorStore` holds the vectors of one corpus for gatherers without document
 vectors, and carries the `Representation` of its vectors, so it refuses
 queries from any other encoder. lateweave only reads stores; the
-[format](STORE_FORMAT.md) is plain `.npy` files, document IDs as JSON, and
+[format](https://github.com/pau-mensa/lateweave/blob/main/STORE_FORMAT.md) is plain `.npy` files, document IDs as JSON, and
 `manifest.json`, so any process can write one. `VectorStoreWriter` is the
 writer lateweave ships:
 
@@ -308,5 +350,20 @@ until a compaction, which changes no result. `VectorStore.view()` returns the
 last commit, loading only what it has not seen; views taken earlier keep
 reading their own commit.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the ownership rules and
-[cookbook/README.md](cookbook/README.md) for the BM25 recipe.
+See [ARCHITECTURE.md](https://github.com/pau-mensa/lateweave/blob/main/ARCHITECTURE.md) for the ownership rules and
+[cookbook/README.md](https://github.com/pau-mensa/lateweave/blob/main/cookbook/README.md) for the BM25 recipe.
+
+## Contributing
+
+Issues and pull requests are welcome; see
+[CONTRIBUTING.md](https://github.com/pau-mensa/lateweave/blob/main/CONTRIBUTING.md) for the development setup and
+[CHANGELOG.md](https://github.com/pau-mensa/lateweave/blob/main/CHANGELOG.md) for what changed in each release.
+Please report security issues privately, as described in
+[SECURITY.md](https://github.com/pau-mensa/lateweave/blob/main/SECURITY.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](https://github.com/pau-mensa/lateweave/blob/main/LICENSE). The
+batching and SIMD reduction in the MaxSim kernel derive from
+[maxsim-cpu](https://github.com/mixedbread-ai/maxsim-cpu); see
+[NOTICE](https://github.com/pau-mensa/lateweave/blob/main/NOTICE).

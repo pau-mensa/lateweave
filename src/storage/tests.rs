@@ -543,7 +543,10 @@ fn a_reader_reloads_a_store_recreated_at_the_same_path() {
         second.commit().unwrap();
         let view = store.view().unwrap();
         let ids = recreated.iter().map(|&(id, _)| id).collect::<Vec<_>>();
-        let values = recreated.iter().map(|&(_, value)| value).collect::<Vec<_>>();
+        let values = recreated
+            .iter()
+            .map(|&(_, value)| value)
+            .collect::<Vec<_>>();
         assert_eq!(view.document_ids(), ids);
         assert_eq!(vectors(&view, &ids), rows(&values));
     }

@@ -193,7 +193,10 @@ impl NpyWriter {
             dtype.descr()
         );
         let unpadded = MAGIC.len() + 4 + header.len() + 1;
-        header.extend(std::iter::repeat(' ').take(unpadded.next_multiple_of(ALIGNMENT) - unpadded));
+        header.extend(std::iter::repeat_n(
+            ' ',
+            unpadded.next_multiple_of(ALIGNMENT) - unpadded,
+        ));
         header.push('\n');
         let header_length = u16::try_from(header.len())
             .map_err(|_| Error::storage("array shape is too long for a .npy header"))?;

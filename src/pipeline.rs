@@ -277,7 +277,7 @@ mod tests {
             let candidates = self
                 .rows
                 .iter()
-                .filter(|(key, _)| subset.map_or(true, |subset| subset.contains(key)))
+                .filter(|(key, _)| subset.is_none_or(|subset| subset.contains(key)))
                 .take(limit)
                 .enumerate()
                 .map(|(rank, (key, gather_score))| Candidate {
