@@ -1,4 +1,10 @@
-# lateweave
+<div align="center">
+  <h1>LateWeave</h1>
+</div>
+
+<p align="center">
+  <img width="950" src="assets/lateweave.png" alt="lateweave architecture"/>
+</p>
 
 [![CI](https://github.com/pau-mensa/lateweave/actions/workflows/ci.yml/badge.svg)](https://github.com/pau-mensa/lateweave/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/lateweave.svg)](https://crates.io/crates/lateweave)
