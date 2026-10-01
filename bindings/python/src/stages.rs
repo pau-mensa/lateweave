@@ -4,12 +4,13 @@ use std::time::SystemTime;
 use lateweave::{
     Candidate, CandidateGenerator, DocumentKey, Gathered, MaxSimReranker, MultiVectorSource,
     PackedDocuments, Query, RankedDocument, Representation, Requirements, Reranker, ResourceBudget,
-    Scored, SearchPipeline, SearchRequest, SearchResult, SearchTimings, Subset, VectorView,
+    Restriction, Scored, SearchPipeline, SearchRequest, SearchResult, SearchTimings, Subset,
+    VectorView,
 };
 use numpy::{AllowTypeChange, PyArrayLike1, PyArrayLike2};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyFrozenSet, PyList, PyMapping, PyTuple};
+use pyo3::types::{PyDict, PyFrozenSet, PyList, PyTuple};
 
 use crate::convert::{
     document_ids, from_py, representation, requirements, requirements_to_py, row_major, to_py,
@@ -196,28 +197,82 @@ impl PyResourceBudget {
     }
 }
 
-fn subset_to_py<'py>(py: Python<'py>, subset: &Subset) -> PyResult<Bound<'py, PyDict>> {
-    let output = PyDict::new(py);
-    for (corpus, ids) in subset.iter() {
-        output.set_item(
-            corpus,
-            PyFrozenSet::new(py, ids.iter().map(AsRef::<str>::as_ref))?,
-        )?;
-    }
-    Ok(output)
+/// The documents a search is restricted to, by corpus: per corpus, either
+/// only some documents or every document but some.
+#[pyclass(name = "Subset", frozen, eq, module = "lateweave._native")]
+#[derive(PartialEq)]
+pub(crate) struct PySubset {
+    pub(crate) inner: Subset,
 }
 
-fn subset_from_py(subset: &Bound<'_, PyAny>) -> PyResult<Subset> {
-    let mapping = subset.cast::<PyMapping>().map_err(|_| {
-        PyTypeError::new_err("subset must map corpora to iterables of document IDs")
-    })?;
-    mapping
-        .items()?
-        .iter()
-        .try_fold(Subset::new(), |subset, item| {
-            let (corpus, ids): (String, Bound<'_, PyAny>) = item.extract()?;
-            Ok(subset.with(corpus, document_ids(&ids)?))
+#[pymethods]
+impl PySubset {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: Subset::new(),
+        }
+    }
+
+    /// Only ``ids`` of ``corpus``; replaces any restriction given for it.
+    fn including(&self, corpus: String, ids: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.clone().including(corpus, document_ids(ids)?),
         })
+    }
+
+    /// Every document of ``corpus`` but ``ids``; replaces any restriction
+    /// given for it.
+    fn excluding(&self, corpus: String, ids: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.clone().excluding(corpus, document_ids(ids)?),
+        })
+    }
+
+    fn allows(&self, corpus: &str, id: &str) -> bool {
+        self.inner.contains(&DocumentKey::new(corpus, id))
+    }
+
+    /// ``("only" | "except", ids)``, or ``None`` when the subset does not
+    /// name ``corpus`` (which then contributes no documents).
+    fn restriction<'py>(
+        &self,
+        py: Python<'py>,
+        corpus: &str,
+    ) -> PyResult<Option<(&'static str, Bound<'py, PyFrozenSet>)>> {
+        self.inner
+            .restriction(corpus)
+            .map(|restriction| {
+                let (kind, ids) = match restriction {
+                    Restriction::Only(ids) => ("only", ids),
+                    Restriction::Except(ids) => ("except", ids),
+                };
+                Ok((
+                    kind,
+                    PyFrozenSet::new(py, ids.iter().map(AsRef::<str>::as_ref))?,
+                ))
+            })
+            .transpose()
+    }
+
+    fn corpora(&self) -> Vec<String> {
+        self.inner
+            .iter()
+            .map(|(corpus, _)| corpus.to_string())
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        let parts: Vec<String> = self
+            .inner
+            .iter()
+            .map(|(corpus, restriction)| match restriction {
+                Restriction::Only(ids) => format!("{corpus:?}: only {} ids", ids.len()),
+                Restriction::Except(ids) => format!("{corpus:?}: all but {} ids", ids.len()),
+            })
+            .collect();
+        format!("Subset({})", parts.join(", "))
+    }
 }
 
 /// What a Python stage declares, read once when it joins a pipeline.
@@ -265,7 +320,9 @@ impl CandidateGenerator for PythonGatherer {
             let arguments = PyDict::new(py);
             arguments.set_item(
                 "subset",
-                subset.map(|subset| subset_to_py(py, subset)).transpose()?,
+                subset.map(|subset| PySubset {
+                    inner: subset.clone(),
+                }),
             )?;
             let query = PyQuery {
                 inner: query.clone(),
@@ -622,7 +679,7 @@ impl PySearchResult {
 /// document is ranked only when every stage holds it.
 #[pyclass(name = "SearchPipeline", frozen, module = "lateweave._native")]
 pub(crate) struct PySearchPipeline {
-    inner: SearchPipeline,
+    inner: SearchPipeline<'static>,
 }
 
 #[pymethods]
@@ -650,8 +707,8 @@ impl PySearchPipeline {
         })
     }
 
-    /// ``query`` is a ``Query`` or plain text; ``subset`` maps corpora to the
-    /// document IDs the search is restricted to.
+    /// ``query`` is a ``Query`` or plain text; ``subset`` is a ``Subset``
+    /// naming, per corpus, the documents the search is restricted to.
     #[pyo3(signature = (query, *, gather_limit, limit, subset=None, budget=None))]
     fn search(
         &self,
@@ -663,7 +720,18 @@ impl PySearchPipeline {
         budget: Option<&Bound<'_, PyResourceBudget>>,
     ) -> PyResult<PySearchResult> {
         let query = PyQuery::from_python(query)?;
-        let subset = subset.map(subset_from_py).transpose()?;
+        let subset = subset
+            .map(|subset| {
+                subset
+                    .cast::<PySubset>()
+                    .map(|subset| subset.get().inner.clone())
+                    .map_err(|_| {
+                        PyTypeError::new_err(
+                            "subset must be a lateweave.Subset, e.g. Subset().including(corpus, ids)",
+                        )
+                    })
+            })
+            .transpose()?;
         // A negative limit reaches the core as zero, which it rejects with
         // the same ValueError as any other non-positive limit.
         let request = SearchRequest {

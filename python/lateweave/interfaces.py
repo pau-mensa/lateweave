@@ -17,7 +17,7 @@ from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
-from ._native import Candidate, Gathered, Query, ResourceBudget, Scored
+from ._native import Candidate, Gathered, Query, ResourceBudget, Scored, Subset
 from .representation import Representation
 
 
@@ -29,10 +29,11 @@ class CandidateGenerator(Protocol):
     with; a text-only gatherer declares an empty mapping. ``score_semantics``
     qualifies ``gather_score`` and ranks results when no reranker follows.
     ``gather`` returns unique candidates with dense zero-based ranks, read from
-    one consistent state of each index it searches. ``subset`` maps corpora to
-    the frozenset of document IDs the search is restricted to; a corpus it does
-    not name contributes nothing, and a gatherer that cannot honour it must
-    raise rather than ignore it. ``requires`` and ``score_semantics`` are read
+    one consistent state of each index it searches. ``subset`` is a ``Subset``
+    naming, per corpus, the documents the search may return: use
+    ``subset.allows(corpus, id)``, or ``subset.restriction(corpus)`` to read an
+    include list. A corpus it does not name contributes nothing, and a gatherer
+    that cannot honour it must raise rather than ignore it. ``requires`` and ``score_semantics`` are read
     once, when the pipeline is built.
     """
 
@@ -40,7 +41,7 @@ class CandidateGenerator(Protocol):
     score_semantics: str
 
     def gather(
-        self, query: Query, limit: int, *, subset: Mapping[str, frozenset[str]] | None = None
+        self, query: Query, limit: int, *, subset: Subset | None = None
     ) -> Gathered: ...
 
 

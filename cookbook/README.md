@@ -112,7 +112,8 @@ Without `--query-embeddings` the search is gather-only and BM25 scores rank.
 With them, only BM25 candidates are fetched from the store and scored by the
 CPU MaxSim kernel; a candidate the store does not hold yet, or no longer, is
 dropped and counted in `diagnostics.dropped`. `--subset-id ID` (repeatable)
-restricts the search to those documents; the gatherer honours it through
-bm25s's weight mask. The output's `as_of` is the older of the two indexes'
+restricts the search to those documents (`Subset().including(...)`); the
+gatherer honours include and exclude restrictions alike through bm25s's weight
+mask. The output's `as_of` is the older of the two indexes'
 commits. A long-running server built the same way, as `LexicalCandidateGenerator` plus `VectorStore`, serves each commit on
 its next search.

@@ -15,6 +15,7 @@ from lateweave import (
     ResourceBudget,
     Scored,
     SearchPipeline,
+    Subset,
     maxsim_scores_packed,
 )
 
@@ -32,13 +33,13 @@ class TextGatherer:
         self.rows = rows
         self.as_of = as_of
         self.calls = 0
-        self.subsets: list[dict[str, frozenset[str]] | None] = []
+        self.subsets: list[Subset | None] = []
 
     def gather(self, query: Query, limit: int, *, subset=None) -> Gathered:  # type: ignore[no-untyped-def]
         self.calls += 1
         self.subsets.append(subset)
         rows = [
-            row for row in self.rows if subset is None or row[1] in subset.get(row[0], frozenset())
+            row for row in self.rows if subset is None or subset.allows(row[0], row[1])
         ]
         return Gathered(
             [
@@ -149,17 +150,28 @@ def test_an_unservable_query_fails_before_gathering() -> None:
     assert gatherer.calls == 0
 
 
-def test_the_subset_reaches_the_gatherer_as_frozensets_per_corpus() -> None:
+def test_the_subset_reaches_the_gatherer_as_a_subset() -> None:
     gatherer = TextGatherer()
-    result = SearchPipeline(gatherer).search(
-        "query", gather_limit=3, limit=3, subset={"corpus": ["x", "z", "x", "unknown"]}
-    )
-    assert gatherer.subsets[0] == {"corpus": frozenset({"x", "z", "unknown"})}
-    assert ids(result) == ["z", "x"]
-    with pytest.raises(TypeError, match="single string"):
-        SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset={"corpus": "x"})
-    with pytest.raises(TypeError, match="corpora"):
-        SearchPipeline(gatherer).search("query", gather_limit=3, limit=1, subset=["x"])
+    subset = Subset().including("corpus", ["x", "z", "x", "unknown"])
+    SearchPipeline(gatherer).search("query", gather_limit=3, limit=3, subset=subset)
+    received = gatherer.subsets[0]
+    assert received == subset
+    assert received.restriction("corpus") == ("only", frozenset({"x", "z", "unknown"}))
+    assert received.allows("corpus", "x") and not received.allows("corpus", "y")
+    assert received.restriction("other") is None and received.corpora() == ["corpus"]
+
+
+def test_an_excluding_subset_leaves_out_its_documents() -> None:
+    gatherer = TextGatherer()
+    subset = Subset().excluding("corpus", ["y"])
+    result = SearchPipeline(gatherer).search("query", gather_limit=3, limit=3, subset=subset)
+    assert "y" not in ids(result) and ids(result)
+    assert subset.restriction("corpus") == ("except", frozenset({"y"}))
+
+
+def test_a_dict_subset_is_refused_with_a_pointer_to_subset() -> None:
+    with pytest.raises(TypeError, match="lateweave.Subset"):
+        SearchPipeline(TextGatherer()).search("query", gather_limit=3, limit=1, subset={"corpus": ["x"]})
 
 
 def test_a_gatherer_that_ignores_the_subset_is_refused() -> None:
@@ -168,7 +180,7 @@ def test_a_gatherer_that_ignores_the_subset_is_refused() -> None:
             return super().gather(query, limit)
 
     with pytest.raises(ValueError, match="outside the subset"):
-        SearchPipeline(IgnoringGatherer()).search("query", gather_limit=3, limit=1, subset={"corpus": ["x"]})
+        SearchPipeline(IgnoringGatherer()).search("query", gather_limit=3, limit=1, subset=Subset().including("corpus", ["x"]))
 
 
 @pytest.mark.parametrize("limits", [(-1, 1), (3, -1)])

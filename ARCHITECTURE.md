@@ -95,8 +95,9 @@ stages that consume them. The package fixes none; `MaxSimReranker` defaults to
 unique candidates, each a `DocumentKey` with a gather score, a dense zero-based
 rank, and provenance, plus `as_of`. One gatherer may search several corpora,
 and fusing the hits of several engines is a gatherer like any other. `subset`
-maps corpora to the document IDs the search is restricted to; a corpus it does
-not name contributes nothing, an ID the index does not hold is not a
+is a `Subset` naming, per corpus, either the documents the search may return
+or the ones it must not (a `Restriction`); a corpus it does not name
+contributes nothing, an ID the index does not hold is not a
 candidate, and a gatherer that cannot honour it raises rather than ignores it.
 The pipeline refuses a repeated candidate or one outside the subset. The
 gatherer's `score_semantics` qualifies its gather scores, which rank the

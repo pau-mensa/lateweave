@@ -54,11 +54,29 @@ pub struct Candidate {
     pub provenance: String,
 }
 
+/// Which documents of one corpus a search may return.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restriction {
+    /// Only these.
+    Only(HashSet<Arc<str>>),
+    /// Every document but these.
+    Except(HashSet<Arc<str>>),
+}
+
+impl Restriction {
+    pub fn allows(&self, id: &str) -> bool {
+        match self {
+            Restriction::Only(ids) => ids.contains(id),
+            Restriction::Except(ids) => !ids.contains(id),
+        }
+    }
+}
+
 /// The documents a search is restricted to, by corpus. A corpus it does not
 /// name contributes no documents; an ID an index does not hold is ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Subset {
-    ids: BTreeMap<Arc<str>, HashSet<Arc<str>>>,
+    corpora: BTreeMap<Arc<str>, Restriction>,
 }
 
 impl Subset {
@@ -66,29 +84,51 @@ impl Subset {
         Self::default()
     }
 
-    /// Replaces any IDs already given for `corpus`.
-    pub fn with<I>(mut self, corpus: impl Into<Arc<str>>, ids: I) -> Self
+    /// Only `ids` of `corpus`; replaces any restriction given for it.
+    pub fn including<I>(self, corpus: impl Into<Arc<str>>, ids: I) -> Self
     where
         I: IntoIterator,
         I::Item: Into<Arc<str>>,
     {
-        self.ids
-            .insert(corpus.into(), ids.into_iter().map(Into::into).collect());
+        self.restrict(
+            corpus,
+            Restriction::Only(ids.into_iter().map(Into::into).collect()),
+        )
+    }
+
+    /// Every document of `corpus` but `ids`; replaces any restriction given
+    /// for it.
+    pub fn excluding<I>(self, corpus: impl Into<Arc<str>>, ids: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Arc<str>>,
+    {
+        self.restrict(
+            corpus,
+            Restriction::Except(ids.into_iter().map(Into::into).collect()),
+        )
+    }
+
+    fn restrict(mut self, corpus: impl Into<Arc<str>>, restriction: Restriction) -> Self {
+        self.corpora.insert(corpus.into(), restriction);
         self
     }
 
-    /// `None` when the subset does not name `corpus`.
-    pub fn ids(&self, corpus: &str) -> Option<&HashSet<Arc<str>>> {
-        self.ids.get(corpus)
+    /// `None` when the subset does not name `corpus`, which then contributes
+    /// no documents.
+    pub fn restriction(&self, corpus: &str) -> Option<&Restriction> {
+        self.corpora.get(corpus)
     }
 
     pub fn contains(&self, key: &DocumentKey) -> bool {
-        self.ids(key.corpus())
-            .is_some_and(|ids| ids.contains(key.id()))
+        self.restriction(key.corpus())
+            .is_some_and(|restriction| restriction.allows(key.id()))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &HashSet<Arc<str>>)> {
-        self.ids.iter().map(|(corpus, ids)| (corpus.as_ref(), ids))
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Restriction)> {
+        self.corpora
+            .iter()
+            .map(|(corpus, restriction)| (corpus.as_ref(), restriction))
     }
 }
 

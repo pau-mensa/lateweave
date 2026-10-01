@@ -41,7 +41,7 @@ pub use representation::Representation;
 pub use source::{MultiVectorSource, PackedDocuments, VectorView};
 pub use stage::{
     Candidate, CandidateGenerator, DocumentKey, Gathered, Requirements, Reranker, ResourceBudget,
-    Scored, Subset,
+    Restriction, Scored, Subset,
 };
 pub use storage::{
     Encoding, StoreView, VectorStore, VectorStoreWriter, MANIFEST_FILE, STORE_FORMAT,

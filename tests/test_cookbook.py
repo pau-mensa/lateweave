@@ -8,6 +8,7 @@ import sys
 import numpy as np
 import pytest
 
+from lateweave import Subset
 
 
 SCRIPT = Path(__file__).parents[1] / "cookbook" / "bm25_stored_maxsim.py"
@@ -126,7 +127,7 @@ def open_gatherer(index: Path) -> "cookbook.LexicalCandidateGenerator":
 def gathered_ids(index: Path, query: str, limit: int = 10, subset=None) -> list[str]:  # type: ignore[no-untyped-def]
     """Document IDs a query reaches, sorted; gather itself ranks by score."""
     if subset is not None:
-        subset = {"laws": frozenset(subset)}
+        subset = Subset().including("laws", subset)
     gathered = open_gatherer(index).gather(cookbook.Query(query), limit, subset=subset)
     return sorted(candidate.document_id for candidate in gathered.candidates)
 
@@ -169,6 +170,18 @@ def test_gather_honours_a_subset_by_document_id(tmp_path: Path) -> None:
     index = build_corpus(tmp_path)
     assert gathered_ids(index, "concesión", subset=["law-4", "unknown"]) == ["law-4"]
     assert gathered_ids(index, "concesión", subset=["law-2"]) == []
+
+
+def test_gather_honours_an_excluding_subset(tmp_path: Path) -> None:
+    index = build_corpus(tmp_path)
+    everything = gathered_ids(index, "concesión")
+    assert "law-4" in everything
+    gathered = open_gatherer(index).gather(
+        cookbook.Query("concesión"), 10, subset=Subset().excluding("laws", ["law-4", "unknown"])
+    )
+    assert sorted(candidate.document_id for candidate in gathered.candidates) == [
+        document for document in everything if document != "law-4"
+    ]
 
 
 def test_a_stemmed_index_matches_inflected_queries(tmp_path: Path) -> None:

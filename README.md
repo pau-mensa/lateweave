@@ -208,8 +208,8 @@ class MyGatherer:
 
     def gather(self, query, limit, *, subset=None):
         searcher = self.engine.searcher()          # one consistent state of the index
-        allowed = None if subset is None else subset.get(self.corpus, frozenset())
-        hits = searcher.search(query.text, limit=limit, allowed=allowed)
+        accept = None if subset is None else lambda id: subset.allows(self.corpus, id)
+        hits = searcher.search(query.text, limit=limit, accept=accept)
         return Gathered(
             [Candidate(self.corpus, hit.id, hit.score, rank, "my-engine") for rank, hit in enumerate(hits)],
             searcher.committed_at,                 # an aware datetime
@@ -221,9 +221,12 @@ is its own business. `as_of` is when the index state the gatherer read was
 committed: every write committed before it is reflected in the candidates. It
 is the commit time, not the time the gatherer reloaded.
 
-`subset` is `None`, or maps corpora to the frozenset of document IDs the search
-is restricted to; a corpus it does not name contributes nothing, and an ID the
-index does not hold is simply not a candidate. A gatherer that cannot honour it
+`subset` is `None`, or a `lateweave.Subset` naming, per corpus, either the
+documents the search may return (`Subset().including(corpus, ids)`) or the ones
+it must not (`.excluding(corpus, ids)`); `subset.allows(corpus, id)` answers
+for one document and `subset.restriction(corpus)` returns `("only" | "except",
+ids)`. A corpus it does not name contributes nothing, and an ID the index does
+not hold is simply not a candidate. A gatherer that cannot honour it
 must raise; the pipeline refuses a candidate outside the subset. A gatherer
 that consumes a vector feature declares it: `requires = {"multi_vector":
 representation}`. `requires` and `score_semantics` are read once, when the
