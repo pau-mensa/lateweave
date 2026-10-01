@@ -46,7 +46,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Sequence
 import unicodedata
 
 import numpy as np
@@ -60,6 +60,7 @@ from lateweave import (
     Representation,
     ResourceBudget,
     SearchPipeline,
+    Subset,
     VectorStore,
     VectorStoreWriter,
 )
@@ -347,7 +348,7 @@ class LexicalCandidateGenerator:
         return self.pinned
 
     def gather(
-        self, query: Query, limit: int, *, subset: Mapping[str, frozenset[str]] | None = None
+        self, query: Query, limit: int, *, subset: Subset | None = None
     ) -> Gathered:
         lexical = self.current()
         terms = self.analyzer.tokens(query.text)
@@ -357,9 +358,18 @@ class LexicalCandidateGenerator:
         if subset is not None:
             # bm25s multiplies scores by the mask; masked documents score zero
             # and are dropped below with every other non-matching document.
-            weight_mask = np.zeros(len(lexical.ids), dtype=np.float32)
-            allowed = subset.get(lexical.corpus, frozenset())
-            weight_mask[[lexical.rows[item] for item in allowed if item in lexical.rows]] = 1.0
+            restriction = subset.restriction(lexical.corpus)
+            if restriction is None:
+                weight_mask = np.zeros(len(lexical.ids), dtype=np.float32)
+            else:
+                kind, ids = restriction
+                listed = [lexical.rows[item] for item in ids if item in lexical.rows]
+                if kind == "only":
+                    weight_mask = np.zeros(len(lexical.ids), dtype=np.float32)
+                    weight_mask[listed] = 1.0
+                else:
+                    weight_mask = np.ones(len(lexical.ids), dtype=np.float32)
+                    weight_mask[listed] = 0.0
         rows, scores = lexical.index.retrieve(
             [terms], k=min(limit, len(lexical.ids)), show_progress=False, weight_mask=weight_mask
         )
@@ -390,7 +400,7 @@ def search_index(args: argparse.Namespace) -> None:
         Query(args.query, **features),
         gather_limit=args.gather_limit,
         limit=args.limit,
-        subset={corpus: args.subset_id} if args.subset_id else None,
+        subset=Subset().including(corpus, args.subset_id) if args.subset_id else None,
         budget=ResourceBudget(
             max_batch_tokens=args.max_batch_tokens,
             max_documents_per_batch=args.max_documents_per_batch,

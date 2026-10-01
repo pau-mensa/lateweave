@@ -31,6 +31,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<stages::PySearchTimings>()?;
     module.add_class::<stages::PySearchResult>()?;
     module.add_class::<stages::PySearchPipeline>()?;
+    module.add_class::<stages::PySubset>()?;
     module.add_class::<storage::PyVectorStore>()?;
     module.add_class::<storage::PyStoreView>()?;
     module.add_class::<storage::PyVectorStoreWriter>()?;

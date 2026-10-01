@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 import numpy as np
 
@@ -112,6 +112,15 @@ class SearchResult:
     @property
     def diagnostics(self) -> dict[str, Any]: ...
 
+class Subset:
+    def __init__(self) -> None: ...
+    def including(self, corpus: str, ids: Iterable[str]) -> Subset: ...
+    def excluding(self, corpus: str, ids: Iterable[str]) -> Subset: ...
+    def allows(self, corpus: str, id: str) -> bool: ...
+    def restriction(self, corpus: str) -> tuple[Literal["only", "except"], frozenset[str]] | None: ...
+    def corpora(self) -> list[str]: ...
+    def __eq__(self, other: object) -> bool: ...
+
 class SearchPipeline:
     def __init__(
         self,
@@ -124,7 +133,7 @@ class SearchPipeline:
         *,
         gather_limit: int,
         limit: int,
-        subset: Mapping[str, Iterable[str]] | None = None,
+        subset: Subset | None = None,
         budget: ResourceBudget | None = None,
     ) -> SearchResult: ...
 

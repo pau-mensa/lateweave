@@ -93,13 +93,19 @@ pub struct SearchResult {
 /// Each stage must be able to consume the query; that is checked before any
 /// stage runs, so a query that cannot be served fails without gathering.
 /// Without a reranker the gather scores rank the results.
-pub struct SearchPipeline {
-    gatherer: Arc<dyn CandidateGenerator>,
-    reranker: Option<Arc<dyn Reranker>>,
+pub struct SearchPipeline<'a> {
+    gatherer: Arc<dyn CandidateGenerator + 'a>,
+    reranker: Option<Arc<dyn Reranker + 'a>>,
 }
 
-impl SearchPipeline {
-    pub fn new(gatherer: Arc<dyn CandidateGenerator>, reranker: Option<Arc<dyn Reranker>>) -> Self {
+impl<'a> SearchPipeline<'a> {
+    /// Stages may borrow state for the life of the pipeline, so a pipeline
+    /// can be built for one search over state its caller holds; `'static`
+    /// stages make a pipeline that lives as long as needed.
+    pub fn new(
+        gatherer: Arc<dyn CandidateGenerator + 'a>,
+        reranker: Option<Arc<dyn Reranker + 'a>>,
+    ) -> Self {
         Self { gatherer, reranker }
     }
 
@@ -226,7 +232,7 @@ mod tests {
     use super::*;
     use crate::query::{Feature, TokenMatrix};
     use crate::representation::Representation;
-    use crate::stage::{Gathered, Scored};
+    use crate::stage::{Gathered, Restriction, Scored};
 
     fn representation() -> Representation {
         Representation::new("encoder", "1", 2, true).unwrap()
@@ -419,7 +425,7 @@ mod tests {
 
     #[test]
     fn the_subset_reaches_the_gatherer_and_bounds_its_candidates() {
-        let subset = Subset::new().with("docs", ["x", "unknown"]);
+        let subset = Subset::new().including("docs", ["x", "unknown"]);
         let result = SearchPipeline::new(Arc::new(FixedGatherer::new()), None)
             .search(
                 &Query::new("query"),
@@ -475,5 +481,82 @@ mod tests {
                 )
                 .is_err());
         }
+    }
+
+    #[test]
+    fn an_excluding_subset_leaves_out_its_documents_only() {
+        let subset = Subset::new().excluding("docs", ["y"]);
+        assert!(subset.contains(&key("x")) && !subset.contains(&key("y")));
+        assert!(!subset.contains(&DocumentKey::new("other", "x")));
+        let result = SearchPipeline::new(Arc::new(FixedGatherer::new()), None)
+            .search(
+                &Query::new("query"),
+                &SearchRequest::new(3, 3).with_subset(&subset),
+            )
+            .unwrap();
+        let ids: Vec<&str> = result.documents.iter().map(|d| d.key.id()).collect();
+        assert!(!ids.contains(&"y") && !ids.is_empty());
+    }
+
+    #[test]
+    fn a_later_restriction_replaces_an_earlier_one_for_its_corpus() {
+        let subset = Subset::new()
+            .including("docs", ["x"])
+            .excluding("docs", ["x"]);
+        assert!(matches!(
+            subset.restriction("docs"),
+            Some(Restriction::Except(_))
+        ));
+        assert!(!subset.contains(&key("x")) && subset.contains(&key("z")));
+    }
+
+    /// Gathers from rows it borrows for one search.
+    struct BorrowingGatherer<'a> {
+        rows: &'a [(&'a str, f32)],
+        requires: Requirements,
+    }
+
+    impl CandidateGenerator for BorrowingGatherer<'_> {
+        fn requires(&self) -> &Requirements {
+            &self.requires
+        }
+
+        fn score_semantics(&self) -> &str {
+            "test"
+        }
+
+        fn gather(&self, _: &Query, limit: usize, subset: Option<&Subset>) -> Result<Gathered> {
+            let candidates = self
+                .rows
+                .iter()
+                .map(|&(id, score)| (key(id), score))
+                .filter(|(key, _)| subset.is_none_or(|subset| subset.contains(key)))
+                .take(limit)
+                .enumerate()
+                .map(|(rank, (key, gather_score))| Candidate {
+                    key,
+                    gather_score,
+                    gather_rank: rank,
+                    provenance: "borrowed".into(),
+                })
+                .collect();
+            Ok(Gathered {
+                candidates,
+                as_of: SystemTime::now(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_stage_can_borrow_state_for_one_search() {
+        let rows = vec![("x", 1.0), ("y", 3.0)];
+        let gatherer = BorrowingGatherer {
+            rows: &rows,
+            requires: Requirements::new(),
+        };
+        let result = SearchPipeline::new(Arc::new(gatherer), None)
+            .search(&Query::new("query"), &SearchRequest::new(2, 1))
+            .unwrap();
+        assert_eq!(result.documents[0].key.id(), "y");
     }
 }
