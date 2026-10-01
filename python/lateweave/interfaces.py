@@ -31,10 +31,11 @@ class CandidateGenerator(Protocol):
     ``gather`` returns unique candidates with dense zero-based ranks, read from
     one consistent state of each index it searches. ``subset`` is a ``Subset``
     naming, per corpus, the documents the search may return: use
-    ``subset.allows(corpus, id)``, or ``subset.restriction(corpus)`` to read an
-    include list. A corpus it does not name contributes nothing, and a gatherer
-    that cannot honour it must raise rather than ignore it. ``requires`` and ``score_semantics`` are read
-    once, when the pipeline is built.
+    ``subset.allows(corpus, id)``, or ``subset.restriction(corpus)``, which
+    returns ``("only", ids)`` or ``("except", ids)``. A corpus it does not name
+    contributes nothing, and a gatherer that cannot honour it must raise rather
+    than ignore it. ``requires`` and ``score_semantics`` are read once, when the
+    pipeline is built.
     """
 
     requires: Mapping[str, Representation]

@@ -74,9 +74,10 @@ impl Restriction {
 
 /// The documents a search is restricted to, by corpus. A corpus it does not
 /// name contributes no documents; an ID an index does not hold is ignored.
+/// Cloning shares each corpus's restriction rather than copying its IDs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Subset {
-    corpora: BTreeMap<Arc<str>, Restriction>,
+    corpora: BTreeMap<Arc<str>, Arc<Restriction>>,
 }
 
 impl Subset {
@@ -110,14 +111,14 @@ impl Subset {
     }
 
     fn restrict(mut self, corpus: impl Into<Arc<str>>, restriction: Restriction) -> Self {
-        self.corpora.insert(corpus.into(), restriction);
+        self.corpora.insert(corpus.into(), Arc::new(restriction));
         self
     }
 
     /// `None` when the subset does not name `corpus`, which then contributes
     /// no documents.
     pub fn restriction(&self, corpus: &str) -> Option<&Restriction> {
-        self.corpora.get(corpus)
+        self.corpora.get(corpus).map(AsRef::as_ref)
     }
 
     pub fn contains(&self, key: &DocumentKey) -> bool {
@@ -128,7 +129,7 @@ impl Subset {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Restriction)> {
         self.corpora
             .iter()
-            .map(|(corpus, restriction)| (corpus.as_ref(), restriction))
+            .map(|(corpus, restriction)| (corpus.as_ref(), restriction.as_ref()))
     }
 }
 

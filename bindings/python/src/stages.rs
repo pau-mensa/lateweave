@@ -724,7 +724,7 @@ impl PySearchPipeline {
             .map(|subset| {
                 subset
                     .cast::<PySubset>()
-                    .map(|subset| subset.get().inner.clone())
+                    .map(|subset| &subset.get().inner)
                     .map_err(|_| {
                         PyTypeError::new_err(
                             "subset must be a lateweave.Subset, e.g. Subset().including(corpus, ids)",
@@ -737,7 +737,7 @@ impl PySearchPipeline {
         let request = SearchRequest {
             gather_limit: usize::try_from(gather_limit).unwrap_or(0),
             limit: usize::try_from(limit).unwrap_or(0),
-            subset: subset.as_ref(),
+            subset,
             budget: budget.map_or_else(ResourceBudget::default, |budget| budget.get().inner),
         };
         let result = py
